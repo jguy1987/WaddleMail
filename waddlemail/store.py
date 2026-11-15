@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS pending(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     mailbox_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
-    field TEXT NOT NULL,            -- isRead / flag
+    field TEXT NOT NULL,            -- isRead / flag / move (value: destination folder)
     value TEXT NOT NULL,
     old TEXT,
     UNIQUE(message_id, field)
@@ -97,7 +97,9 @@ VALUES(:id, :folder_id, :conversation_id, :subject, :sender_name, :sender_addr,
        :received, COALESCE(:is_read, 0), COALESCE(:has_attachments, 0), :preview,
        :to_recipients, :cc_recipients, :importance, :flag, :last_verb, :size)
 ON CONFLICT(id) DO UPDATE SET
-    folder_id       = excluded.folder_id,
+    folder_id       = CASE WHEN EXISTS(SELECT 1 FROM pending p
+                                       WHERE p.message_id = :id AND p.field = 'move')
+                           THEN folder_id ELSE excluded.folder_id END,
     conversation_id = COALESCE(excluded.conversation_id, conversation_id),
     subject         = COALESCE(excluded.subject, subject),
     sender_name     = COALESCE(excluded.sender_name, sender_name),
@@ -356,8 +358,10 @@ class Store:
             c.execute("CREATE TEMP TABLE IF NOT EXISTS keep(id TEXT PRIMARY KEY)")
             c.execute("DELETE FROM keep")
             c.executemany("INSERT OR IGNORE INTO keep(id) VALUES(?)", ((i,) for i in keep_ids))
+            # (a message moved here locally isn't on the server's list yet: keep it)
             cur = c.execute(
-                "DELETE FROM messages WHERE folder_id=? AND id NOT IN (SELECT id FROM keep)",
+                "DELETE FROM messages WHERE folder_id=? AND id NOT IN (SELECT id FROM keep)"
+                " AND id NOT IN (SELECT message_id FROM pending WHERE field='move')",
                 (folder_id,),
             )
             return cur.rowcount
@@ -442,6 +446,25 @@ class Store:
                 changed.append(mid)
         return changed
 
+    def move_messages(self, mailbox_id: str, message_ids: list[str], dest: str) -> list[str]:
+        """Move messages to folder `dest` locally (counts included) and queue the move."""
+        changed = []
+        with self.conn as c:
+            for mid in message_ids:
+                row = c.execute("SELECT folder_id, is_read FROM messages WHERE id=?",
+                                (mid,)).fetchone()
+                if row is None or row["folder_id"] == dest:
+                    continue
+                c.execute("UPDATE messages SET folder_id=? WHERE id=?", (dest, mid))
+                unread = 0 if row["is_read"] else 1
+                c.execute("UPDATE folders SET total = MAX(total - 1, 0),"
+                          " unread = MAX(unread - ?, 0) WHERE id=?", (unread, row["folder_id"]))
+                c.execute("UPDATE folders SET total = total + 1, unread = unread + ? WHERE id=?",
+                          (unread, dest))
+                self._queue(c, mailbox_id, mid, "move", dest, row["folder_id"])
+                changed.append(mid)
+        return changed
+
     @staticmethod
     def _queue(c, mailbox_id, message_id, field, value, old):
         prev = c.execute("SELECT old FROM pending WHERE message_id=? AND field=?",
@@ -475,6 +498,9 @@ class Store:
             if row["field"] == "isRead":
                 c.execute("UPDATE messages SET is_read=? WHERE id=?",
                           (int(row["old"]), row["message_id"]))
+            elif row["field"] == "move":
+                c.execute("UPDATE messages SET folder_id=? WHERE id=?",
+                          (row["old"], row["message_id"]))
             else:
                 c.execute("UPDATE messages SET flag=? WHERE id=?", (row["old"], row["message_id"]))
 

@@ -7,19 +7,23 @@ the unread mail in the subfolders it hides, in a dimmer colour.
 
 New folder and Rename edit the name in place (as in Outlook); the pane only asks, through
 signals, and MainWindow does the work on the server and repopulates.
+
+Drag and drop: drop messages from the list onto a folder to move them (hold Ctrl to copy),
+and drag a folder onto another folder or a mailbox heading to move it. Both only work within
+one mailbox; the folder under the pointer is highlighted while it would accept the drop.
 """
 from __future__ import annotations
 
 from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QPalette
+from PySide6.QtGui import QAction, QColor, QDrag, QFont, QFontMetrics, QPainter, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QFrame, QMenu, QStyle, QStyledItemDelegate,
     QStyleOptionViewItem, QTreeWidget, QTreeWidgetItem,
 )
 
-from ..graph import WELL_KNOWN
+from ..graph import NO_SUBFOLDERS, WELL_KNOWN
 from ..store import Store
-from . import iconset
+from . import dnd, iconset
 
 ID_ROLE = Qt.ItemDataRole.UserRole
 KIND_ROLE = Qt.ItemDataRole.UserRole + 1     # "mailbox" or "folder"
@@ -82,6 +86,16 @@ class FolderDelegate(QStyledItemDelegate):
         widget = opt.widget
         style = widget.style() if widget else QApplication.style()
         style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+        if widget is not None and getattr(widget, "drop_key", None) == (
+                index.data(KIND_ROLE), index.data(ID_ROLE)):  # a drop would land here
+            hl = QColor(_accent(opt.palette, QPalette.ColorGroup.Active))
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(hl)
+            hl.setAlpha(50)
+            painter.setBrush(hl)
+            painter.drawRoundedRect(opt.rect.adjusted(1, 1, -2, -2), 4, 4)
+            painter.restore()
 
         rect = style.subElementRect(QStyle.SubElement.SE_ItemViewItemText, opt, widget)
         rect = rect.adjusted(2, 0, -6, 0)
@@ -144,6 +158,9 @@ class FolderPane(QTreeWidget):
     createFolderRequested = Signal(str, str, str)  # mailbox id, parent folder id ("" = top), name
     renameFolderRequested = Signal(str, str)       # folder id, new name
     deleteFolderRequested = Signal(str)            # folder id
+    moveFolderRequested = Signal(str, str)         # folder id, new parent ("" = top)
+    pickMoveFolderRequested = Signal(str)          # folder id: ask where to
+    messagesDropped = Signal(list, str, bool)      # message ids, folder id, copy?
 
     def __init__(self, store: Store, parent=None):
         super().__init__(parent)
@@ -163,6 +180,12 @@ class FolderPane(QTreeWidget):
         self._populate_later = False       # a refresh that arrived while editing
         self._delegate.edited.connect(self._on_edited)
         self._delegate.closeEditor.connect(lambda *_: QTimer.singleShot(0, self._edit_closed))
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(False)  # we highlight the target folder instead
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.setAutoExpandDelay(700)       # hovering over a closed folder opens it
+        self.drop_key: tuple[str, str] | None = None
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.DefaultContextMenu)
         self.itemSelectionChanged.connect(self._on_selection)
         self.itemClicked.connect(self._on_clicked)
@@ -334,7 +357,7 @@ class FolderPane(QTreeWidget):
         """Add a "New folder" row under `parent` (a folder or a mailbox heading; default: the
         current folder) and let the user type its name."""
         parent = parent or self.currentItem()
-        if parent is None or self._edit is not None:
+        if parent is None or self._edit is not None or not self.can_hold_folders(parent):
             return
         item = QTreeWidgetItem(["New folder"])
         item.setIcon(0, iconset.load("folder"))
@@ -361,6 +384,13 @@ class FolderPane(QTreeWidget):
         item = item or self.currentItem()
         if item is not None and self.can_change(item):
             self.deleteFolderRequested.emit(item.data(0, ID_ROLE))
+
+    @staticmethod
+    def can_hold_folders(item: QTreeWidgetItem) -> bool:
+        """Outbox and the Sync Issues folders can't have subfolders."""
+        return item.data(0, KIND_ROLE) == "mailbox" or (
+            item.data(0, KIND_ROLE) == "folder"
+            and item.data(0, WELL_KNOWN_ROLE) not in NO_SUBFOLDERS)
 
     @staticmethod
     def can_change(item: QTreeWidgetItem) -> bool:
@@ -399,18 +429,109 @@ class FolderPane(QTreeWidget):
             return
         super().keyPressEvent(event)
 
+    # -- drag and drop ------------------------------------------------------
+    def startDrag(self, supported_actions):
+        item = self.currentItem()
+        if item is None or not self.can_change(item):
+            return  # default folders stay where they are
+        drag = QDrag(self)
+        drag.setMimeData(dnd.encode(dnd.FOLDER, {"folder": item.data(0, ID_ROLE)}))
+        pm, hot = dnd.label_pixmap(item.text(0))
+        drag.setPixmap(pm)
+        drag.setHotSpot(hot)
+        drag.exec(Qt.DropAction.MoveAction, Qt.DropAction.MoveAction)
+
+    def _drop_target(self, event) -> tuple[QTreeWidgetItem, dict, dict] | None:
+        """(target item, messages payload, folder payload) if a drop here would be allowed."""
+        item = self.itemAt(event.position().toPoint())
+        msgs = dnd.decode(event.mimeData(), dnd.MESSAGES)
+        folder = dnd.decode(event.mimeData(), dnd.FOLDER)
+        if item is None or not (msgs or folder):
+            return None
+        kind = item.data(0, KIND_ROLE)
+        mailbox = self._mailbox_of(item).data(0, ID_ROLE)
+        if msgs:
+            if kind != "folder" or item.data(0, ID_ROLE) == msgs["folder"]:
+                return None
+            if self.store.folder_mailbox(msgs["folder"]) != mailbox:
+                return None  # Graph moves mail only within a mailbox
+            return item, msgs, None
+        fid = folder["folder"]
+        if not self.can_hold_folders(item) or self.store.folder_mailbox(fid) != mailbox:
+            return None
+        row = self.store.folder_row(fid)
+        ids = {r["id"] for r in self.store.folder_rows(mailbox)}
+        parent = row["parent_id"] if row and row["parent_id"] in ids else ""
+        dest = item.data(0, ID_ROLE) if kind == "folder" else ""
+        if dest == parent:
+            return None  # already there
+        if dest and dest in {r["id"] for r in self.store.folder_subtree(fid)}:
+            return None  # not into itself
+        return item, None, folder
+
+    def _set_drop_item(self, item: QTreeWidgetItem | None):
+        key = (item.data(0, KIND_ROLE), item.data(0, ID_ROLE)) if item is not None else None
+        if key != self.drop_key:
+            self.drop_key = key
+            self.viewport().update()
+
+    def dragEnterEvent(self, event):
+        mime = event.mimeData()
+        if mime.hasFormat(dnd.MESSAGES) or mime.hasFormat(dnd.FOLDER):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        super().dragMoveEvent(event)  # auto-scroll and open folders on hover
+        target = self._drop_target(event)
+        self._set_drop_item(target[0] if target else None)
+        if target is None:
+            event.ignore()
+            return
+        copy = bool(target[1]) and bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        event.setDropAction(Qt.DropAction.CopyAction if copy else Qt.DropAction.MoveAction)
+        event.accept()
+
+    def dragLeaveEvent(self, event):
+        self._set_drop_item(None)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        target = self._drop_target(event)
+        self._set_drop_item(None)
+        if target is None:
+            event.ignore()
+            return
+        item, msgs, folder = target
+        if msgs:
+            copy = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            event.setDropAction(Qt.DropAction.CopyAction if copy else Qt.DropAction.MoveAction)
+            event.accept()
+            self.messagesDropped.emit(list(msgs["ids"]), item.data(0, ID_ROLE), copy)
+        else:
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+            dest = item.data(0, ID_ROLE) if item.data(0, KIND_ROLE) == "folder" else ""
+            self.moveFolderRequested.emit(folder["folder"], dest)
+
     # -- context menu ------------------------------------------------------
     def contextMenuEvent(self, event):
         item = self.itemAt(event.pos())
         menu = QMenu(self)
         if item is not None and item.data(0, KIND_ROLE) in ("folder", "mailbox"):
             where = "&New folder…" if item.data(0, KIND_ROLE) == "mailbox" else "&New subfolder…"
-            menu.addAction(iconset.load("folder-plus"), where,
-                           lambda: self.start_new_folder(item))
+            act = menu.addAction(iconset.load("folder-plus"), where,
+                                 lambda: self.start_new_folder(item))
+            act.setEnabled(self.can_hold_folders(item))
             if item.data(0, KIND_ROLE) == "folder":
                 changeable = self.can_change(item)
                 act = menu.addAction(iconset.load("pencil"), "&Rename\tF2",
                                      lambda: self.start_rename(item))
+                act.setEnabled(changeable)
+                act = menu.addAction(iconset.load("folder-input"), "&Move folder…",
+                                     lambda: self.pickMoveFolderRequested.emit(
+                                         item.data(0, ID_ROLE)))
                 act.setEnabled(changeable)
                 act = menu.addAction(iconset.load("trash-2"), "&Delete\tDel",
                                      lambda: self.request_delete(item))

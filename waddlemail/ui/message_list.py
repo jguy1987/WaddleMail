@@ -25,7 +25,7 @@ from PySide6.QtCore import (
     QSortFilterProxyModel, Qt, QTime, QTimer, Signal,
 )
 from PySide6.QtGui import (
-    QActionGroup, QColor, QFont, QFontMetrics, QIcon, QPainter, QPalette, QPixmap,
+    QActionGroup, QColor, QDrag, QFont, QFontMetrics, QIcon, QPainter, QPalette, QPixmap,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QStyle,
@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..store import recipients
-from . import iconset
+from . import dnd, iconset
 
 ID_ROLE = Qt.ItemDataRole.UserRole       # message id (messages only)
 SORT_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -721,6 +721,10 @@ class MessageListView(QTreeView):
         self._row_delegate = RowDelegate(self)
         self.setItemDelegate(self._row_delegate)
         self.doubleClicked.connect(self._on_double_clicked)
+        # Drag messages onto a folder in the folder pane (Ctrl while dropping: copy).
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        self.folder_id: str | None = None  # the folder shown; set by MainWindow
 
         self.threaded = True
         self.grouped = True
@@ -962,6 +966,31 @@ class MessageListView(QTreeView):
             return None
         return node.row["newest_id"] if node.kind == THREAD else node.row["id"]
 
+    def neighbor_after(self, leaving: set[str]) -> str | None:
+        """The message to select once `leaving` is gone from the list: the next one below
+        the current row, else the one above."""
+        order = [n.row["id"] for n in (i.data(NODE_ROLE) for i in self._walk())
+                 if n.kind == MESSAGE]
+        cur = self.current_id()
+        if cur not in order:
+            return None
+        pos = order.index(cur)
+        after = [m for m in order[pos + 1:] if m not in leaving]
+        before = [m for m in order[:pos] if m not in leaving]
+        return after[0] if after else (before[-1] if before else None)
+
+    def select_id(self, message_id: str) -> None:
+        for idx in self._walk():
+            node = idx.data(NODE_ROLE)
+            if node.kind == MESSAGE and node.row["id"] == message_id:
+                parent = idx.parent()
+                while parent.isValid():  # reveal it inside a closed conversation
+                    self.setExpanded(parent, True)
+                    parent = parent.parent()
+                self.setCurrentIndex(idx)
+                self.scrollTo(idx)
+                return
+
     # -- input ------------------------------------------------------------
     def _hit(self, event) -> str | None:
         """What a plain left click lands on: "read", "flag", "expand" or None."""
@@ -1012,6 +1041,18 @@ class MessageListView(QTreeView):
                 self.toggleFlagRequested.emit(ids)
             return
         super().mousePressEvent(event)
+
+    def startDrag(self, supported_actions):
+        ids = self.selected_ids()
+        if not ids or not self.folder_id:
+            return
+        drag = QDrag(self)
+        drag.setMimeData(dnd.encode(dnd.MESSAGES, {"folder": self.folder_id, "ids": ids}))
+        pm, hot = dnd.label_pixmap("1 message" if len(ids) == 1 else f"{len(ids)} messages")
+        drag.setPixmap(pm)
+        drag.setHotSpot(hot)
+        drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction,
+                  Qt.DropAction.MoveAction)
 
     def mouseDoubleClickEvent(self, event):
         if self._hit(event):

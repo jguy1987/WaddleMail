@@ -20,8 +20,21 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   or a mailbox heading for New folder; also File > New > Folder. Names are typed in place, as in
   Outlook (Enter saves, Esc cancels); a name already used next to it is refused. Delete moves
   the folder and everything in it to Deleted Items; deleting a folder that is already in Deleted
-  Items removes it for good (after a warning). Default folders (Inbox, Sent Items, ...) can't be
-  renamed or deleted.
+  Items removes it for good (after a warning). Default folders (Inbox, Sent Items, ...) and
+  Exchange's system folders (Sync Issues and its Conflicts / Local Failures / Server Failures)
+  can't be renamed, moved or deleted, and Outbox and the Sync Issues folders can't have
+  subfolders (not by New folder, nor by moving a folder into them).
+- **Moving folders**: drag a folder onto another folder, or onto the mailbox heading for the top
+  level (the folder under the pointer is highlighted; hovering opens a closed folder), or
+  right-click > Move folder….
+- **Moving and copying mail**: drag messages from the list onto a folder (hold Ctrl to copy), or
+  Message menu / right-click > Move to folder… (Ctrl+Shift+V) or Copy to folder…. The message
+  window has the same Move and Copy buttons and a Message menu. The folder chooser has a
+  filter box: type part of a name and press Enter. It starts on the folder you used last.
+  - A move shows at once (the next message is selected, counts update) and goes through the
+    same change queue as read/flag, so it also works offline and is undone if the server
+    refuses it. A copy needs the server, which creates the new message.
+  - Moves and copies work within one mailbox; Graph can't move mail between mailboxes.
 - Message list served from a local SQLite store, kept current with Graph **delta queries** (one
   cursor per folder). If the first sync fails (offline), the stored mail is still shown.
   - Columns: read dot, replied/forwarded, attachment, importance, From (To in Sent Items, Drafts
@@ -86,7 +99,7 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
 
 Sending mail and saving events (the New dialogs open but only collect input), personal contacts,
 calendar views, searching all folders at once, attachments and inline (`cid:`) images,
-move/delete of messages, moving folders (drag and drop). Conversations only group messages within the current folder (your replies in Sent
+deleting messages, moving or copying between mailboxes. Conversations only group messages within the current folder (your replies in Sent
 Items are not pulled in, as Outlook does).
 
 ## Register the app (one time)
@@ -144,6 +157,8 @@ waddlemail/ui/             main window + menus/toolbar, preferences, new mail/ev
 waddlemail/ui/folder_pane.py  folder tree: mailbox headings, folder order, icons, unread counts
 waddlemail/ui/message_list.py  message model/view (columns, sorting, compact rows), quick filter bar
 waddlemail/ui/message_view.py  message header + sandboxed body; the separate message window
+waddlemail/ui/folder_picker.py  "choose a folder" dialog for Move/Copy to folder and Move folder
+waddlemail/ui/dnd.py       drag-and-drop data format and drag image
 waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 ```
 
@@ -170,8 +185,8 @@ waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 
 ## Next steps
 
-1. Real sending (`Mail.Send`) through an outbox, and move/delete through the change queue
-   (`pending` table) that read/flag already use.
+1. Real sending (`Mail.Send`) through an outbox, and deleting messages through the change
+   queue (`pending` table) that read/flag/move already use.
 2. Personal contacts (`/me/contacts`) and recipient autocomplete.
 3. Events (`Calendars.ReadWrite`), then calendar views.
 4. Attachments and `cid:` images; search across all folders; optional background download of

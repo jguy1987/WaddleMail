@@ -13,12 +13,14 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__
+from ..graph import NO_SUBFOLDERS
 from ..mailboxes import MailboxManager
 from ..settings import Settings
 from ..store import Store
 from . import iconset
 from .dialogs import ComposeDialog, EventDialog, SharedMailboxDialog
 from .folder_pane import FolderPane
+from .folder_picker import TOP, FolderPicker
 from .message_list import OUTGOING, FilterBar, MessageListView
 from .message_view import MessageView, MessageWindow
 from .preferences import PreferencesDialog
@@ -79,6 +81,11 @@ class MainWindow(QMainWindow):
         self.folder_tree.createFolderRequested.connect(self._create_folder)
         self.folder_tree.renameFolderRequested.connect(self._rename_folder)
         self.folder_tree.deleteFolderRequested.connect(self.delete_folder)
+        self.folder_tree.moveFolderRequested.connect(self.move_folder)
+        self.folder_tree.pickMoveFolderRequested.connect(self.pick_move_folder)
+        self.folder_tree.messagesDropped.connect(
+            lambda ids, dest, copy: self.move_messages(ids, dest, copy))
+        self._last_dest: dict[str, str] = {}  # mailbox -> last Move/Copy destination
 
         # messages: quick filter bar over the list
         self.filter_bar = FilterBar()
@@ -196,6 +203,9 @@ class MainWindow(QMainWindow):
         for box in self.mailboxes.all():
             try:
                 box.sync.send_changes()
+            except Exception as exc:  # stays queued; mustn't hold up the folder refresh
+                log.warning("sending changes for %s failed: %s", box.display_name, exc)
+            try:
                 box.sync.sync_folders()
             except Exception as exc:
                 log.warning("folder sync failed for %s: %s", box.display_name, exc)
@@ -309,8 +319,12 @@ class MainWindow(QMainWindow):
     # -- folder management --------------------------------------------
     def new_folder(self):
         """New subfolder of the selected folder (File > New > Folder)."""
-        if self.folder_tree.currentItem() is None:
+        item = self.folder_tree.currentItem()
+        if item is None:
             self.statusBar().showMessage("Select a folder or mailbox first", 4000)
+            return
+        if not self.folder_tree.can_hold_folders(item):
+            self.statusBar().showMessage(f"{item.text(0)} can't contain folders", 4000)
             return
         self.folder_tree.setFocus()
         self.folder_tree.start_new_folder()
@@ -318,6 +332,9 @@ class MainWindow(QMainWindow):
     def _name_problem(self, mailbox_id: str, parent_id: str, name: str,
                       exclude: str | None = None) -> str | None:
         """Why `name` can't be used under `parent_id` ("" = top of the mailbox), if it can't."""
+        parent = self.store.folder_row(parent_id) if parent_id else None
+        if parent is not None and parent["well_known"] in NO_SUBFOLDERS:
+            return f"{parent['name']} can't contain folders."
         if not name:
             return "A folder needs a name."
         if len(name) > 255:
@@ -437,6 +454,7 @@ class MainWindow(QMainWindow):
         rows = self.store.list_messages(self._current_folder, since=self._list_cutoff(),
                                         also_ids=hits, **self.filter_bar.criteria())
         folder = self.store.folder_row(self._current_folder)
+        self.msg_list.folder_id = self._current_folder  # for dragging messages out
         self.msg_list.set_messages(rows, bool(folder) and folder["well_known"] in OUTGOING)
         self._update_message_actions()
         if not words:
@@ -561,7 +579,8 @@ class MainWindow(QMainWindow):
             return
         win = MessageWindow(row, self.images_action.isChecked(),
                             [self.act_reply, self.act_reply_all, self.act_forward,
-                             self.act_delete], self)
+                             self.act_delete],
+                            lambda copy: self.move_messages([mid], copy=copy, parent=win), self)
         self._windows.add(win)
         win.destroyed.connect(lambda *_: self._windows.discard(win))
         win.show()
@@ -569,6 +588,120 @@ class MainWindow(QMainWindow):
                   lambda body: win.set_body(body.content_type, body.content),
                   on_failed=win.show_error)
         self.mark_read([mid], True)
+
+    # -- move / copy --------------------------------------------------------
+    def _pick_folder(self, mailbox_id: str, title: str, prompt: str, parent=None,
+                     **kwargs) -> str | None:
+        dlg = FolderPicker(self.store, mailbox_id, title, prompt,
+                           preselect=self._last_dest.get(mailbox_id), parent=parent or self,
+                           **kwargs)
+        if not dlg.exec() or dlg.chosen is None:
+            return None
+        return dlg.chosen
+
+    def move_messages(self, ids: list[str], dest: str | None = None, copy: bool = False,
+                      parent=None):
+        """Move (or copy) messages to folder `dest`; without `dest`, ask which folder.
+        A move shows at once and is sent through the change queue; a copy needs the server,
+        which makes the new message."""
+        rows = [r for r in (self.store.message_row(i) for i in ids) if r is not None]
+        if not rows:
+            return
+        source = rows[0]["folder_id"]
+        box = self.mailboxes.for_folder(source)
+        if box is None:
+            return
+        ids = [r["id"] for r in rows]
+        what = "1 message" if len(ids) == 1 else f"{len(ids)} messages"
+        if dest is None:
+            verb = "Copy" if copy else "Move"
+            dest = self._pick_folder(box.id, f"{verb} to folder", f"{verb} {what} to:",
+                                     parent=parent,
+                                     disabled=frozenset() if copy else frozenset({source}))
+            if dest is None:
+                return
+        if self.store.folder_mailbox(dest) != box.id:
+            QMessageBox.warning(parent or self, "Move to folder",
+                                "Messages can only be moved or copied within one mailbox.")
+            return
+        self._last_dest[box.id] = dest
+        name = (self.store.folder_row(dest) or {"name": "folder"})["name"]
+        if copy:
+            self.statusBar().showMessage(f"Copying {what} to {name}…")
+
+            def job():
+                items = [box.graph.copy_message(i, dest) for i in ids]
+                self.store.apply_message_changes(dest, items)
+                box.sync.sync_folders()
+
+            def done(_):
+                self.folder_tree.refresh_counts()
+                if dest == self._current_folder:
+                    self._refresh_messages()
+                self.statusBar().showMessage(f"Copied {what} to {name}", 4000)
+
+            self._run(job, done, on_failed=lambda msg: QMessageBox.warning(
+                parent or self, "Copy to folder", f"Couldn't copy {what}.\n\n{msg}"))
+            return
+        follow = self.msg_list.neighbor_after(set(ids))  # Outlook moves on to the next one
+        moved = self.store.move_messages(box.id, ids, dest)
+        if not moved:
+            return
+        if source == self._current_folder:
+            selected = set(self.msg_list.selected_ids())
+            self._refresh_messages()
+            if selected & set(moved) and follow:
+                self.msg_list.select_id(follow)
+        self.folder_tree.refresh_counts()
+        self._send_timer.start()
+        self.statusBar().showMessage(f"Moved {what} to {name}", 4000)
+
+    def pick_move_folder(self, folder_id: str):
+        row = self.store.folder_row(folder_id)
+        box = self.mailboxes.for_folder(folder_id)
+        if row is None or box is None:
+            return
+        ids = {r["id"] for r in self.store.folder_rows(box.id)}
+        parent = row["parent_id"] if row["parent_id"] in ids else TOP
+        no_room = {r["id"] for r in self.store.folder_rows(box.id)
+                   if r["well_known"] in NO_SUBFOLDERS}
+        dest = self._pick_folder(box.id, "Move folder", f"Move \"{row['name']}\" to:",
+                                 subtree=folder_id, allow_top=parent != TOP,
+                                 disabled=frozenset({parent} | no_room))
+        if dest is not None:
+            self.move_folder(folder_id, dest)
+
+    def move_folder(self, folder_id: str, dest: str):
+        """Move a folder (and everything in it) under folder `dest`, or to the top of its
+        mailbox when `dest` is ""."""
+        row = self.store.folder_row(folder_id)
+        box = self.mailboxes.for_folder(folder_id)
+        if row is None or box is None or row["well_known"]:
+            return
+        if dest and dest in {r["id"] for r in self.store.folder_subtree(folder_id)}:
+            return
+        problem = self._name_problem(box.id, dest, row["name"], exclude=folder_id)
+        if problem:
+            self._folder_failed("Move folder", problem)
+            return
+        target = (self.store.folder_row(dest)["name"] if dest
+                  else box.display_name)
+        self.statusBar().showMessage(f"Moving {row['name']}…")
+
+        def job():
+            moved = box.graph.move_folder(folder_id, dest or "msgfolderroot") or {}
+            box.sync.sync_folders()
+            return moved.get("id") or folder_id
+
+        def done(new_id: str):
+            was_current = self._current_folder == folder_id
+            self._populate_folders()
+            if was_current and new_id != folder_id:  # Exchange gave it a new id
+                self.folder_tree.select_folder(new_id)
+            self.statusBar().showMessage(f"Moved {row['name']} to {target}", 4000)
+
+        self._run(job, done, on_failed=lambda msg: self._folder_failed(
+            "Move folder", f"Couldn't move \"{row['name']}\".\n\n{msg}"))
 
     # -- read / flag ------------------------------------------------------
     def _mark_viewed_read(self):
@@ -785,9 +918,15 @@ class MainWindow(QMainWindow):
             "Toggle &flag", lambda: self._toggle_flag(sel()), "S", icon="flag")
         self.act_flag_complete = self._list_action(
             "Mark flag &complete", lambda: self.set_flag(sel(), "complete"), icon="check")
+        self.msg_list.addAction(self._separator())
+        self.act_move = self._list_action(
+            "Mo&ve to folder…", lambda: self.move_messages(sel()), "Ctrl+Shift+V",
+            icon="folder-input")
+        self.act_copy_to = self._list_action(
+            "Cop&y to folder…", lambda: self.move_messages(sel(), copy=True), icon="copy")
         self._message_actions = [self.act_open, self.act_mark_read, self.act_mark_unread,
                                  self.act_toggle_read, self.act_toggle_flag,
-                                 self.act_flag_complete]
+                                 self.act_flag_complete, self.act_move, self.act_copy_to]
 
         self.act_threads = QAction("Group by &conversation", self)
         self.act_threads.setCheckable(True)
@@ -933,6 +1072,9 @@ class MainWindow(QMainWindow):
         msg_menu.addSeparator()
         msg_menu.addAction(self.act_toggle_flag)
         msg_menu.addAction(self.act_flag_complete)
+        msg_menu.addSeparator()
+        msg_menu.addAction(self.act_move)
+        msg_menu.addAction(self.act_copy_to)
 
         help_menu = mb.addMenu("&Help")
         help_menu.addAction(self._action("&About WaddleMail", self.show_about))

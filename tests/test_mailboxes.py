@@ -52,6 +52,8 @@ def test_full_mailbox_walk_tags_well_known():
     out = g.list_folders()
     assert [f["id"] for f in out] == ["I", "S"]
     assert out[0]["wellKnownName"] == "inbox" and "wellKnownName" not in out[1]
+    asked = [r["url"].split("?")[0].rsplit("/", 1)[1] for r in s.calls[0][2]["requests"]]
+    assert asked[0] == "inbox" and {"outbox", "syncissues", "conflicts"} <= set(asked)
     assert s.calls[0][2]["requests"][0]["url"].startswith("/users/shared@x.com/mailFolders/inbox")
 
 

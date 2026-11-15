@@ -15,6 +15,11 @@ log = logging.getLogger(__name__)
 FOLDER_FIELDS = "id,displayName,parentFolderId,childFolderCount,unreadItemCount,totalItemCount"
 # Default folders, in the order the folder pane shows them (other folders follow, A-Z).
 WELL_KNOWN = ("inbox", "drafts", "sentitems", "deleteditems", "junkemail", "archive", "outbox")
+# Exchange's own bookkeeping folders. They are recognised (so they can't be renamed, moved or
+# deleted) but listed among the other folders, A-Z.
+SYSTEM = ("syncissues", "conflicts", "localfailures", "serverfailures")
+# Folders that can't contain folders (Exchange refuses, and so does Outlook).
+NO_SUBFOLDERS = frozenset({"outbox", *SYSTEM})
 MESSAGE_FIELDS = (
     "id,parentFolderId,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,"
     "isRead,hasAttachments,importance,flag,bodyPreview"
@@ -103,7 +108,7 @@ class GraphClient:
         (no Archive yet) or that we may not open (a shared folder set) are left out."""
         reqs = [{"id": name, "method": "GET",
                  "url": f"{self._root}/mailFolders/{name}?$select={FOLDER_FIELDS}"}
-                for name in WELL_KNOWN]
+                for name in WELL_KNOWN + SYSTEM]
         data = self._request("/$batch", method="POST", json={"requests": reqs})
         return {r["id"]: r["body"] for r in data.get("responses", [])
                 if r.get("status") == 200 and isinstance(r.get("body"), dict)}
@@ -226,6 +231,18 @@ class GraphClient:
         """PATCH writable message properties, e.g. {"isRead": True}."""
         self._request(f"{self._root}/messages/{quote(message_id, safe='')}", method="PATCH",
                       json=changes, params={"$select": "id"})
+
+    def move_message(self, message_id: str, destination_id: str) -> dict:
+        """Move within this mailbox. With immutable ids the message keeps its id."""
+        return self._request(f"{self._root}/messages/{quote(message_id, safe='')}/move",
+                             method="POST", json={"destinationId": destination_id},
+                             headers=_prefer())
+
+    def copy_message(self, message_id: str, destination_id: str) -> dict:
+        """Copy within this mailbox; returns the new message (with a new id)."""
+        return self._request(f"{self._root}/messages/{quote(message_id, safe='')}/copy",
+                             method="POST", json={"destinationId": destination_id},
+                             headers=_prefer())
 
     def get_message_body(self, message_id: str) -> tuple[str, str]:
         """Return (content_type, content); content_type is 'html' or 'text'."""

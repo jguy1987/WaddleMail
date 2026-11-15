@@ -31,29 +31,39 @@ class SyncEngine:
         self.store.upsert_folders(self.mailbox_id, self.graph.list_folders())
 
     def send_changes(self) -> int:
-        """Send queued read/flag changes. A change the server refuses (no write access to a
+        """Send queued read/flag/move changes. A change the server refuses (no write access to a
         shared mailbox, message deleted) is undone locally; network or server errors leave it
-        queued for the next try. Returns how many were sent."""
+        queued for the next try, but don't hold up the changes behind them (unless the network
+        is down: then stop). Returns how many were sent."""
         sent = 0
+        failed: GraphError | None = None
         for ch in self.store.pending_changes(self.mailbox_id):
-            if ch["field"] == "isRead":
-                body = {"isRead": ch["value"] == "1"}
-            else:
-                body = {"flag": {"flagStatus": ch["value"]}}
             try:
-                self.graph.update_message(ch["message_id"], body)
+                if ch["field"] == "move":
+                    self.graph.move_message(ch["message_id"], ch["value"])
+                elif ch["field"] == "isRead":
+                    self.graph.update_message(ch["message_id"], {"isRead": ch["value"] == "1"})
+                else:
+                    self.graph.update_message(ch["message_id"],
+                                              {"flag": {"flagStatus": ch["value"]}})
             except GraphError as exc:
-                if exc.status not in (400, 403, 404):
-                    raise
-                log.warning("server refused %s on %s: %s", ch["field"], ch["message_id"], exc)
-                self.store.change_refused(ch["id"])
+                if exc.status in (400, 403, 404):
+                    log.warning("server refused %s on %s: %s", ch["field"], ch["message_id"], exc)
+                    self.store.change_refused(ch["id"])
+                else:  # server trouble: keep it queued, try the rest
+                    failed = exc
                 continue
             self.store.change_sent(ch["id"])
             sent += 1
+        if failed is not None:
+            raise failed
         return sent
 
     def sync_folder(self, folder_id: str) -> SyncResult:
-        self.send_changes()  # first, so the delta below already reflects them
+        try:
+            self.send_changes()  # first, so the delta below already reflects them
+        except Exception as exc:  # they stay queued; a stuck change mustn't block syncing
+            log.warning("sending queued changes failed: %s", exc)
         key = f"delta:{folder_id}"
         link = self.store.get_state(key)
         try:

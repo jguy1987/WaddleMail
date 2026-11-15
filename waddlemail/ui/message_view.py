@@ -151,7 +151,9 @@ class MessageView(QWidget):
 class MessageWindow(QMainWindow):
     """One message in its own window (double-click or Enter in the list)."""
 
-    def __init__(self, row, remote_images: bool, reply_actions: list[QAction], parent=None):
+    def __init__(self, row, remote_images: bool, reply_actions: list[QAction], move_copy,
+                 parent=None):
+        """`move_copy(copy: bool)` asks for a folder and moves (or copies) this message."""
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle(row["subject"] or "(no subject)")
@@ -167,6 +169,18 @@ class MessageWindow(QMainWindow):
         for act in reply_actions:
             bar.addAction(act)
         bar.addSeparator()
+        self.act_move = QAction(iconset.load("folder-input"), "Mo&ve to folder…", self)
+        self.act_move.setIconText("Move")  # the toolbar's label
+        self.act_move.setToolTip("Move to folder (Ctrl+Shift+V)")
+        self.act_move.setShortcut(QKeySequence("Ctrl+Shift+V"))
+        self.act_move.triggered.connect(lambda: move_copy(False))
+        self.act_copy = QAction(iconset.load("copy"), "Cop&y to folder…", self)
+        self.act_copy.setIconText("Copy")
+        self.act_copy.setToolTip("Copy to folder")
+        self.act_copy.triggered.connect(lambda: move_copy(True))
+        bar.addAction(self.act_move)
+        bar.addAction(self.act_copy)
+        bar.addSeparator()
         self.images = QAction(iconset.load("image"), "Load images", self)
         self.images.setCheckable(True)
         self.images.setChecked(remote_images)
@@ -175,10 +189,18 @@ class MessageWindow(QMainWindow):
         bar.addAction(self.images)
         self.addToolBar(bar)
 
-        close = QAction(self)
+        close = QAction("&Close", self)
         close.setShortcuts([QKeySequence(Qt.Key.Key_Escape), QKeySequence.StandardKey.Close])
         close.triggered.connect(self.close)
         self.addAction(close)
+
+        menu = self.menuBar().addMenu("&Message")
+        menu.addAction(self.act_move)
+        menu.addAction(self.act_copy)
+        menu.addSeparator()
+        menu.addAction(self.images)
+        menu.addSeparator()
+        menu.addAction(close)
 
     @property
     def message_id(self) -> str | None:

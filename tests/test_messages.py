@@ -129,3 +129,23 @@ def test_delta_falls_back_when_expand_is_refused():
     pages = list(GraphClient(lambda: "t", session=s).messages_delta("F"))
     assert pages == [([], "L")]
     assert "$expand" in s.params[0] and "$expand" not in s.params[1]
+
+
+def test_one_stuck_change_does_not_block_the_rest(tmp_path):
+    st = make_store(tmp_path, msg("m1"), msg("m2"))
+    st.set_read("a", ["m1", "m2"], True)
+
+    class G:
+        sent = []
+
+        def update_message(self, mid, changes):
+            if mid == "m1":
+                raise GraphError("busy", 503)
+            self.sent.append(mid)
+
+    try:
+        SyncEngine(st, G(), "a").send_changes()
+    except GraphError:
+        pass
+    assert G.sent == ["m2"]
+    assert [c["message_id"] for c in st.pending_changes("a")] == ["m1"]

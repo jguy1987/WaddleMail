@@ -51,6 +51,10 @@ class FakeFolders:
             "in": {"id": "in", "displayName": "Inbox", "wellKnownName": "inbox",
                    "unreadItemCount": 3},
             "del": {"id": "del", "displayName": "Deleted Items", "wellKnownName": "deleteditems"},
+            "out": {"id": "out", "displayName": "Outbox", "wellKnownName": "outbox"},
+            "sync": {"id": "sync", "displayName": "Sync Issues", "wellKnownName": "syncissues"},
+            "conf": {"id": "conf", "displayName": "Conflicts", "wellKnownName": "conflicts",
+                     "parentFolderId": "sync"},
         }
         self.n = 0
 
@@ -88,6 +92,11 @@ graph.GraphClient.create_folder = lambda self, name, parent_id=None: server.crea
 graph.GraphClient.rename_folder = lambda self, fid, name: server.rename(self, fid, name)
 graph.GraphClient.move_folder = lambda self, fid, dest: server.move(self, fid, dest)
 graph.GraphClient.delete_folder = lambda self, fid: server.delete(self, fid)
+server_moves: list[tuple[str, str]] = []
+graph.GraphClient.move_message = lambda self, mid, dest: server_moves.append((mid, dest)) or {}
+graph.GraphClient.copy_message = lambda self, mid, dest: {
+    "id": f"copy-of-{mid}", "parentFolderId": dest, "subject": "copied", "isRead": True,
+    "receivedDateTime": "2026-11-01T10:00:00Z"}
 
 # Dialogs would block the test: answer Yes, and record warnings.
 from PySide6.QtWidgets import QLineEdit, QMessageBox  # noqa: E402
@@ -286,6 +295,7 @@ def checks():
     check(len(w._windows) == 1 and "m3" not in unread(), "double-click opens and marks read")
 
     folder_checks()
+    move_checks()
 
     w.close()
     saved = Settings(str(tmp / "settings.ini"))
@@ -345,11 +355,112 @@ def folder_checks():
     QTest.keyClick(pane, Qt.Key.Key_Delete)
     wait(400)
     check(st.folder_row(made["id"])["parent_id"] == "del", "Delete moves it to Deleted Items")
+
+    for fid in ("out", "sync", "conf"):
+        pane.start_new_folder(pane._find(fid))
+        wait(100)
+    check(pane._edit is None, "no New subfolder in Outbox, Sync Issues or Conflicts")
+    check(pane.can_hold_folders(pane._find("in"))
+          and not any(pane.can_hold_folders(pane._find(f)) for f in ("out", "sync", "conf")),
+          "the New subfolder menu item is greyed out there")
+    pane.select_folder("out")
+    wait(300)  # (selecting starts a sync, whose offline error would replace the message)
+    w.new_folder()
+    check(pane._edit is None and "can't contain folders" in w.statusBar().currentMessage(),
+          "File > New > Folder says why")
+    before = len(warnings)
+    w._create_folder("a", "sync", "Sneaky")
+    wait(300)
+    check(len(warnings) == before + 1 and folder_named("Sneaky") is None,
+          "refused before anything is sent")
+    check(not pane.can_change(pane._find("sync")), "Sync Issues can't be renamed or deleted")
+    pane.select_folder(made["id"])
     pane.select_folder(made["id"])
     QTest.keyClick(pane, Qt.Key.Key_Delete)
     wait(400)
     check(st.folder_row(made["id"]) is None and w._current_folder == "in",
           "deleting it from Deleted Items removes it; Inbox is shown")
+
+
+def drop(item, payload_type, payload, ctrl=False):
+    from PySide6.QtGui import QDropEvent
+    from waddlemail.ui import dnd
+    mime = dnd.encode(payload_type, payload)
+    pos = QPointF(w.folder_tree.visualItemRect(item).center())
+    mods = Qt.KeyboardModifier.ControlModifier if ctrl else Qt.KeyboardModifier.NoModifier
+    ev = QDropEvent(pos, Qt.DropAction.MoveAction | Qt.DropAction.CopyAction, mime,
+                    Qt.MouseButton.LeftButton, mods)
+    w.folder_tree.dropEvent(ev)
+    wait(400)
+    return ev.isAccepted()
+
+
+def move_checks():
+    from waddlemail.ui import dnd
+    from waddlemail.ui.folder_picker import FolderPicker
+    pane = w.folder_tree
+    receipts = server.create(None, "Receipts", "in")["id"]
+    travel = server.create(None, "Travel", "in")["id"]
+    w._sync_all_folders()
+    w._populate_folders()
+    pane.select_folder("in")
+    wait(300)
+    item = pane._find
+
+    check(drop(item(receipts), dnd.MESSAGES, {"folder": "in", "ids": ["m4"]}),
+          "drop messages on a folder")
+    check(st.message_row("m4")["folder_id"] == receipts and "m4" not in ids(),
+          "dropped message moved at once, gone from the list")
+    wait(2000)  # the change queue sends it
+    check(("m4", receipts) in server_moves, "the move was sent to the server")
+
+    check(drop(item(travel), dnd.MESSAGES, {"folder": "in", "ids": ["m3"]}, ctrl=True),
+          "Ctrl-drop copies")
+    check(st.message_row("copy-of-m3")["folder_id"] == travel
+          and st.message_row("m3")["folder_id"] == "in", "copy made, original stays")
+
+    check(not drop(item("in"), dnd.MESSAGES, {"folder": "in", "ids": ["m1"]}),
+          "dropping on its own folder does nothing")
+
+    check(drop(item(receipts), dnd.FOLDER, {"folder": travel}), "drop a folder on a folder")
+    check(st.folder_row(travel)["parent_id"] == receipts, "folder moved on the server and here")
+    check(not drop(item(travel), dnd.FOLDER, {"folder": receipts}),
+          "a folder can't be dropped into its own subfolder")
+    check(not drop(item("in"), dnd.FOLDER, {"folder": "in"}), "default folders don't move")
+    check(not drop(item("out"), dnd.FOLDER, {"folder": travel})
+          and not drop(item("sync"), dnd.FOLDER, {"folder": travel}),
+          "no folder can be dropped into Outbox or Sync Issues")
+
+    picker = FolderPicker(st, "a", "Move folder", "Move to:", subtree=receipts,
+                          allow_top=True)
+    flags = {i: picker.tree.findItems(n, Qt.MatchFlag.MatchRecursive)[0].flags()
+             for i, n in ((receipts, "Receipts"), (travel, "Travel"), ("in", "Inbox"))}
+    check(not flags[receipts] & Qt.ItemFlag.ItemIsSelectable
+          and not flags[travel] & Qt.ItemFlag.ItemIsSelectable
+          and flags["in"] & Qt.ItemFlag.ItemIsSelectable,
+          "picker: a folder can't go into itself or below")
+    picker.filter.setText("inb")
+    check(picker.tree.currentItem().text(0) == "Inbox", "picker: typing finds a folder")
+
+    w._pick_folder = lambda *a, **k: receipts  # the picker's answer
+    pane.select_folder("in")
+    wait(300)
+    click("m1")
+    w.act_move.trigger()
+    wait(200)
+    check(st.message_row("m1")["folder_id"] == receipts, "Move to folder… (menu)")
+    check(view.current_id() not in (None, "m1"), "the next message is selected after a move")
+
+    w.open_message("m5")
+    wait(300)
+    win = next(x for x in w._windows if x.message_id == "m5")
+    w._pick_folder = lambda *a, **k: travel
+    win.act_copy.trigger()
+    wait(400)
+    check(st.message_row("copy-of-m5") is not None, "message window: Copy to folder")
+    win.act_move.trigger()
+    wait(200)
+    check(st.message_row("m5")["folder_id"] == travel, "message window: Move to folder")
 
 
 QTimer.singleShot(1200, run)
