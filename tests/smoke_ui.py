@@ -134,6 +134,8 @@ graph.GraphClient.move_message = lambda self, mid, dest: server_moves.append((mi
 graph.GraphClient.messages_before = lambda self, fid, before, limit=500: [
     {"id": f"older{i}", "parentFolderId": fid, "subject": f"Old {i}", "isRead": True,
      "receivedDateTime": f"2018-0{i}-01T00:00:00Z"} for i in (1, 2)] if fid == "in" else []
+graph.GraphClient.message_sizes = lambda self, fid: iter([
+    {m: 1024 * (i + 3) for i, m in enumerate(("m1", "m2", "m3", "m4", "m5", "m6"))}])
 graph.GraphClient.copy_message = lambda self, mid, dest: {
     "id": f"copy-of-{mid}", "parentFolderId": dest, "subject": "copied", "isRead": True,
     "receivedDateTime": "2026-11-01T10:00:00Z"}
@@ -294,6 +296,12 @@ def checks():
     view.sortByColumn(COL["received"], Qt.SortOrder.DescendingOrder)
     check(nodes()[0][1].kind == "group", "headings back when sorted by date")
 
+    # (this test's mail sync is offline, so run the size step the sync job runs after it)
+    w.mailboxes.all()[0].sync.fill_sizes("in")
+    w._refresh_messages()
+    check(st.message_row("m1")["size"] == 3072
+          and view.model_.text(st.message_row("m1"), "size") == "3 KB",
+          "message sizes are fetched separately and shown (Size column)")
     w._focus_filter()
     QTest.keyClicks(w.filter_bar.search, "contract alex")
     wait(400)
@@ -345,6 +353,7 @@ def checks():
     recurrence_checks()
     reminder_checks()
     new_button_checks()
+    compose_checks()
 
     w.close()
     saved = Settings(str(tmp / "settings.ini"))
@@ -1107,6 +1116,123 @@ def new_button_checks():
     for name, fn in real.items():
         setattr(w, name, fn)
     w.show_page("mail")
+
+
+class FakeOutbox:
+    def __init__(self):
+        self.sent, self.drafts, self.updates, self.sent_drafts, self.responses = [], [], [], [], []
+
+    def install(self):
+        G = graph.GraphClient
+        G.send_mail = lambda c, message: self.sent.append(message)
+        G.create_draft = lambda c, message: (self.drafts.append(message),
+                                             {"id": f"draft{len(self.drafts)}"})[1]
+        G.create_response = lambda c, mid, kind: (self.responses.append((mid, kind)),
+                                                  {"id": f"resp{len(self.responses)}"})[1]
+        G.update_message = lambda c, mid, changes: self.updates.append((mid, changes))
+        G.send_draft = lambda c, did: self.sent_drafts.append(did)
+
+
+def compose_windows():
+    from waddlemail.ui.compose_window import ComposeWindow
+    return [x for x in w._windows if isinstance(x, ComposeWindow)]
+
+
+def compose_checks():
+    from PySide6.QtGui import QTextCursor
+    from waddlemail.ui.preferences import PreferencesDialog
+    out = FakeOutbox()
+    out.install()
+    st.set_signature("a", "<p><b>Jordan Lee</b><br>Contoso</p>", True, True)
+
+    w.new_mail(to=["Ana Ruiz <ana@x.com>"])
+    wait(200)
+    win = compose_windows()[-1]
+    body = win.editor.text()
+    check(win.to.text().startswith("Ana Ruiz <ana@x.com>") and "Jordan Lee" in body
+          and win.editor.edit.textCursor().position() == 0,
+          "new mail: To filled, signature added, cursor above it")
+    check(not win.cc.isVisible() and not win.bcc.isVisible(), "Cc and Bcc hidden until asked")
+    win.act_bcc.trigger()
+    check(win.bcc.isVisible(), "Bcc shown on demand")
+    win.subject.setText("Hello")
+    win.editor.edit.textCursor().insertText("Hi Ana,")
+    cur = win.editor.edit.textCursor()
+    cur.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+    cur.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+    win.editor.edit.setTextCursor(cur)
+    win.editor.act_bold.trigger()
+    html = win.editor.html()
+    check("font-weight:700" in html or "font-weight:600" in html, "formatting: bold")
+    win.draftRequested.emit(win)
+    wait(300)
+    check(out.drafts and win.draft_id == "draft1", "Save draft: kept in Drafts")
+    win.act_send.trigger()
+    wait(400)
+    check(out.sent_drafts == ["draft1"] and out.updates[-1][0] == "draft1"
+          and out.updates[-1][1]["body"]["contentType"] == "html"
+          and "Hi Ana," in out.updates[-1][1]["body"]["content"]
+          and win not in compose_windows(), "Send: the saved draft goes out; the window closes")
+
+    w.show_page("mail")
+    w.folder_tree.select_folder("in")
+    wait(300)
+    w.respond("reply", "m1")
+    wait(400)
+    win = compose_windows()[-1]
+    text = win.editor.text()
+    order = [text.find(x) for x in ("Jordan Lee", "From: Priya Shah", "Final numbers")]
+    check(win.subject.text() == "RE: Q4 budget review" and "Priya" in win.to.text()
+          and -1 not in order and order == sorted(order)
+          and win.editor.edit.textCursor().position() == 0,
+          "reply: cursor at the top, then signature, then Outlook's header and the original")
+    win.insert_signature()
+    text = win.editor.text()
+    check(text.count("Jordan Lee") == 2 and text.rfind("Jordan Lee") < text.find("From: Priya"),
+          "Insert signature: right above the quoted text")
+    win.editor.edit.textCursor().insertText("Thanks!")
+    win.act_plain.setChecked(True)  # (the "lose formatting?" question is answered Yes)
+    check(win.editor.is_plain() and not win.editor.bar.isVisible()
+          and win.outgoing().html is False, "plain text: no formatting bar, sent as text")
+    win.act_send.trigger()
+    wait(400)
+    check(st.message_row("m1")["last_verb"] == 102,
+          "the original is marked replied as soon as the reply is sent")
+    check(out.responses[-1] == ("m1", "reply") and out.sent_drafts[-1] == "resp1"
+          and out.updates[-1][1]["body"]["content"].startswith("Thanks!"),
+          "reply sent through Exchange's reply draft (keeps the thread)")
+
+    w.respond("forward", "m1")
+    wait(400)
+    win = compose_windows()[-1]
+    check(win.subject.text() == "FW: Q4 budget review" and not win.to.text().strip(),
+          "forward: FW: subject, nobody in To")
+    win.sent = True
+    win.close()
+
+    st.set_signature("a", "<p>Sig</p>", False, False)
+    w.new_mail()
+    wait(200)
+    win = compose_windows()[-1]
+    check("Sig" not in win.editor.text(), "the signature can be left off new messages")
+    win.sent = True
+    win.close()
+
+    dlg = PreferencesDialog(w.settings, lambda: None, w, store=st,
+                            accounts=[("a", "jordan@contoso.com")])
+    dlg.sig_editor.edit.setHtml("<p><i>Best,</i><br>Jordan</p>")
+    dlg.sig_new.setChecked(True)
+    dlg.sig_reply.setChecked(False)
+    dlg.font_size.setValue(12)
+    dlg.text_format.setChecked(True)
+    dlg._save()
+    sig = st.signature("a")
+    check(w.settings.get("compose/font") == "Calibri",
+          "an uninstalled default font (Calibri) isn't replaced by its stand-in")
+    check("Jordan" in sig["html"] and sig["on_new"] == 1 and sig["on_reply"] == 0
+          and w.settings.get("compose/size") == 12 and not w.settings.get("compose/html"),
+          "Preferences: signature per account, when to add it, font and format")
+    w.settings.set("compose/html", True)
 
 
 def travel_id():

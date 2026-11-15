@@ -1,9 +1,8 @@
-"""New message dialog (collecting input only; sending is not wired up yet) and the Add shared
-mailbox dialog. (Events: see event_editor.py.)"""
+"""The Add shared mailbox dialog. (Composing: compose_window.py; events: event_editor.py.)"""
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit, QPlainTextEdit,
+    QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit,
 )
 
 
@@ -14,32 +13,6 @@ class _Base(QDialog):
         box.accepted.connect(self.accept)
         box.rejected.connect(self.reject)
         form.addRow(box)
-
-
-class ComposeDialog(_Base):
-    def __init__(self, parent=None, suggestions=(), to: list[str] | None = None):
-        """`suggestions` (contacts.suggestions()) feed name completion in To and Cc; `to`
-        fills in the recipients (from the Contacts view, say)."""
-        super().__init__(parent)
-        from .recipients import RecipientEdit  # (keeps this module light for the tests)
-        self.setWindowTitle("New message")
-        self.resize(640, 480)
-        form = QFormLayout(self)
-        suggestions = list(suggestions)
-        self.to, self.cc = RecipientEdit(suggestions), RecipientEdit(suggestions)
-        self.subject, self.body = QLineEdit(), QPlainTextEdit()
-        if to:
-            self.to.setText("; ".join(to) + "; ")
-        form.addRow("To:", self.to)
-        form.addRow("Cc:", self.cc)
-        form.addRow("Subject:", self.subject)
-        form.addRow(self.body)
-        self._finish(form, "Send")
-        (self.subject if to else self.to).setFocus()
-
-    def values(self) -> dict:
-        return {"to": self.to.addresses(), "cc": self.cc.addresses(),
-                "subject": self.subject.text(), "body": self.body.toPlainText()}
 
 
 class SharedMailboxDialog(_Base):

@@ -152,8 +152,10 @@ class MessageWindow(QMainWindow):
     """One message in its own window (double-click or Enter in the list)."""
 
     def __init__(self, row, remote_images: bool, reply_actions: list[QAction], move_copy,
-                 parent=None):
-        """`move_copy(copy: bool)` asks for a folder and moves (or copies) this message."""
+                 parent=None, respond=None):
+        """`move_copy(copy: bool)` asks for a folder and moves (or copies) this message;
+        `respond(kind)` replies / replies all / forwards it (kind: reply, replyAll,
+        forward). `reply_actions` are shown as they are (placeholders)."""
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle(row["subject"] or "(no subject)")
@@ -166,6 +168,15 @@ class MessageWindow(QMainWindow):
         bar = QToolBar("Message", self)
         bar.setMovable(False)
         bar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+        if respond is not None:  # this window's own Reply / Reply all / Forward
+            for icon, text, kind, key in (("reply", "Reply", "reply", "Ctrl+R"),
+                                          ("reply-all", "Reply all", "replyAll", "Ctrl+Shift+R"),
+                                          ("forward", "Forward", "forward", "Ctrl+F")):
+                act = QAction(iconset.load(icon), text, self)
+                act.setShortcut(QKeySequence(key))
+                act.setToolTip(f"{text} ({key})")
+                act.triggered.connect(lambda _=False, k=kind: respond(k))
+                bar.addAction(act)
         for act in reply_actions:
             bar.addAction(act)
         bar.addSeparator()

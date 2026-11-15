@@ -7,7 +7,7 @@ import threading
 import time
 from pathlib import Path
 
-from .graph import PROP_LAST_VERB, PROP_SIZE
+from .graph import DELTA_QUERY_VERSION, PROP_LAST_VERB, PROP_SIZE
 from .text import body_text
 
 SCHEMA = """
@@ -157,6 +157,13 @@ CREATE TABLE IF NOT EXISTS categories(
     name TEXT NOT NULL,
     color TEXT,                     -- #rrggbb
     PRIMARY KEY(account_id, name)
+);
+-- Email signatures, one per account.
+CREATE TABLE IF NOT EXISTS signatures(
+    account_id TEXT PRIMARY KEY,
+    html TEXT NOT NULL DEFAULT '',
+    on_new INTEGER DEFAULT 1,       -- add to new messages
+    on_reply INTEGER DEFAULT 1      -- add to replies and forwards
 );
 -- Contact photos, fetched when first shown. data NULL: the person has no photo (asked at
 -- `fetched`, asked again after a week).
@@ -315,8 +322,15 @@ class Store:
         missing = {c: t for c, t in _NEW_MESSAGE_COLUMNS.items() if c not in cols}
         for col, sqltype in missing.items():
             self.conn.execute(f"ALTER TABLE messages ADD COLUMN {col} {sqltype}")
-        if missing:
-            self.conn.execute("DELETE FROM sync_state WHERE key LIKE 'delta:%'")
+        version = self.conn.execute(
+            "SELECT value FROM sync_state WHERE key='delta_query'").fetchone()
+        if missing or (version or [None])[0] != DELTA_QUERY_VERSION:
+            # cursors made with another query (or before these columns existed) would keep
+            # leaving fields out: make them again (headers only; bodies and changes stay)
+            self.conn.execute("DELETE FROM sync_state WHERE key LIKE 'delta:%'"
+                              " OR key LIKE 'window:%'")
+            self.conn.execute("INSERT OR REPLACE INTO sync_state(key, value)"
+                              " VALUES('delta_query', ?)", (DELTA_QUERY_VERSION,))
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -518,6 +532,21 @@ class Store:
             sql += " AND m.has_attachments = 1"
         sql += " ORDER BY m.received DESC LIMIT ? OFFSET ?"
         return self.conn.execute(sql, (*args, limit, offset)).fetchall()
+
+    def missing_sizes(self, folder_id: str) -> set[str]:
+        return {r["id"] for r in self.conn.execute(
+            "SELECT id FROM messages WHERE folder_id=? AND size IS NULL", (folder_id,))}
+
+    def set_sizes(self, sizes: dict[str, int]) -> None:
+        with self.conn as c:
+            c.executemany("UPDATE messages SET size=? WHERE id=?",
+                          [(v, k) for k, v in sizes.items()])
+
+    def mark_responded(self, message_id: str, verb: int) -> None:
+        """Mark a message replied (102), replied to all (103) or forwarded (104) locally, as
+        Exchange does when the reply goes out (the next sync confirms it)."""
+        with self.conn as c:
+            c.execute("UPDATE messages SET last_verb=? WHERE id=?", (verb, message_id))
 
     def message_row(self, message_id: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
@@ -896,6 +925,16 @@ class Store:
     def category_colors(self) -> dict[str, str]:
         return {r["name"]: r["color"] for r in self.conn.execute(
             "SELECT name, color FROM categories ORDER BY name COLLATE NOCASE")}
+
+    # -- signatures -------------------------------------------------------------
+    def signature(self, account_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM signatures WHERE account_id=?",
+                                 (account_id,)).fetchone()
+
+    def set_signature(self, account_id: str, html: str, on_new: bool, on_reply: bool) -> None:
+        with self.conn as c:
+            c.execute("INSERT OR REPLACE INTO signatures(account_id, html, on_new, on_reply)"
+                      " VALUES(?,?,?,?)", (account_id, html, int(on_new), int(on_reply)))
 
     def has_body(self, message_id: str) -> bool:
         return self.conn.execute(

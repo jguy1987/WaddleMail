@@ -70,6 +70,25 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   offline: they go out on the next successful sync). If the server refuses one, for example in a
   shared mailbox you can only read, it is undone locally.
 - Window size, pane layout and splitter positions are remembered.
+- **Writing mail** (New Mail, Reply Ctrl+R, Reply all Ctrl+Shift+R, Forward Ctrl+F, in the
+  main window and in a message's own window) opens a compose window:
+  - From (with several accounts), To, Cc and Bcc (shown on demand; a reply all shows Cc when
+    it has some), Subject, all completing names like the contacts.
+  - A WYSIWYG body on a white page: font, size, bold/italic/underline/strikethrough, colour,
+    highlight, bullets and numbering, indent, alignment, link (Ctrl+K), clear formatting.
+    **Plain text** switches the message to text only (formatting is dropped).
+  - Replies and forwards: RE:/FW: subjects (no stacking), reply all leaves you out, and the
+    body starts with the cursor at the top, then your signature, then a line and Outlook's
+    From / Sent / To / Cc / Subject block over the original.
+  - **Signatures**, one per account (Preferences > Signatures, rich text), added
+    automatically to new messages and/or replies and forwards; **Insert signature** adds it
+    just above the quoted text (or at the end of a new message).
+  - Send (Ctrl+Enter). New mail is sent directly; replies and forwards go through Exchange's
+    reply/forward draft, so they stay in the conversation and a forward keeps the original's
+    attachments. Save draft (Ctrl+S) keeps it in Drafts; closing an unsent message asks.
+  - Preferences > Compose: write new mail in HTML or plain text; default font, size and
+    colour (a font that isn't installed, such as Calibri on Linux, is shown as its stand-in
+    but mail keeps naming it).
 - **Calendar** (the rail, or Ctrl+2):
   - Day, Work week, Week and Month views; Today and back/forward; a mini month and your
     calendars (tick to show/hide) on the left; the selected event's details on the right.
@@ -191,10 +210,10 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
 
 ## Not yet
 
-Sending mail and saving events (the New dialogs open but only collect input), personal contacts,
-calendar views, searching all folders at once, attachments and inline (`cid:`) images,
-deleting messages, moving or copying between mailboxes. Conversations only group messages within the current folder (your replies in Sent
-Items are not pulled in, as Outlook does).
+Adding attachments to new mail (forwards keep the original's), inline (`cid:`) images, an
+offline outbox (sending needs a connection), searching all folders at once, deleting messages,
+moving or copying between mailboxes. Conversations only group messages within the current
+folder (your replies in Sent Items are not pulled in, as Outlook does).
 
 ## Register the app (one time)
 
@@ -205,7 +224,7 @@ In the Entra admin center (entra.microsoft.com) > App registrations > New regist
 2. Redirect URI: platform **Mobile and desktop applications**, value `http://localhost`.
 3. Under **Authentication**, set "Allow public client flows" to **Yes**.
 4. **API permissions** > Microsoft Graph > Delegated: `Mail.ReadWrite` (mark read, flag, move),
-   `Mail.ReadWrite.Shared` (shared mailboxes and folders), `Contacts.ReadWrite` (contacts and
+   `Mail.ReadWrite.Shared` (shared mailboxes and folders), `Mail.Send` (sending), `Contacts.ReadWrite` (contacts and
    contact groups), `User.ReadBasic.All` (the organization directory), `Calendars.ReadWrite`
    (calendar, meetings, free/busy) and `MailboxSettings.Read` (your categories and colours);
    none needs admin consent. Existing users are asked to consent once more after upgrading. Sending and events will
@@ -256,6 +275,7 @@ waddlemail/desktop.py      app icon paths; launcher + icon install for the appli
 waddlemail/notify.py       desktop notifications and the task manager unread badge
 waddlemail/contacts.py     contacts/directory/contact group sync, To/Cc suggestions
 waddlemail/calendars.py    calendars, events, categories, free/busy, layout and free-time search
+waddlemail/compose.py      replies: recipients, subjects, quoted header; the message to send
 waddlemail/resources/      app icon (SVG + PNG sizes), tray icons, launcher template
 waddlemail/settings.py     Preferences (QSettings) and their defaults
 waddlemail/ui/             main window + menus/toolbar, preferences, new mail/event dialogs, safe rendering
@@ -271,6 +291,8 @@ waddlemail/ui/calendar_view.py  the Calendar page: day/week/month views and even
 waddlemail/ui/event_editor.py  the event/meeting editor and the scheduling assistant
 waddlemail/ui/recurrence_dialog.py  custom repeat pattern
 waddlemail/ui/reminders.py  reminders window and the service that raises it
+waddlemail/ui/compose_window.py  the compose window (new, reply, forward)
+waddlemail/ui/rich_editor.py  WYSIWYG editor with formatting bar (mail and signatures)
 waddlemail/ui/contacts_view.py  the Contacts page
 waddlemail/ui/contact_dialogs.py  contact editor (with photo), contact group editor, avatars
 waddlemail/ui/recipients.py  To/Cc field with name completion
@@ -288,10 +310,17 @@ waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 - Immutable IDs: moving a message between folders keeps its id, so cached bodies stay valid, and a
   "removed" notice from the old folder cannot delete a message already re-homed in the new one.
 - Delta updates merge field by field, so a partial update never blanks a subject or sender.
-- Replied/forwarded state and size come from MAPI properties (`PidTagLastVerbExecuted` 0x1081,
-  `PidTagMessageSize` 0x0E08) expanded in the same delta request. If a server refuses the
-  `$expand`, sync continues without them. Adding these fields reset the delta cursors once, so
-  existing mail gets them on the next sync.
+- Replied/forwarded state comes from the MAPI property `PidTagLastVerbExecuted` (0x1081),
+  expanded in the same delta request. The filter inside that `$expand` accepts only
+  `id eq '...'`, one property per request (an earlier `or` for the message size too made
+  Exchange refuse it, and sync silently went on without both). Sizes (`PidTagMessageSize`,
+  0x0E08) come from a second request on the folder's message list, ids and sizes only, 500 a
+  page, newest first; it runs after a sync only while some messages lack a size (a few pages
+  at a time for a first fill). If a server refuses either, sync continues and the status bar
+  says so. Delta cursors remember their
+  query, so a change to it (`DELTA_QUERY_VERSION`) makes them again once; headers are
+  downloaded again, bodies and queued changes stay. Replies and forwards sent from WaddleMail
+  mark the original at once.
 - A queued read/flag change wins over an older value arriving in a delta page, so the list
   never flickers back to unread while the change is on its way.
 - Search: `body_fts` is an FTS5 table keyed by the `bodies` rowid. `put_body` adds the text and
@@ -300,7 +329,7 @@ waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 
 ## Next steps
 
-1. Real sending (`Mail.Send`) through an outbox, and deleting messages through the change
+1. Attachments when writing, an offline outbox, and deleting messages through the change
    queue (`pending` table) that read/flag/move already use.
 2. Removing a contact's photo (Graph has no call for it); photos in lists and autocomplete.
 3. Calendar: other people's shared calendars, room booking; reminders dismissed on another

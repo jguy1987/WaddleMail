@@ -40,3 +40,11 @@ def placeholder(text: str) -> str:
         f"<style>{_BASE_CSS}</style></head>"
         f"<body><p style='color:#777'>{html.escape(text)}</p></body></html>"
     )
+
+
+def quotable_html(content_type: str, content: str) -> str:
+    """A received body as a safe HTML fragment, to quote in a reply or forward."""
+    if content_type == "text":
+        return "<div>" + html.escape(content).replace("\n", "<br>") + "</div>"
+    return nh3.clean(content, attributes=_ATTRS,
+                     url_schemes={"http", "https", "mailto", "cid", "data"})

@@ -23,6 +23,10 @@ DEFAULTS = {
     "tray/close_to_tray": False,   # closing the window keeps WaddleMail running in the tray
     "view/splash": True,           # splash screen while starting
     "reminders/enabled": True,     # event reminders (window + notification)
+    "compose/html": True,          # write new mail in HTML (else plain text)
+    "compose/font": "Calibri",     # default font for new mail...
+    "compose/size": 11,            # ...its size in points...
+    "compose/color": "#000000",    # ...and colour
     # Window layout, saved on exit (not shown in Preferences).
     "window/geometry": QByteArray(),
     "window/folder_split": QByteArray(),

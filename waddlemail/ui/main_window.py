@@ -27,7 +27,8 @@ from ..text import body_text as _plain
 from . import iconset
 from .contacts_view import ContactsView
 from .calendar_view import CalendarPage
-from .dialogs import ComposeDialog, SharedMailboxDialog
+from .compose_window import ComposeWindow
+from .dialogs import SharedMailboxDialog
 from .event_editor import EventEditor
 from .reminders import ReminderService, ReminderWindow
 from .folder_pane import FolderPane
@@ -604,6 +605,10 @@ class MainWindow(QMainWindow):
 
         def job():
             res = box.sync.sync_folder(fid)
+            try:  # sizes come separately (one cheap request, only when some are missing)
+                box.sync.fill_sizes(fid)
+            except Exception as exc:
+                log.info("message sizes not fetched: %s", exc)
             new = list(res.new_ids)
             # Every account's Inbox too, so new mail is noticed (and announced) wherever
             # you are. Shared mailboxes only get their counts refreshed.
@@ -625,6 +630,15 @@ class MainWindow(QMainWindow):
     def _sync_done(self, payload):
         self._syncing = False
         fid, res, new = payload
+        for box in self.mailboxes.all():  # say it (once) if the server won't give these
+            refused = [what for what, why in (("replied/forwarded marks",
+                                               box.graph.expand_refused),
+                                              ("message sizes", box.sync.sizes_refused)) if why]
+            if refused and not getattr(box, "_told_refused", False):
+                box._told_refused = True
+                self.statusBar().showMessage(
+                    f"The server didn't send {' or '.join(refused)} for {box.display_name}",
+                    15_000)
         self.status.synced()
         self._notify_new(new)
         if res.upserted or res.removed:  # new mail may match a search: ask the server again
@@ -680,10 +694,9 @@ class MainWindow(QMainWindow):
         box = self.mailboxes.for_folder(self._current_folder) if self._current_folder else None
         if row is None or box is None:
             return
-        win = MessageWindow(row, self.images_action.isChecked(),
-                            [self.act_reply, self.act_reply_all, self.act_forward,
-                             self.act_delete],
-                            lambda copy: self.move_messages([mid], copy=copy, parent=win), self)
+        win = MessageWindow(row, self.images_action.isChecked(), [self.act_delete],
+                            lambda copy: self.move_messages([mid], copy=copy, parent=win), self,
+                            respond=lambda kind: self.respond(kind, mid))
         self._windows.add(win)
         win.destroyed.connect(lambda *_: self._windows.discard(win))
         win.show()
@@ -1189,6 +1202,9 @@ class MainWindow(QMainWindow):
         any_selected = bool(self.msg_list.selected_ids())
         for act in self._message_actions:
             act.setEnabled(any_selected)
+        one = self.msg_list.shown_id() is not None  # reply to one message (or conversation)
+        for act in (self.act_reply, self.act_reply_all, self.act_forward):
+            act.setEnabled(one)
 
     # -- reading pane / layout -----------------------------------------
     def set_reading_pane(self, mode: str):
@@ -1327,9 +1343,13 @@ class MainWindow(QMainWindow):
             "Select &all", "", self._edit_select_all, QKeySequence.StandardKey.SelectAll)
 
         # Placeholders until the outbox / message actions exist.
-        self.act_reply = self._themed("Reply", "reply", lambda: None, enabled=False, tip=soon)
-        self.act_reply_all = self._themed("Reply all", "reply-all", lambda: None, enabled=False, tip=soon)
-        self.act_forward = self._themed("Forward", "forward", lambda: None, enabled=False, tip=soon)
+        self.act_reply = self._themed("Reply", "reply", lambda: self.respond("reply"),
+                                      "Ctrl+R", enabled=False, tip="Reply (Ctrl+R)")
+        self.act_reply_all = self._themed("Reply all", "reply-all",
+                                          lambda: self.respond("replyAll"), "Ctrl+Shift+R",
+                                          enabled=False, tip="Reply all (Ctrl+Shift+R)")
+        self.act_forward = self._themed("Forward", "forward", lambda: self.respond("forward"),
+                                        "Ctrl+F", enabled=False, tip="Forward (Ctrl+F)")
         self.act_delete = self._themed("Delete", "trash-2", lambda: None, enabled=False, tip=soon)
 
         # Message actions; they work on the selection. "\tEnter" only labels the key: the
@@ -1548,11 +1568,113 @@ class MainWindow(QMainWindow):
             self, "About WaddleMail",
             f"WaddleMail {__version__}\n\nA Linux mail client for Microsoft 365.")
 
+    # -- composing and sending -------------------------------------------------------
+    def _compose_accounts(self) -> list[tuple[str, str]]:
+        return [(b.account_id, b.display_name) for b in self.mailboxes.all() if not b.shared]
+
+    def _compose(self, **kwargs) -> ComposeWindow:
+        s = self.settings
+        win = ComposeWindow(self._compose_accounts(), suggestions(self.store),
+                            {"html": s.get("compose/html"), "font": s.get("compose/font"),
+                             "size": s.get("compose/size"), "color": s.get("compose/color")},
+                            self.store.signature, parent=self, **kwargs)
+        win.sendRequested.connect(self.send_message)
+        win.draftRequested.connect(self.save_draft)
+        self._windows.add(win)
+        win.destroyed.connect(lambda *_: self._windows.discard(win))
+        win.show()
+        return win
+
     def new_mail(self, to: list[str] | None = None):
-        dlg = ComposeDialog(self, suggestions(self.store), to)
-        if dlg.exec():
-            _values = dlg.values()  # TODO: queue in outbox, then POST /me/sendMail
-            self.statusBar().showMessage("Sending isn't wired up yet", 5000)
+        if not self._compose_accounts():
+            self.statusBar().showMessage("Sign in first", 4000)
+            return
+        box = self.mailboxes.for_folder(self._current_folder) if self._current_folder else None
+        self._compose(to=to, account_id=box.account_id if box else None)
+
+    def respond(self, kind: str, message_id: str | None = None):
+        """Reply (kind "reply"), reply all ("replyAll") or forward ("forward") the message
+        shown (or `message_id`), with its text quoted below."""
+        mid = message_id or self.msg_list.current_id() or self._current_message
+        row = self.store.message_row(mid) if mid else None
+        box = self.mailboxes.for_folder(row["folder_id"]) if row else None
+        if row is None or box is None:
+            return
+        self._run(lambda: box.bodies.get(mid),
+                  lambda body: self._compose(kind=kind, original=row,
+                                             original_body=(body.content_type, body.content),
+                                             account_id=box.account_id),
+                  activity=None if self.store.has_body(mid) else "Downloading message…")
+
+    def _sending_box(self, win: ComposeWindow):
+        """A reply goes out from the mailbox its message is in; new mail from From."""
+        if win.original is not None:
+            return self.mailboxes.for_folder(win.original["folder_id"])
+        return next((b for b in self.mailboxes.all()
+                     if not b.shared and b.account_id == win.account_id()), None)
+
+    def _write_draft(self, box, win: ComposeWindow) -> str:
+        """Create or update the message in Drafts (worker thread); returns its id."""
+        message = win.outgoing().graph_message()
+        draft_id = win.draft_id
+        if draft_id is None:
+            if win.original is not None:
+                draft_id = box.graph.create_response(win.original["id"], win.kind)["id"]
+            else:
+                draft_id = box.graph.create_draft(message)["id"]
+                return draft_id
+        box.graph.update_message(draft_id, message)
+        return draft_id
+
+    def send_message(self, win: ComposeWindow):
+        box = self._sending_box(win)
+        if box is None:
+            return
+        out = win.outgoing()
+        win.act_send.setEnabled(False)
+
+        def job():
+            if win.original is None and win.draft_id is None:
+                box.graph.send_mail(out.graph_message())  # new mail: straight out
+            else:  # replies/forwards (threading, forwarded attachments) and saved drafts
+                box.graph.send_draft(self._write_draft(box, win))
+
+        original = win.original["id"] if win.original is not None else None
+        verb = {"reply": 102, "replyAll": 103, "forward": 104}.get(win.kind)
+
+        def done(_):
+            win.sent = True
+            win.close()
+            self.statusBar().showMessage(f"Sent: {out.subject or '(no subject)'}", 5000)
+            if original and verb:  # replied / forwarded mark on the original, right away
+                self.store.mark_responded(original, verb)
+                self.msg_list.model_.update_rows([self.store.message_row(original)])
+            QTimer.singleShot(5000, self.sync_current)  # the reply mark, Sent Items
+
+        def failed(msg: str):
+            win.act_send.setEnabled(True)
+            QMessageBox.warning(win, "Send", f"The message wasn't sent.\n\n{msg}")
+
+        self._run(job, done, on_failed=failed, activity="Sending…")
+
+    def save_draft(self, win: ComposeWindow):
+        box = self._sending_box(win)
+        if box is None:
+            return
+        closing = win.sent  # "Save draft" from closing the window
+
+        def done(draft_id: str):
+            win.mark_saved(draft_id)
+            self.statusBar().showMessage("Saved to Drafts", 3000)
+            if closing:
+                win.close()
+
+        def failed(msg: str):
+            win.sent = False
+            QMessageBox.warning(win, "Save draft", f"The draft wasn't saved.\n\n{msg}")
+
+        self._run(lambda: self._write_draft(box, win), done, on_failed=failed,
+                  activity="Saving draft…")
 
     # -- calendar ------------------------------------------------------------
     def _calendar_boxes(self):
@@ -1820,7 +1942,8 @@ class MainWindow(QMainWindow):
 
     # -- preferences ----------------------------------------------------
     def show_preferences(self):
-        dlg = PreferencesDialog(self.settings, self._clear_cache, self)
+        dlg = PreferencesDialog(self.settings, self._clear_cache, self, store=self.store,
+                                accounts=self._compose_accounts())
         if dlg.exec():
             self._apply_settings()
             self._no_older.clear()

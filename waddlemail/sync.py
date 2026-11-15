@@ -29,6 +29,7 @@ class SyncEngine:
         self.graph = graph
         self.mailbox_id = mailbox_id
         self.initial_days = initial_days
+        self.sizes_refused = ""  # set if the server won't send message sizes
 
     def sync_folders(self) -> None:
         self.store.upsert_folders(self.mailbox_id, self.graph.list_folders())
@@ -94,6 +95,31 @@ class SyncEngine:
         (or before periods were recorded)."""
         used = self.store.get_state(f"window:{folder_id}")
         return used is None or self._since() < used
+
+    def fill_sizes(self, folder_id: str, max_pages: int = 4) -> int:
+        """Fetch the sizes of the folder's messages that don't have one yet (the delta can't
+        bring them; see graph.EXTENDED_PROPS), newest first, up to `max_pages` x 500 per
+        call. Costs nothing when every size is known. Returns how many were filled."""
+        if self.sizes_refused:
+            return 0
+        missing = self.store.missing_sizes(folder_id)
+        if not missing:
+            return 0
+        filled = 0
+        try:
+            for i, page in enumerate(self.graph.message_sizes(folder_id)):
+                found = {k: v for k, v in page.items() if k in missing}
+                self.store.set_sizes(found)
+                filled += len(found)
+                missing -= found.keys()
+                if not missing or i + 1 >= max_pages:
+                    break
+        except GraphError as exc:
+            if exc.status != 400:
+                raise
+            log.warning("message sizes refused: %s", exc)
+            self.sizes_refused = str(exc)
+        return filled
 
     def fetch_older(self, folder_id: str, limit: int = 500) -> int:
         """Download up to `limit` messages older than the oldest one stored for the folder

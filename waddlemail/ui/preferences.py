@@ -1,10 +1,11 @@
 """Preferences dialog."""
 from __future__ import annotations
 
-from PySide6.QtGui import QPalette
+from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+    QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFontComboBox,
+    QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QRadioButton, QSpinBox,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 from ..settings import Settings
@@ -42,11 +43,14 @@ class PeriodEdit(QWidget):
 
 
 class PreferencesDialog(QDialog):
-    def __init__(self, settings: Settings, clear_cache, parent=None):
+    def __init__(self, settings: Settings, clear_cache, parent=None, store=None,
+                 accounts: list[tuple[str, str]] = ()):
+        """`store` and `accounts` ([(account id, address)]) are for the Signatures tab."""
         super().__init__(parent)
         self.s = settings
+        self.store = store
         self.setWindowTitle("Preferences")
-        self.resize(560, 360)
+        self.resize(640, 460)
         tabs = QTabWidget()
 
         general = QWidget()
@@ -130,6 +134,77 @@ class PreferencesDialog(QDialog):
         f.addRow(clear)
         tabs.addTab(storage, "Storage")
 
+        compose = QWidget()
+        f = QFormLayout(compose)
+        self.html_format, self.text_format = QRadioButton("HTML"), QRadioButton("Plain text")
+        (self.html_format if settings.get("compose/html") else self.text_format).setChecked(True)
+        fmt = QHBoxLayout()
+        fmt.addWidget(self.html_format)
+        fmt.addWidget(self.text_format)
+        fmt.addStretch()
+        f.addRow("Write new mail in:", fmt)
+        self.font_box = QFontComboBox()
+        self.font_box.setCurrentFont(QFont(settings.get("compose/font")))
+        # A font that isn't installed shows as its stand-in (Calibri as Carlito, say); save
+        # the stand-in only if you pick a font, so mail keeps naming the font you chose.
+        self._shown_font = self.font_box.currentFont().family()
+        self.font_size = QSpinBox()
+        self.font_size.setRange(6, 72)
+        self.font_size.setSuffix(" pt")
+        self.font_size.setValue(settings.get("compose/size"))
+        self.font_color = QPushButton()
+        self._color = QColor(settings.get("compose/color"))
+        self.font_color.clicked.connect(self._pick_color)
+        font_row = QHBoxLayout()
+        font_row.addWidget(self.font_box, 1)
+        font_row.addWidget(self.font_size)
+        font_row.addWidget(self.font_color)
+        f.addRow("Default font:", font_row)
+        self.sample = QLabel("The quick brown fox jumps over the lazy dog.")
+        self.sample.setAutoFillBackground(True)
+        pal = self.sample.palette()
+        pal.setColor(QPalette.ColorRole.Window, QColor("white"))
+        self.sample.setPalette(pal)
+        self.sample.setContentsMargins(8, 8, 8, 8)
+        f.addRow("", self.sample)
+        self._show_color()
+        for sig in (self.font_box.currentFontChanged, self.font_size.valueChanged):
+            sig.connect(lambda *_: self._show_color())
+        tabs.addTab(compose, "Compose")
+
+        self._signatures: dict[str, tuple[str, bool, bool]] = {}
+        self._sig_shown = None
+        if store is not None and accounts:
+            from .rich_editor import RichEditor
+            sigs = QWidget()
+            v = QVBoxLayout(sigs)
+            top = QHBoxLayout()
+            top.addWidget(QLabel("Account:"))
+            self.sig_account = QComboBox()
+            for account_id, address in accounts:
+                self.sig_account.addItem(address, account_id)
+                row = store.signature(account_id)
+                self._signatures[account_id] = (row["html"], bool(row["on_new"]),
+                                                bool(row["on_reply"])) if row else ("", True, True)
+            top.addWidget(self.sig_account, 1)
+            v.addLayout(top)
+            self.sig_editor = RichEditor()
+            self.sig_editor.set_default_font(settings.get("compose/font"),
+                                             settings.get("compose/size"),
+                                             settings.get("compose/color"))
+            v.addWidget(self.sig_editor, 1)
+            self.sig_new = QCheckBox("Add it to new messages")
+            self.sig_reply = QCheckBox("Add it to replies and forwards")
+            v.addWidget(self.sig_new)
+            v.addWidget(self.sig_reply)
+            hint = QLabel("In a message, “Insert signature” adds it just above the quoted text.")
+            hint.setForegroundRole(QPalette.ColorRole.PlaceholderText)
+            v.addWidget(hint)
+            self._sig_shown = None
+            self.sig_account.currentIndexChanged.connect(lambda _: self._show_signature())
+            self._show_signature()
+            tabs.addTab(sigs, "Signatures")
+
         box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         box.accepted.connect(self._save)
@@ -143,8 +218,52 @@ class PreferencesDialog(QDialog):
         if d:
             self.path.setText(d)
 
+    # -- compose --------------------------------------------------------------------------
+    def _pick_color(self):
+        color = QColorDialog.getColor(self._color, self, "Text colour")
+        if color.isValid():
+            self._color = color
+            self._show_color()
+
+    def _show_color(self):
+        self.font_color.setText(self._color.name())
+        self.font_color.setStyleSheet(f"color: {self._color.name()}")
+        font = QFont(self.font_box.currentFont())
+        font.setPointSize(self.font_size.value())
+        self.sample.setFont(font)
+        self.sample.setStyleSheet(f"color: {self._color.name()}; background: white")
+
+    # -- signatures ---------------------------------------------------------------------------
+    def _keep_signature(self):
+        if self._sig_shown is not None:
+            text = self.sig_editor.text().strip()
+            html = self.sig_editor.html() if text or "<img" in self.sig_editor.html() else ""
+            self._signatures[self._sig_shown] = (html, self.sig_new.isChecked(),
+                                                 self.sig_reply.isChecked())
+
+    def _show_signature(self):
+        self._keep_signature()
+        account_id = self.sig_account.currentData()
+        html, on_new, on_reply = self._signatures.get(account_id, ("", True, True))
+        if html:
+            self.sig_editor.edit.setHtml(html)
+        else:
+            self.sig_editor.edit.clear()
+        self.sig_new.setChecked(on_new)
+        self.sig_reply.setChecked(on_reply)
+        self._sig_shown = account_id
+
     def _save(self) -> None:
         s = self.s
+        s.set("compose/html", self.html_format.isChecked())
+        if self.font_box.currentFont().family() != self._shown_font:
+            s.set("compose/font", self.font_box.currentFont().family())
+        s.set("compose/size", self.font_size.value())
+        s.set("compose/color", self._color.name())
+        if self._signatures:
+            self._keep_signature()
+            for account_id, (html, on_new, on_reply) in self._signatures.items():
+                self.store.set_signature(account_id, html, on_new, on_reply)
         s.set("images/load_remote", self.images.isChecked())
         s.set("sync/interval_min", self.interval.value())
         s.set("notify/new_mail", self.notify.isChecked())

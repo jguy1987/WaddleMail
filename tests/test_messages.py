@@ -238,3 +238,83 @@ def test_list_has_no_size_cap(tmp_path):
     st.apply_message_changes("F", [{"id": f"x{i}", "receivedDateTime": "2024-01-01T00:00:00Z"}
                                    for i in range(5200)])
     assert len(st.list_messages("F")) == 5200
+
+
+def test_delta_asks_for_reply_state_with_a_plain_eq_filter():
+    """Exchange accepts only "id eq" in this filter; an "or" made it refuse the request."""
+    from tests.test_mailboxes import FakeResponse
+
+    class Session:
+        def request(self, method, url, params=None, **kw):
+            self.params = dict(params or {})
+            return FakeResponse(200, {"value": [], "@odata.deltaLink": "L"})
+
+    s = Session()
+    list(GraphClient(lambda: "t", session=s).messages_delta("F"))
+    assert s.params["$expand"] == ("singleValueExtendedProperties("
+                                   "$filter=id eq 'Integer 0x1081')")
+
+
+def test_cursors_are_remade_once_when_the_query_changes(tmp_path):
+    st = make_store(tmp_path, msg("m1"))
+    st.set_state("delta:F", "OLD-QUERY")
+    st.set_state("delta_query", "1")  # made by the version with the refused "or" filter
+    st.conn.commit()
+    st2 = Store(tmp_path / "m.db")
+    assert st2.get_state("delta:F") is None and st2.get_state("delta_query") == "2"
+    assert st2.message_row("m1") is not None  # mail stays; only the cursor goes
+    st2.set_state("delta:F", "NEW")
+    assert Store(tmp_path / "m.db").get_state("delta:F") == "NEW"  # only once
+
+
+def test_marking_responded_locally(tmp_path):
+    st = make_store(tmp_path, msg("m1"))
+    st.mark_responded("m1", 103)
+    assert st.message_row("m1")["last_verb"] == 103
+    st.apply_message_changes("F", [{"id": "m1", "subject": "later update"}])
+    assert st.message_row("m1")["last_verb"] == 103  # kept until the server says otherwise
+
+
+def test_message_sizes_request():
+    from tests.test_mailboxes import FakeResponse
+
+    class Session:
+        def request(self, method, url, params=None, **kw):
+            self.params = dict(params or {})
+            return FakeResponse(200, {"value": [
+                {"id": "a", "singleValueExtendedProperties": [
+                    {"id": "Integer 0xe08", "value": "2048"}]},
+                {"id": "b"}]})
+
+    s = Session()
+    [page] = list(GraphClient(lambda: "t", session=s).message_sizes("F"))
+    assert page == {"a": 2048}
+    assert s.params["$expand"] == "singleValueExtendedProperties($filter=id eq 'Integer 0x0E08')"
+    assert s.params["$select"] == "id" and s.params["$top"] == 500
+
+
+def test_fill_sizes(tmp_path):
+    st = make_store(tmp_path, msg("m1"), msg("m2"), msg("m3"))
+
+    class G:
+        def __init__(self, pages=(), status=None):
+            self.pages, self.status, self.asked = list(pages), status, 0
+
+        def message_sizes(self, folder_id):
+            self.asked += 1
+            if self.status:
+                raise GraphError("no", self.status)
+            yield from self.pages
+
+    g = G([{"m3": 300, "x": 1}, {"m2": 200}, {"m1": 100}])
+    eng = SyncEngine(st, g, "a")
+    assert eng.fill_sizes("F", max_pages=2) == 2          # two pages, then stops for now
+    assert st.missing_sizes("F") == {"m1"}
+    assert eng.fill_sizes("F") == 1 and not st.missing_sizes("F")
+    g.asked = 0
+    assert eng.fill_sizes("F") == 0 and g.asked == 0      # all known: no request
+    st.apply_message_changes("F", [{"id": "m1", "subject": "changed"}])
+    assert st.message_row("m1")["size"] == 100            # a later update keeps it
+    st.apply_message_changes("F", [msg("m4")])
+    refusing = SyncEngine(st, G(status=400), "a")
+    assert refusing.fill_sizes("F") == 0 and refusing.sizes_refused

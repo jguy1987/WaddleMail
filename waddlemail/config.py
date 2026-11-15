@@ -15,8 +15,9 @@ AUTHORITY = f"https://login.microsoftonline.com/{TENANT}"
 # folders other people have shared with you. Contacts: personal contacts and contact groups.
 # User.ReadBasic.All: the organization directory (names, addresses, titles; no admin consent).
 # Calendars: events and free/busy; MailboxSettings.Read: your Outlook categories and colours.
-SCOPES = ["Mail.ReadWrite", "Mail.ReadWrite.Shared", "Contacts.ReadWrite", "User.ReadBasic.All",
-          "Calendars.ReadWrite", "MailboxSettings.Read"]
+# Mail.Send: sending new mail, replies and forwards.
+SCOPES = ["Mail.ReadWrite", "Mail.ReadWrite.Shared", "Mail.Send", "Contacts.ReadWrite",
+          "User.ReadBasic.All", "Calendars.ReadWrite", "MailboxSettings.Read"]
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 

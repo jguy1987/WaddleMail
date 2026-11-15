@@ -57,11 +57,15 @@ EVENT_FIELDS = (
 CALENDAR_FIELDS = ("id,name,hexColor,color,isDefaultCalendar,canEdit,"
                    "allowedOnlineMeetingProviders,owner")
 # MAPI properties Graph has no first-class field for: PidTagLastVerbExecuted (102 replied,
-# 103 replied to all, 104 forwarded) and PidTagMessageSize (bytes).
+# 103 replied to all, 104 forwarded) and PidTagMessageSize (bytes). Only one can be expanded
+# per request: the $filter in $expand=singleValueExtendedProperties takes "id eq" and nothing
+# else (an "or" for both made Exchange refuse it). So the delta brings the reply state and
+# message_sizes() fetches sizes separately, cheaply (ids and sizes only, 500 a page).
 PROP_LAST_VERB = "Integer 0x1081"
 PROP_SIZE = "Integer 0x0E08"
-EXTENDED_PROPS = (f"singleValueExtendedProperties($filter=id eq '{PROP_LAST_VERB}'"
-                  f" or id eq '{PROP_SIZE}')")
+EXTENDED_PROPS = f"singleValueExtendedProperties($filter=id eq '{PROP_LAST_VERB}')"
+# Delta cursors remember the query they were made with: when it changes, they are made again.
+DELTA_QUERY_VERSION = "2"  # 2: reply state with a single "id eq" filter
 
 
 def _network_problem(exc: requests.RequestException) -> str:
@@ -102,6 +106,7 @@ class GraphClient:
         self._base = base.rstrip("/")
         self._root = f"/users/{quote(user, safe='@')}" if user else "/me"
         self._expand_props = True  # turned off if the server refuses the $expand
+        self.expand_refused = ""
         self._s = session or requests.Session()
         self._sleep = sleep
 
@@ -443,9 +448,9 @@ class GraphClient:
             except GraphError as exc:
                 if exc.status != 400 or not params or "$expand" not in params:
                     raise
-                log.warning("extended properties refused; syncing without reply state/size: %s",
-                            exc)
+                log.warning("reply state refused; syncing without it: %s", exc)
                 self._expand_props = False
+                self.expand_refused = str(exc)  # MainWindow says so once
                 params = {k: v for k, v in params.items() if k != "$expand"}
                 continue
             nxt = data.get("@odata.nextLink")
@@ -453,6 +458,24 @@ class GraphClient:
             if not nxt:
                 return
             url, params = nxt, None
+
+    def message_sizes(self, folder_id: str) -> Iterator[dict[str, int]]:
+        """{message id: size in bytes} for a folder, a page (up to 500) at a time, newest
+        first; stop iterating when you have what you need."""
+        url = f"{self._root}/mailFolders/{quote(folder_id, safe='')}/messages"
+        params = {"$select": "id", "$top": 500, "$orderby": "receivedDateTime desc",
+                  "$expand": f"singleValueExtendedProperties($filter=id eq '{PROP_SIZE}')"}
+        while url:
+            data = self._request(url, params=params, headers=_prefer())
+            sizes = {}
+            for item in data.get("value", []):
+                for prop in item.get("singleValueExtendedProperties") or []:
+                    try:
+                        sizes[item["id"]] = int(prop.get("value"))
+                    except (TypeError, ValueError):
+                        pass
+            yield sizes
+            url, params = data.get("@odata.nextLink"), None
 
     def messages_before(self, folder_id: str, before: str, limit: int = 500) -> list[dict]:
         """Up to `limit` messages received before `before` (ISO time), newest first: mail
@@ -506,6 +529,29 @@ class GraphClient:
         return self._request(f"{self._root}/messages/{quote(message_id, safe='')}/copy",
                              method="POST", json={"destinationId": destination_id},
                              headers=_prefer())
+
+    # -- sending ------------------------------------------------------------
+    def send_mail(self, message: dict) -> None:
+        """Send a new message (a copy is kept in Sent Items)."""
+        self._request(f"{self._root}/sendMail", method="POST",
+                      json={"message": message, "saveToSentItems": True})
+
+    def create_draft(self, message: dict) -> dict:
+        """Save a new message in Drafts; returns it (with its id)."""
+        return self._request(f"{self._root}/messages", method="POST", json=message,
+                             headers=_prefer())
+
+    def create_response(self, message_id: str, kind: str) -> dict:
+        """A reply / reply-all / forward draft of a message (`kind`: reply, replyAll,
+        forward). Exchange sets the threading headers and, for a forward, copies the
+        attachments; we then fill in the body and recipients."""
+        action = {"reply": "createReply", "replyAll": "createReplyAll",
+                  "forward": "createForward"}[kind]
+        return self._request(f"{self._root}/messages/{quote(message_id, safe='')}/{action}",
+                             method="POST", headers=_prefer())
+
+    def send_draft(self, draft_id: str) -> None:
+        self._request(f"{self._root}/messages/{quote(draft_id, safe='')}/send", method="POST")
 
     def get_message_body(self, message_id: str) -> tuple[str, str]:
         """Return (content_type, content); content_type is 'html' or 'text'."""
