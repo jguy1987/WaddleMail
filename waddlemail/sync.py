@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 
 from . import config
-from .graph import DeltaResetError, GraphClient
+from .graph import DeltaResetError, GraphClient, GraphError
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -30,7 +30,30 @@ class SyncEngine:
     def sync_folders(self) -> None:
         self.store.upsert_folders(self.mailbox_id, self.graph.list_folders())
 
+    def send_changes(self) -> int:
+        """Send queued read/flag changes. A change the server refuses (no write access to a
+        shared mailbox, message deleted) is undone locally; network or server errors leave it
+        queued for the next try. Returns how many were sent."""
+        sent = 0
+        for ch in self.store.pending_changes(self.mailbox_id):
+            if ch["field"] == "isRead":
+                body = {"isRead": ch["value"] == "1"}
+            else:
+                body = {"flag": {"flagStatus": ch["value"]}}
+            try:
+                self.graph.update_message(ch["message_id"], body)
+            except GraphError as exc:
+                if exc.status not in (400, 403, 404):
+                    raise
+                log.warning("server refused %s on %s: %s", ch["field"], ch["message_id"], exc)
+                self.store.change_refused(ch["id"])
+                continue
+            self.store.change_sent(ch["id"])
+            sent += 1
+        return sent
+
     def sync_folder(self, folder_id: str) -> SyncResult:
+        self.send_changes()  # first, so the delta below already reflects them
         key = f"delta:{folder_id}"
         link = self.store.get_state(key)
         try:

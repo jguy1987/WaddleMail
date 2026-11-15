@@ -1,7 +1,7 @@
 """User preferences, persisted with QSettings (~/.config/WaddleMail/WaddleMail.conf)."""
 from __future__ import annotations
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QByteArray, QSettings
 
 DEFAULTS = {
     "images/load_remote": False,   # load remote images by default
@@ -11,6 +11,16 @@ DEFAULTS = {
     "cache/max_mb": 200,           # message body cache size limit
     "cache/max_age_days": 0,       # discard cached bodies not opened for this long; 0 = never
     "sync/interval_min": 1,        # check for new mail every N minutes
+    "read/mark_on_view": True,     # mark messages read when shown in the reading pane...
+    "read/mark_delay_sec": 0,      # ...after this many seconds
+    "view/reading_pane": "bottom", # right / bottom / off
+    "view/filter_bar": True,       # quick filter bar above the message list
+    # Window layout, saved on exit (not shown in Preferences).
+    "window/geometry": QByteArray(),
+    "window/folder_split": QByteArray(),
+    "window/split_right": QByteArray(),
+    "window/split_bottom": QByteArray(),
+    "list/header": QByteArray(),   # column order, widths, visibility and sort
 }
 
 

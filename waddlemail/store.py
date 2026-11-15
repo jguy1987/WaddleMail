@@ -1,10 +1,13 @@
 """SQLite store: mailboxes, folder tree, message metadata, LRU body cache, sync cursors."""
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
 from pathlib import Path
+
+from .graph import PROP_LAST_VERB, PROP_SIZE
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS mailboxes(
@@ -36,7 +39,13 @@ CREATE TABLE IF NOT EXISTS messages(
     received TEXT,
     is_read INTEGER DEFAULT 0,
     has_attachments INTEGER DEFAULT 0,
-    preview TEXT
+    preview TEXT,
+    to_recipients TEXT,             -- JSON [[name, address], ...]
+    cc_recipients TEXT,
+    importance TEXT,                -- low / normal / high
+    flag TEXT,                      -- notFlagged / flagged / complete
+    last_verb INTEGER,              -- 102 replied, 103 replied all, 104 forwarded
+    size INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_messages_folder_received
     ON messages(folder_id, received DESC);
@@ -51,13 +60,33 @@ CREATE TABLE IF NOT EXISTS sync_state(
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+-- Local changes (read/unread, flag) not yet sent to the server. One per message and field:
+-- a newer change replaces an unsent older one. `old` is restored if the server refuses it.
+CREATE TABLE IF NOT EXISTS pending(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mailbox_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    field TEXT NOT NULL,            -- isRead / flag
+    value TEXT NOT NULL,
+    old TEXT,
+    UNIQUE(message_id, field)
+);
 """
+
+# Message columns added after the first release; adding them resets the delta cursors so
+# the next sync fetches the new fields for mail already stored.
+_NEW_MESSAGE_COLUMNS = {
+    "to_recipients": "TEXT", "cc_recipients": "TEXT", "importance": "TEXT", "flag": "TEXT",
+    "last_verb": "INTEGER", "size": "INTEGER",
+}
 
 _UPSERT_MESSAGE = """
 INSERT INTO messages(id, folder_id, conversation_id, subject, sender_name, sender_addr,
-                     received, is_read, has_attachments, preview)
+                     received, is_read, has_attachments, preview, to_recipients, cc_recipients,
+                     importance, flag, last_verb, size)
 VALUES(:id, :folder_id, :conversation_id, :subject, :sender_name, :sender_addr,
-       :received, COALESCE(:is_read, 0), COALESCE(:has_attachments, 0), :preview)
+       :received, COALESCE(:is_read, 0), COALESCE(:has_attachments, 0), :preview,
+       :to_recipients, :cc_recipients, :importance, :flag, :last_verb, :size)
 ON CONFLICT(id) DO UPDATE SET
     folder_id       = excluded.folder_id,
     conversation_id = COALESCE(excluded.conversation_id, conversation_id),
@@ -65,9 +94,20 @@ ON CONFLICT(id) DO UPDATE SET
     sender_name     = COALESCE(excluded.sender_name, sender_name),
     sender_addr     = COALESCE(excluded.sender_addr, sender_addr),
     received        = COALESCE(excluded.received, received),
-    is_read         = COALESCE(:is_read, is_read),
+    -- a change still waiting to be sent wins over the server's older value
+    is_read         = CASE WHEN EXISTS(SELECT 1 FROM pending p
+                                       WHERE p.message_id = :id AND p.field = 'isRead')
+                           THEN is_read ELSE COALESCE(:is_read, is_read) END,
+    flag            = CASE WHEN EXISTS(SELECT 1 FROM pending p
+                                       WHERE p.message_id = :id AND p.field = 'flag')
+                           THEN flag ELSE COALESCE(excluded.flag, flag) END,
     has_attachments = COALESCE(:has_attachments, has_attachments),
-    preview         = COALESCE(excluded.preview, preview)
+    preview         = COALESCE(excluded.preview, preview),
+    to_recipients   = COALESCE(excluded.to_recipients, to_recipients),
+    cc_recipients   = COALESCE(excluded.cc_recipients, cc_recipients),
+    importance      = COALESCE(excluded.importance, importance),
+    last_verb       = COALESCE(excluded.last_verb, last_verb),
+    size            = COALESCE(excluded.size, size)
 """
 
 
@@ -78,6 +118,30 @@ def _row_from_item(item: dict, folder_id: str) -> dict:
 
     def flag(key: str):
         return None if key not in item else int(bool(item[key]))
+
+    def people(key: str):
+        if key not in item:
+            return None
+        return json.dumps([[(r.get("emailAddress") or {}).get("name") or "",
+                            (r.get("emailAddress") or {}).get("address") or ""]
+                           for r in item[key] or []])
+
+    def tag(prop_id: str) -> int | None:
+        # "Integer 0x0E08" and "Integer 0xe08" name the same property
+        try:
+            return int(prop_id.split()[-1], 16)
+        except (IndexError, ValueError):
+            return None
+
+    props = {tag(p.get("id", "")): p.get("value")
+             for p in item.get("singleValueExtendedProperties") or []}
+
+    def prop(prop_id: str):
+        value = props.get(tag(prop_id))
+        try:
+            return int(value) if value is not None else None
+        except ValueError:
+            return None
 
     return {
         "id": item["id"],
@@ -90,7 +154,25 @@ def _row_from_item(item: dict, folder_id: str) -> dict:
         "is_read": flag("isRead"),
         "has_attachments": flag("hasAttachments"),
         "preview": item.get("bodyPreview"),
+        "to_recipients": people("toRecipients"),
+        "cc_recipients": people("ccRecipients"),
+        "importance": item.get("importance"),
+        "flag": (item.get("flag") or {}).get("flagStatus") if "flag" in item else None,
+        "last_verb": prop(PROP_LAST_VERB),
+        "size": prop(PROP_SIZE),
     }
+
+
+def recipients(value: str | None) -> list[tuple[str, str]]:
+    """Decode a to_recipients/cc_recipients column into [(name, address)]."""
+    try:
+        return [tuple(r) for r in json.loads(value)] if value else []
+    except (ValueError, TypeError):
+        return []
+
+
+_SEARCH_COLUMNS = ("subject", "sender_name", "sender_addr", "to_recipients", "cc_recipients",
+                   "preview")
 
 
 class Store:
@@ -109,6 +191,12 @@ class Store:
         for col in ("mailbox_id", "well_known"):
             if col not in cols:
                 self.conn.execute(f"ALTER TABLE folders ADD COLUMN {col} TEXT")
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(messages)")}
+        missing = {c: t for c, t in _NEW_MESSAGE_COLUMNS.items() if c not in cols}
+        for col, sqltype in missing.items():
+            self.conn.execute(f"ALTER TABLE messages ADD COLUMN {col} {sqltype}")
+        if missing:
+            self.conn.execute("DELETE FROM sync_state WHERE key LIKE 'delta:%'")
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -144,6 +232,7 @@ class Store:
                 c.execute("DELETE FROM messages WHERE folder_id=?", (fid,))
                 c.execute("DELETE FROM sync_state WHERE key=?", (f"delta:{fid}",))
             c.execute("DELETE FROM folders WHERE mailbox_id=?", (mailbox_id,))
+            c.execute("DELETE FROM pending WHERE mailbox_id=?", (mailbox_id,))
             c.execute("DELETE FROM mailboxes WHERE id=?", (mailbox_id,))
         self.purge_orphan_bodies()
 
@@ -187,6 +276,9 @@ class Store:
         if mailbox_id is not None:
             sql, args = sql + " WHERE mailbox_id=?", (mailbox_id,)
         return self.conn.execute(sql + " ORDER BY name COLLATE NOCASE", args).fetchall()
+
+    def folder_row(self, folder_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM folders WHERE id=?", (folder_id,)).fetchone()
 
     def folder_mailbox(self, folder_id: str) -> str | None:
         row = self.conn.execute(
@@ -232,9 +324,14 @@ class Store:
             )
             return cur.rowcount
 
-    def list_messages(self, folder_id: str, limit: int = 500, offset: int = 0,
-                      since: str | None = None) -> list[sqlite3.Row]:
-        """Newest first. `since` (ISO timestamp) hides older mail without deleting it."""
+    def list_messages(self, folder_id: str, limit: int = 5000, offset: int = 0,
+                      since: str | None = None, search: str = "", unread: bool = False,
+                      flagged: bool = False, attachments: bool = False) -> list[sqlite3.Row]:
+        """Newest first. `since` (ISO timestamp) hides older mail without deleting it.
+
+        `search` keeps messages where every word appears in the sender, recipients, subject
+        or preview (case-insensitive); the flags narrow the list further.
+        """
         sql = ("SELECT m.*, (b.message_id IS NOT NULL) AS has_body "
                "FROM messages m LEFT JOIN bodies b ON b.message_id = m.id "
                "WHERE m.folder_id=?")
@@ -242,8 +339,90 @@ class Store:
         if since:
             sql += " AND m.received >= ?"
             args.append(since)
+        for word in search.split():
+            like = "%" + word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            sql += " AND (" + " OR ".join(
+                f"m.{col} LIKE ? ESCAPE '\\'" for col in _SEARCH_COLUMNS) + ")"
+            args.extend([like] * len(_SEARCH_COLUMNS))
+        if unread:
+            sql += " AND m.is_read = 0"
+        if flagged:
+            sql += " AND m.flag = 'flagged'"
+        if attachments:
+            sql += " AND m.has_attachments = 1"
         sql += " ORDER BY m.received DESC LIMIT ? OFFSET ?"
         return self.conn.execute(sql, (*args, limit, offset)).fetchall()
+
+    def message_row(self, message_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
+
+    # -- local changes, queued for the server ---------------------------
+    def set_read(self, mailbox_id: str, message_ids: list[str], read: bool) -> list[str]:
+        """Mark messages read/unread locally and queue the change. Returns the ids that changed."""
+        changed = []
+        with self.conn as c:
+            for mid in message_ids:
+                row = c.execute("SELECT folder_id, is_read FROM messages WHERE id=?",
+                                (mid,)).fetchone()
+                if row is None or bool(row["is_read"]) == read:
+                    continue
+                c.execute("UPDATE messages SET is_read=? WHERE id=?", (int(read), mid))
+                c.execute("UPDATE folders SET unread = MAX(unread + ?, 0) WHERE id=?",
+                          (-1 if read else 1, row["folder_id"]))
+                self._queue(c, mailbox_id, mid, "isRead", "1" if read else "0",
+                            "1" if row["is_read"] else "0")
+                changed.append(mid)
+        return changed
+
+    def set_flag(self, mailbox_id: str, message_ids: list[str], status: str) -> list[str]:
+        """Set flagStatus (notFlagged / flagged / complete) locally and queue the change."""
+        changed = []
+        with self.conn as c:
+            for mid in message_ids:
+                row = c.execute("SELECT flag FROM messages WHERE id=?", (mid,)).fetchone()
+                old = (row["flag"] or "notFlagged") if row else None
+                if row is None or old == status:
+                    continue
+                c.execute("UPDATE messages SET flag=? WHERE id=?", (status, mid))
+                self._queue(c, mailbox_id, mid, "flag", status, old)
+                changed.append(mid)
+        return changed
+
+    @staticmethod
+    def _queue(c, mailbox_id, message_id, field, value, old):
+        prev = c.execute("SELECT old FROM pending WHERE message_id=? AND field=?",
+                         (message_id, field)).fetchone()
+        if prev is not None:
+            old = prev["old"]  # still unsent: the server has the oldest value
+            if old == value:   # changed back before it was sent: nothing to send
+                c.execute("DELETE FROM pending WHERE message_id=? AND field=?",
+                          (message_id, field))
+                return
+        c.execute("INSERT OR REPLACE INTO pending(mailbox_id, message_id, field, value, old)"
+                  " VALUES(?,?,?,?,?)", (mailbox_id, message_id, field, value, old))
+
+    def pending_changes(self, mailbox_id: str) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM pending WHERE mailbox_id=? ORDER BY id",
+                                 (mailbox_id,)).fetchall()
+
+    def change_sent(self, change_id: int) -> None:
+        with self.conn as c:
+            c.execute("DELETE FROM pending WHERE id=?", (change_id,))
+
+    def change_refused(self, change_id: int) -> None:
+        """The server rejected a change (no write access, message gone): undo it locally."""
+        with self.conn as c:
+            row = c.execute("SELECT * FROM pending WHERE id=?", (change_id,)).fetchone()
+            if row is None:
+                return
+            c.execute("DELETE FROM pending WHERE id=?", (change_id,))
+            if row["old"] is None:
+                return
+            if row["field"] == "isRead":
+                c.execute("UPDATE messages SET is_read=? WHERE id=?",
+                          (int(row["old"]), row["message_id"]))
+            else:
+                c.execute("UPDATE messages SET flag=? WHERE id=?", (row["old"], row["message_id"]))
 
     def message_count(self, folder_id: str) -> int:
         return self.conn.execute(

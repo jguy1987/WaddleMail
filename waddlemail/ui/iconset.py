@@ -50,3 +50,19 @@ def load(name: str) -> QIcon:
         icon.addPixmap(_pixmap(svg, dimmed, size), QIcon.Mode.Disabled)
         icon.addPixmap(_pixmap(svg, selected, size), QIcon.Mode.Selected)
     return icon
+
+
+@cache
+def load_colored(name: str, color: str) -> QIcon:
+    """An icon in a fixed colour (`color` like "#d64545") rather than the text colour."""
+    path = ICON_DIR / f"{name}.svg"
+    if not path.exists():
+        return QIcon()
+    svg = path.read_text(encoding="utf-8")
+    selected = QApplication.palette().color(QPalette.ColorGroup.Active,
+                                            QPalette.ColorRole.HighlightedText)
+    icon = QIcon()
+    for size in _SIZES:
+        icon.addPixmap(_pixmap(svg, QColor(color), size), QIcon.Mode.Normal)
+        icon.addPixmap(_pixmap(svg, selected, size), QIcon.Mode.Selected)  # readable on blue
+    return icon

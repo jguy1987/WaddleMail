@@ -1,16 +1,15 @@
-"""Main window: folder pane | message list | reader. All network work runs off the UI thread."""
+"""Main window: folder pane | message list | reading pane. Network work runs off the UI thread."""
 from __future__ import annotations
 
 import datetime as dt
 import logging
 
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction, QDesktopServices, QFont, QKeySequence
-from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
-from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence
+from PySide6.QtWebEngineCore import QWebEnginePage
 from PySide6.QtWidgets import (
     QApplication, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QSplitter,
-    QTextEdit, QToolBar, QToolButton, QTreeWidget, QTreeWidgetItem,
+    QTextEdit, QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .. import __version__
@@ -20,12 +19,14 @@ from ..store import Store
 from . import iconset
 from .dialogs import ComposeDialog, EventDialog, SharedMailboxDialog
 from .folder_pane import FolderPane
+from .message_list import OUTGOING, FilterBar, MessageListView
+from .message_view import MessageView, MessageWindow
 from .preferences import PreferencesDialog
-from .render import placeholder, render_body
+from .render import placeholder
 
 log = logging.getLogger(__name__)
 
-ID_ROLE = Qt.ItemDataRole.UserRole
+READING_PANE_MODES = (("right", "&Right"), ("bottom", "&Bottom"), ("off", "&Off"))
 
 
 class _Signals(QObject):
@@ -49,34 +50,6 @@ class Worker(QRunnable):
         self.signals.done.emit(result)
 
 
-class ReaderPage(QWebEnginePage):
-    """Opens clicked links in the system browser instead of navigating the reader."""
-
-    def javaScriptConsoleMessage(self, level, message, line, source):
-        # Blocked remote images are expected (see the CSP); don't spam the terminal with them.
-        if "Content Security Policy" in message:
-            return
-        super().javaScriptConsoleMessage(level, message, line, source)
-
-    def acceptNavigationRequest(self, url, nav_type, is_main_frame):
-        if nav_type == QWebEnginePage.NavigationType.NavigationTypeLinkClicked:
-            if url.scheme() in ("http", "https", "mailto"):
-                QDesktopServices.openUrl(url)
-            return False
-        return super().acceptNavigationRequest(url, nav_type, is_main_frame)
-
-
-def _fmt_received(iso: str | None) -> str:
-    if not iso:
-        return ""
-    try:
-        t = dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
-    except ValueError:
-        return iso
-    now = dt.datetime.now().astimezone()
-    return t.strftime("%H:%M") if t.date() == now.date() else t.strftime("%Y-%m-%d")
-
-
 class MainWindow(QMainWindow):
     def __init__(self, store: Store, mailboxes: MailboxManager, settings: Settings):
         super().__init__()
@@ -84,10 +57,10 @@ class MainWindow(QMainWindow):
         self.settings = settings
         self.pool = QThreadPool.globalInstance()
         self._workers: set[Worker] = set()
+        self._windows: set[MessageWindow] = set()
         self._current_folder: str | None = None
-        self._current_message: str | None = None
-        self._current_body: tuple[str, str] | None = None
-        self._syncing = False
+        self._current_message: str | None = None  # the one selected message, if exactly one
+        self._syncing = False  # one sync/send job at a time
 
         self.setWindowTitle("WaddleMail")
         self.resize(1200, 760)
@@ -98,41 +71,41 @@ class MainWindow(QMainWindow):
         self.folder_tree.folderSelected.connect(self._on_folder_selected)
         self.folder_tree.removeMailboxRequested.connect(self.remove_mailbox)
 
-        # messages
-        self.msg_list = QTreeWidget()
-        self.msg_list.setRootIsDecorated(False)
-        self.msg_list.setUniformRowHeights(True)
-        self.msg_list.setHeaderLabels(["From", "Subject", "Received"])
-        self.msg_list.setColumnWidth(0, 180)
-        self.msg_list.setColumnWidth(1, 320)
-        self.msg_list.itemSelectionChanged.connect(self._on_message_selected)
+        # messages: quick filter bar over the list
+        self.filter_bar = FilterBar()
+        self.filter_bar.changed.connect(self._refresh_messages)
+        self.msg_list = MessageListView()
+        self.msg_list.selectionModel().selectionChanged.connect(self._on_message_selected)
+        self.msg_list.openRequested.connect(self.open_message)
+        self.msg_list.toggleReadRequested.connect(self._toggle_read)
+        self.msg_list.toggleFlagRequested.connect(self._toggle_flag)
+        self.filter_bar.sort_button.clicked.connect(self._show_sort_menu)
+        self.msg_list.header().sortIndicatorChanged.connect(self._update_sort_button)
+        list_box = QWidget()
+        lay = QVBoxLayout(list_box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(self.filter_bar)
+        lay.addWidget(self.msg_list)
 
-        # reader: no JavaScript, no plugins, CSP blocks remote content by default
-        self.reader = QWebEngineView()
-        self.reader.setPage(ReaderPage(self.reader))
-        s = self.reader.settings()
-        s.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, False)
-        s.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, False)
-        s.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, False)
-        s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, False)
-        self.reader.setHtml(placeholder("Select a message."))
+        self.msg_view = MessageView()
 
-        split = QSplitter()
-        mid = QSplitter(Qt.Orientation.Vertical)
-        mid.addWidget(self.msg_list)
-        mid.addWidget(self.reader)
-        mid.setSizes([300, 460])
-        split.addWidget(self.folder_tree)
-        split.addWidget(mid)
-        split.setStretchFactor(1, 1)  # resizing the window grows the mail, not the folders
-        split.setSizes([240, 960])
-        self.setCentralWidget(split)
+        self.content = QSplitter()
+        self.content.addWidget(list_box)
+        self.content.addWidget(self.msg_view)
+        self.content.setChildrenCollapsible(False)
+        self.outer = QSplitter()
+        self.outer.addWidget(self.folder_tree)
+        self.outer.addWidget(self.content)
+        self.outer.setStretchFactor(1, 1)  # resizing the window grows the mail, not the folders
+        self.outer.setSizes([240, 960])
+        self.setCentralWidget(self.outer)
 
         # Session toggle in the View menu; its starting value comes from Preferences.
         self.images_action = QAction("Load remote &images", self)
         self.images_action.setCheckable(True)
         self.images_action.setChecked(self.settings.get("images/load_remote"))
-        self.images_action.toggled.connect(self._rerender_body)
+        self.images_action.toggled.connect(self.msg_view.rerender)
 
         self._build_actions()
         self._build_menus()
@@ -140,10 +113,21 @@ class MainWindow(QMainWindow):
         self.folder_tree.set_context_actions([self.act_add_shared, self.act_add_account])
         QApplication.instance().focusChanged.connect(self._update_edit_actions)
         self._update_edit_actions()
+        self._update_message_actions()
+
+        # Marking read after a delay in the reading pane; sending local changes shortly after.
+        self._read_timer = QTimer(self)
+        self._read_timer.setSingleShot(True)
+        self._read_timer.timeout.connect(self._mark_viewed_read)
+        self._send_timer = QTimer(self)
+        self._send_timer.setSingleShot(True)
+        self._send_timer.setInterval(1500)
+        self._send_timer.timeout.connect(self._send_changes)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.sync_current)
         self._apply_settings()
+        self._restore_layout()
 
         self._populate_folders()
         self._start_initial_sync()
@@ -165,8 +149,10 @@ class MainWindow(QMainWindow):
         self.pool.start(w)
 
     def _on_error(self, msg: str):
-        self._syncing = False
         self.statusBar().showMessage(f"Error: {msg}", 10_000)
+
+    def _sync_failed(self, _msg: str):
+        self._syncing = False
 
     # -- startup ------------------------------------------------------
     def _start_initial_sync(self):
@@ -188,13 +174,15 @@ class MainWindow(QMainWindow):
             return inbox, error
 
         self._syncing = True
-        self._run(job, self._initial_sync_done)
+        self._run(job, self._initial_sync_done, on_failed=self._sync_failed)
 
     def _sync_all_folders(self):
-        """Refresh every mailbox's folder list and counts (worker thread). One mailbox failing,
-        say a shared one whose access was taken away, doesn't stop the others."""
+        """Send queued changes and refresh every mailbox's folder list and counts (worker
+        thread). One mailbox failing, say a shared one whose access was taken away, doesn't
+        stop the others."""
         for box in self.mailboxes.all():
             try:
+                box.sync.send_changes()
                 box.sync.sync_folders()
             except Exception as exc:
                 log.warning("folder sync failed for %s: %s", box.display_name, exc)
@@ -222,8 +210,11 @@ class MainWindow(QMainWindow):
         self._current_folder = fid
         self._current_message = None
         self._update_title()
-        self.reader.setHtml(placeholder("Select a message."))
+        self.msg_view.show_placeholder("Select a message.")
+        self.filter_bar.clear(emit=False)  # a filter belongs to the folder it was typed in
+        self.msg_list.clearSelection()
         self._refresh_messages()  # instant, from the local store
+        self.msg_list.scrollToTop()
         self.sync_current()       # then catch up in the background
 
     def _update_title(self):
@@ -247,7 +238,7 @@ class MainWindow(QMainWindow):
             box.sync.sync_folders()
             return box.id
 
-        self._run(job, self._mailbox_added)
+        self._run(job, self._mailbox_added, on_failed=self._sync_failed)
 
     def add_shared_mailbox(self):
         accounts = [(b.account_id, b.display_name) for b in self.mailboxes.all() if not b.shared]
@@ -265,6 +256,7 @@ class MainWindow(QMainWindow):
             return self.mailboxes.add_shared(v["account_id"], v["address"], v["display_name"]).id
 
         def failed(msg: str):
+            self._syncing = False
             QMessageBox.warning(
                 self, "Add shared mailbox",
                 f"Couldn't open {v['address']}.\n\nCheck the address and that you've been "
@@ -296,35 +288,21 @@ class MainWindow(QMainWindow):
             return
         if self._current_folder and self.store.folder_mailbox(self._current_folder) in gone:
             self._current_folder = self._current_message = None
-            self.msg_list.clear()
-            self.reader.setHtml(placeholder("Select a folder."))
+            self.msg_list.set_messages([], False)
+            self.msg_view.show_placeholder("Select a folder.")
         self.mailboxes.remove(mailbox_id)
         self._populate_folders()
 
-    # -- messages -----------------------------------------------------
+    # -- message list ---------------------------------------------------
     def _refresh_messages(self):
         if not self._current_folder:
             return
-        selected = self._current_message
-        self.msg_list.blockSignals(True)
-        self.msg_list.clear()
-        bold = QFont()
-        bold.setBold(True)
-        restore = None
-        for r in self.store.list_messages(self._current_folder, since=self._list_cutoff()):
-            sender = r["sender_name"] or r["sender_addr"] or ""
-            it = QTreeWidgetItem([sender, r["subject"] or "(no subject)", _fmt_received(r["received"])])
-            it.setData(0, ID_ROLE, r["id"])
-            it.setToolTip(1, r["preview"] or "")
-            if not r["is_read"]:
-                for col in range(3):
-                    it.setFont(col, bold)
-            self.msg_list.addTopLevelItem(it)
-            if r["id"] == selected:
-                restore = it
-        if restore:
-            self.msg_list.setCurrentItem(restore)
-        self.msg_list.blockSignals(False)
+        rows = self.store.list_messages(self._current_folder, since=self._list_cutoff(),
+                                        **self.filter_bar.criteria())
+        folder = self.store.folder_row(self._current_folder)
+        self.msg_list.set_messages(rows, bool(folder) and folder["well_known"] in OUTGOING)
+        self.filter_bar.set_count(len(rows))
+        self._update_message_actions()
 
     def sync_current(self):
         fid = self._current_folder
@@ -343,7 +321,7 @@ class MainWindow(QMainWindow):
                 self.store.purge_bodies_older_than(max_age_days)
             return fid, res
 
-        self._run(job, self._sync_done)
+        self._run(job, self._sync_done, on_failed=self._sync_failed)
 
     def _sync_done(self, payload):
         self._syncing = False
@@ -353,33 +331,197 @@ class MainWindow(QMainWindow):
             self._refresh_messages()
         self.statusBar().showMessage(f"Synced (+{res.upserted} / -{res.removed})", 4000)
 
-    # -- reader -------------------------------------------------------
-    def _on_message_selected(self):
-        items = self.msg_list.selectedItems()
-        if not items:
+    def _on_message_selected(self, *_):
+        self._update_message_actions()
+        self._read_timer.stop()
+        ids = self.msg_list.selected_ids()
+        if len(ids) != 1:
+            self._current_message = None
+            self.msg_view.show_placeholder(
+                f"{len(ids)} messages selected." if ids else "Select a message.")
             return
-        mid = items[0].data(0, ID_ROLE)
+        if ids[0] == self._current_message:
+            return
+        self._current_message = ids[0]
+        if not self.msg_view.isHidden():  # reading pane is on
+            self._show_in_pane(ids[0])
+
+    def _show_in_pane(self, mid: str):
+        row = self.store.message_row(mid)
         box = self.mailboxes.for_folder(self._current_folder)
-        if box is None:
+        if row is None or box is None:
             return
-        self._current_message = mid
-        self._current_body = None
-        self.reader.setHtml(placeholder("Loading…"))
-        self._run(lambda: (mid, box.bodies.get(mid)), self._body_ready)
+        self.msg_view.show_message(row)
+        self._run(lambda: (mid, box.bodies.get(mid)), self._body_ready,
+                  on_failed=lambda msg: self._body_failed(mid, msg))
+        if self.settings.get("read/mark_on_view") and not row["is_read"]:
+            self._read_timer.start(self.settings.get("read/mark_delay_sec") * 1000)
 
     def _body_ready(self, payload):
         mid, body = payload
-        if mid != self._current_message:  # user already moved on
+        if mid != self.msg_view.message_id:  # user already moved on
             return
-        self._current_body = (body.content_type, body.content)
-        self._rerender_body()
+        self.msg_view.set_body(body.content_type, body.content, self.images_action.isChecked())
         self.statusBar().showMessage("Loaded from local cache" if body.from_cache
                                      else "Fetched from server and cached", 3000)
 
-    def _rerender_body(self, *_):
-        if self._current_body:
-            ctype, content = self._current_body
-            self.reader.setHtml(render_body(ctype, content, self.images_action.isChecked()))
+    def _body_failed(self, mid: str, msg: str):
+        if mid == self.msg_view.message_id:
+            self.msg_view.reader.setHtml(placeholder(f"Couldn't load this message: {msg}"))
+
+    def open_message(self, mid: str):
+        """Open one message in its own window (double-click / Enter) and mark it read."""
+        row = self.store.message_row(mid)
+        box = self.mailboxes.for_folder(self._current_folder) if self._current_folder else None
+        if row is None or box is None:
+            return
+        win = MessageWindow(row, self.images_action.isChecked(),
+                            [self.act_reply, self.act_reply_all, self.act_forward,
+                             self.act_delete], self)
+        self._windows.add(win)
+        win.destroyed.connect(lambda *_: self._windows.discard(win))
+        win.show()
+        self._run(lambda: box.bodies.get(mid),
+                  lambda body: win.set_body(body.content_type, body.content),
+                  on_failed=win.show_error)
+        self.mark_read([mid], True)
+
+    # -- read / flag ------------------------------------------------------
+    def _mark_viewed_read(self):
+        if self._current_message and not self.msg_view.isHidden() \
+                and self.msg_view.message_id == self._current_message:
+            self.mark_read([self._current_message], True)
+
+    def mark_read(self, ids: list[str], read: bool):
+        box = self.mailboxes.for_folder(self._current_folder) if self._current_folder else None
+        if box is None or not ids:
+            return
+        self._local_change(self.store.set_read(box.id, ids, read))
+
+    def set_flag(self, ids: list[str], status: str):
+        box = self.mailboxes.for_folder(self._current_folder) if self._current_folder else None
+        if box is None or not ids:
+            return
+        self._local_change(self.store.set_flag(box.id, ids, status))
+
+    def _toggle_read(self, ids: list[str]):
+        rows = [self.store.message_row(i) for i in ids]
+        self.mark_read(ids, any(r and not r["is_read"] for r in rows))
+
+    def _toggle_flag(self, ids: list[str]):
+        rows = [self.store.message_row(i) for i in ids]
+        flag_them = any(r and r["flag"] != "flagged" for r in rows)
+        self.set_flag(ids, "flagged" if flag_them else "notFlagged")
+
+    def _local_change(self, changed: list[str]):
+        """Show a local read/flag change at once; it goes to the server shortly after."""
+        if not changed:
+            return
+        self.msg_list.model_.update_rows([self.store.message_row(i) for i in changed])
+        self.folder_tree.refresh_counts()
+        self._send_timer.start()
+
+    def _send_changes(self):
+        if self._syncing:  # try again once the running job is done
+            self._send_timer.start()
+            return
+        self._syncing = True
+        boxes = self.mailboxes.all()
+
+        def job():
+            for box in boxes:
+                try:
+                    box.sync.send_changes()
+                except Exception as exc:  # offline: stays queued for the next sync
+                    log.warning("sending changes for %s failed: %s", box.display_name, exc)
+
+        self._run(job, self._changes_sent, on_failed=self._sync_failed)
+
+    def _changes_sent(self, _):
+        self._syncing = False
+        # A change the server refused was undone in the store; show that.
+        self._refresh_messages()
+        self.folder_tree.refresh_counts()
+
+    def _update_message_actions(self, *_):
+        any_selected = bool(self.msg_list.selected_ids())
+        for act in self._message_actions:
+            act.setEnabled(any_selected)
+
+    # -- reading pane / layout -----------------------------------------
+    def set_reading_pane(self, mode: str):
+        if mode not in dict(READING_PANE_MODES):
+            mode = "bottom"
+        prev = getattr(self, "_pane_mode", None)
+        if prev in ("right", "bottom"):
+            self._split_states[prev] = self.content.saveState()
+        self._pane_mode = mode
+        self._pane_actions[mode].setChecked(True)
+        # Beside the reading pane the list is narrow: two-line rows instead of columns.
+        self.msg_list.set_compact(mode == "right")
+        self.filter_bar.set_compact(mode == "right")
+        self._update_sort_button()
+        if mode == "off":
+            self.msg_view.hide()
+            self._read_timer.stop()
+            return
+        self.content.setOrientation(Qt.Orientation.Horizontal if mode == "right"
+                                    else Qt.Orientation.Vertical)
+        state = self._split_states.get(mode)
+        if not (state and not state.isEmpty() and self.content.restoreState(state)):
+            total = sum(self.content.sizes()) or 1000
+            share = 0.45 if mode == "right" else 0.4  # the list's share
+            self.content.setSizes([int(total * share), int(total * (1 - share))])
+        self.msg_view.show()
+        if self._current_message and self.msg_view.message_id != self._current_message:
+            self._show_in_pane(self._current_message)
+
+    def _restore_layout(self):
+        s = self.settings
+        geometry = s.get("window/geometry")
+        if not geometry.isEmpty():
+            self.restoreGeometry(geometry)
+        split = s.get("window/folder_split")
+        if not split.isEmpty():
+            self.outer.restoreState(split)
+        self._split_states = {"right": s.get("window/split_right"),
+                              "bottom": s.get("window/split_bottom")}
+        self.msg_list.restore_header(s.get("list/header"))
+        self.act_filter_bar.setChecked(s.get("view/filter_bar"))
+        self.filter_bar.setVisible(s.get("view/filter_bar"))
+        self.set_reading_pane(s.get("view/reading_pane"))
+
+    def closeEvent(self, event):
+        s = self.settings
+        if self._pane_mode in ("right", "bottom"):
+            self._split_states[self._pane_mode] = self.content.saveState()
+        s.set("window/geometry", self.saveGeometry())
+        s.set("window/folder_split", self.outer.saveState())
+        s.set("window/split_right", self._split_states["right"])
+        s.set("window/split_bottom", self._split_states["bottom"])
+        s.set("list/header", self.msg_list.header_state())
+        s.set("view/reading_pane", self._pane_mode)
+        s.set("view/filter_bar", self.act_filter_bar.isChecked())
+        for win in list(self._windows):
+            win.close()
+        super().closeEvent(event)
+
+    def _show_sort_menu(self):
+        button = self.filter_bar.sort_button
+        self.msg_list.sort_menu().exec(button.mapToGlobal(button.rect().bottomLeft()))
+
+    def _update_sort_button(self, *_):
+        self.filter_bar.sort_button.setText(self.msg_list.sort_label())
+
+    def _set_filter_bar(self, on: bool):
+        self.filter_bar.setVisible(on)
+        if not on:
+            self.filter_bar.clear(emit=False)
+        self._refresh_messages()
+
+    def _focus_filter(self):
+        self.act_filter_bar.setChecked(True)
+        self.filter_bar.focus_search()
 
     # -- menus ----------------------------------------------------------
     def _action(self, text: str, slot, shortcut=None) -> QAction:
@@ -396,6 +538,14 @@ class MainWindow(QMainWindow):
         act.setIcon(iconset.load(icon_name))
         act.setToolTip(tip or text.replace("&", ""))
         act.setEnabled(enabled)
+        return act
+
+    def _list_action(self, text: str, slot, shortcut=None, icon: str = "") -> QAction:
+        """A message action: in the Message menu and the list's context menu. Its shortcut
+        works while the list has focus, so single keys (M, S) don't fire while typing."""
+        act = self._themed(text, icon, slot, shortcut)
+        act.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.msg_list.addAction(act)
         return act
 
     def _build_actions(self):
@@ -424,6 +574,47 @@ class MainWindow(QMainWindow):
         self.act_reply_all = self._themed("Reply all", "reply-all", lambda: None, enabled=False, tip=soon)
         self.act_forward = self._themed("Forward", "forward", lambda: None, enabled=False, tip=soon)
         self.act_delete = self._themed("Delete", "trash-2", lambda: None, enabled=False, tip=soon)
+
+        # Message actions; they work on the selection. "\tEnter" only labels the key: the
+        # list handles Enter itself.
+        sel = self.msg_list.selected_ids
+        self.act_open = self._list_action(
+            "&Open in new window\tEnter",
+            lambda: self.msg_list.current_id() and self.open_message(self.msg_list.current_id()))
+        self.msg_list.addAction(self._separator())
+        self.act_mark_read = self._list_action(
+            "Mark as &read", lambda: self.mark_read(sel(), True), icon="mail")
+        self.act_mark_unread = self._list_action(
+            "Mark as &unread", lambda: self.mark_read(sel(), False), "Ctrl+U")
+        self.act_toggle_read = self._list_action(
+            "&Toggle read/unread", lambda: self._toggle_read(sel()), "M")
+        self.msg_list.addAction(self._separator())
+        self.act_toggle_flag = self._list_action(
+            "Toggle &flag", lambda: self._toggle_flag(sel()), "S", icon="flag")
+        self.act_flag_complete = self._list_action(
+            "Mark flag &complete", lambda: self.set_flag(sel(), "complete"), icon="check")
+        self._message_actions = [self.act_open, self.act_mark_read, self.act_mark_unread,
+                                 self.act_toggle_read, self.act_toggle_flag,
+                                 self.act_flag_complete]
+
+        self.act_filter_bar = QAction("&Quick filter bar", self)
+        self.act_filter_bar.setCheckable(True)
+        self.act_filter_bar.toggled.connect(self._set_filter_bar)
+        self.act_focus_filter = self._action("&Filter messages…", self._focus_filter,
+                                             "Ctrl+Shift+K")
+        self._pane_actions: dict[str, QAction] = {}
+        group = QActionGroup(self)
+        for mode, label in READING_PANE_MODES:
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.triggered.connect(lambda checked=False, m=mode: self.set_reading_pane(m))
+            group.addAction(act)
+            self._pane_actions[mode] = act
+
+    def _separator(self) -> QAction:
+        act = QAction(self)
+        act.setSeparator(True)
+        return act
 
     def _build_toolbar(self):
         bar = QToolBar("Main", self)
@@ -458,7 +649,8 @@ class MainWindow(QMainWindow):
 
     def _reader_has_focus(self) -> bool:
         w = QApplication.focusWidget()
-        return w is not None and (w is self.reader or self.reader.isAncestorOf(w))
+        reader = self.msg_view.reader
+        return w is not None and (w is reader or reader.isAncestorOf(w))
 
     def _edit_cut(self):
         t = self._focused_text_widget()
@@ -470,7 +662,7 @@ class MainWindow(QMainWindow):
         if t is not None:
             t.copy()
         elif self._reader_has_focus():
-            self.reader.page().triggerAction(QWebEnginePage.WebAction.Copy)
+            self.msg_view.reader.page().triggerAction(QWebEnginePage.WebAction.Copy)
 
     def _edit_paste(self):
         t = self._focused_text_widget()
@@ -482,7 +674,9 @@ class MainWindow(QMainWindow):
         if t is not None:
             t.selectAll()
         elif self._reader_has_focus():
-            self.reader.page().triggerAction(QWebEnginePage.WebAction.SelectAll)
+            self.msg_view.reader.page().triggerAction(QWebEnginePage.WebAction.SelectAll)
+        elif QApplication.focusWidget() is self.msg_list:
+            self.msg_list.selectAll()
 
     def _update_edit_actions(self, *_):
         t = self._focused_text_widget()
@@ -491,7 +685,7 @@ class MainWindow(QMainWindow):
         self.act_cut.setEnabled(editable)
         self.act_paste.setEnabled(editable)
         self.act_copy.setEnabled(readable)
-        self.act_select_all.setEnabled(readable)
+        self.act_select_all.setEnabled(readable or QApplication.focusWidget() is self.msg_list)
 
     def _build_menus(self):
         mb = self.menuBar()
@@ -511,16 +705,31 @@ class MainWindow(QMainWindow):
             edit_menu.addAction(act)
         edit_menu.addSeparator()
         edit_menu.addAction(self.act_select_all)
+        edit_menu.addAction(self.act_focus_filter)
         edit_menu.addSeparator()
         edit_menu.addAction(self._action("&Preferences…", self.show_preferences, "Ctrl+,"))
 
         view_menu = mb.addMenu("&View")
-        view_menu.addAction(self.images_action)  # same action as the toolbar button
+        pane_menu = view_menu.addMenu("&Reading pane")
+        for mode, _label in READING_PANE_MODES:
+            pane_menu.addAction(self._pane_actions[mode])
+        view_menu.addAction(self.act_filter_bar)
         folders = QAction("Show &folder pane", self)
         folders.setCheckable(True)
         folders.setChecked(True)
         folders.toggled.connect(self.folder_tree.setVisible)
         view_menu.addAction(folders)
+        view_menu.addSeparator()
+        view_menu.addAction(self.images_action)
+
+        msg_menu = mb.addMenu("&Message")
+        msg_menu.addAction(self.act_open)
+        msg_menu.addSeparator()
+        for act in (self.act_mark_read, self.act_mark_unread, self.act_toggle_read):
+            msg_menu.addAction(act)
+        msg_menu.addSeparator()
+        msg_menu.addAction(self.act_toggle_flag)
+        msg_menu.addAction(self.act_flag_complete)
 
         help_menu = mb.addMenu("&Help")
         help_menu.addAction(self._action("&About WaddleMail", self.show_about))

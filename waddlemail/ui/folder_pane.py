@@ -213,18 +213,37 @@ class FolderPane(QTreeWidget):
         wk = r["well_known"]
         item.setData(0, WELL_KNOWN_ROLE, wk)
         item.setIcon(0, iconset.load(_ICONS.get(wk, "folder")))
-        if wk in _COUNT_TOTAL:
-            item.setData(0, TOTAL_ROLE, True)
-            item.setData(0, COUNT_ROLE, r["total"] or 0)
-        else:
-            item.setData(0, COUNT_ROLE, r["unread"] or 0)
-        if r["unread"] and wk not in _COUNT_TOTAL:
-            font = QFont(self.font())
-            font.setBold(True)
-            item.setFont(0, font)
+        self._set_counts(item, r)
+        return item
+
+    def _set_counts(self, item: QTreeWidgetItem, r) -> None:
+        wk = r["well_known"]
+        total_only = wk in _COUNT_TOTAL
+        item.setData(0, TOTAL_ROLE, total_only)
+        item.setData(0, COUNT_ROLE, (r["total"] if total_only else r["unread"]) or 0)
+        font = QFont(self.font())
+        font.setBold(bool(r["unread"]) and not total_only)
+        item.setFont(0, font)
         tip = f"{r['total']} items, {r['unread']} unread" if r["total"] else "Empty"
         item.setToolTip(0, f"{r['name']}\n{tip}")
-        return item
+
+    def refresh_counts(self) -> None:
+        """Re-read unread/total counts from the store without rebuilding the tree."""
+        rows = {r["id"]: r for r in self.store.folder_rows()}
+
+        def walk(item: QTreeWidgetItem) -> int:
+            below = 0
+            for i in range(item.childCount()):
+                child = item.child(i)
+                r = rows.get(child.data(0, ID_ROLE))
+                if r is not None:
+                    self._set_counts(child, r)
+                below += ((r["unread"] or 0) if r is not None else 0) + walk(child)
+            item.setData(0, HIDDEN_ROLE, below)
+            return below
+
+        for i in range(self.topLevelItemCount()):
+            walk(self.topLevelItem(i))
 
     # -- lookup / selection ----------------------------------------------
     def current_folder(self) -> str | None:

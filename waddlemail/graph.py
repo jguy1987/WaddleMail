@@ -16,9 +16,15 @@ FOLDER_FIELDS = "id,displayName,parentFolderId,childFolderCount,unreadItemCount,
 # Default folders, in the order the folder pane shows them (other folders follow, A-Z).
 WELL_KNOWN = ("inbox", "drafts", "sentitems", "deleteditems", "junkemail", "archive", "outbox")
 MESSAGE_FIELDS = (
-    "id,parentFolderId,conversationId,subject,from,receivedDateTime,"
-    "isRead,hasAttachments,bodyPreview"
+    "id,parentFolderId,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,"
+    "isRead,hasAttachments,importance,flag,bodyPreview"
 )
+# MAPI properties Graph has no first-class field for: PidTagLastVerbExecuted (102 replied,
+# 103 replied to all, 104 forwarded) and PidTagMessageSize (bytes).
+PROP_LAST_VERB = "Integer 0x1081"
+PROP_SIZE = "Integer 0x0E08"
+EXTENDED_PROPS = (f"singleValueExtendedProperties($filter=id eq '{PROP_LAST_VERB}'"
+                  f" or id eq '{PROP_SIZE}')")
 
 
 class GraphError(Exception):
@@ -50,6 +56,7 @@ class GraphClient:
         self._token = token_provider
         self._base = base.rstrip("/")
         self._root = f"/users/{quote(user, safe='@')}" if user else "/me"
+        self._expand_props = True  # turned off if the server refuses the $expand
         self._s = session or requests.Session()
         self._sleep = sleep
 
@@ -76,7 +83,7 @@ class GraphClient:
                 raise DeltaResetError("sync state expired", 410)
             if not r.ok:
                 raise GraphError(f"Graph {r.status_code}: {r.text[:300]}", r.status_code)
-            return r.json()
+            return r.json() if r.text else {}
         raise GraphError("Graph request failed after retries")
 
     def _paged(self, url: str, params: dict | None = None,
@@ -150,16 +157,32 @@ class GraphClient:
         else:
             url = f"{self._root}/mailFolders/{quote(folder_id, safe='')}/messages/delta"
             params = {"$select": MESSAGE_FIELDS}
+            if self._expand_props:
+                params["$expand"] = EXTENDED_PROPS
             if since:
                 params["$filter"] = f"receivedDateTime ge {since}"
         headers = _prefer("odata.maxpageSize=100")
         while True:
-            data = self._request(url, params=params, headers=headers)
+            try:
+                data = self._request(url, params=params, headers=headers)
+            except GraphError as exc:
+                if exc.status != 400 or not params or "$expand" not in params:
+                    raise
+                log.warning("extended properties refused; syncing without reply state/size: %s",
+                            exc)
+                self._expand_props = False
+                params = {k: v for k, v in params.items() if k != "$expand"}
+                continue
             nxt = data.get("@odata.nextLink")
             yield data.get("value", []), data.get("@odata.deltaLink")
             if not nxt:
                 return
             url, params = nxt, None
+
+    def update_message(self, message_id: str, changes: dict) -> None:
+        """PATCH writable message properties, e.g. {"isRead": True}."""
+        self._request(f"{self._root}/messages/{quote(message_id, safe='')}", method="PATCH",
+                      json=changes, params={"$select": "id"})
 
     def get_message_body(self, message_id: str) -> tuple[str, str]:
         """Return (content_type, content); content_type is 'html' or 'text'."""

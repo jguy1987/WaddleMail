@@ -11,8 +11,9 @@ TENANT = os.environ.get("WADDLEMAIL_TENANT", "common")
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT}"
 
 # Delegated scopes. offline_access/openid/profile are added by MSAL itself.
-# Mail.Read.Shared opens shared mailboxes and folders other people have shared with you.
-SCOPES = ["Mail.Read", "Mail.Read.Shared"]
+# ReadWrite: marking read/unread and flagging. The .Shared variant covers shared mailboxes and
+# folders other people have shared with you.
+SCOPES = ["Mail.ReadWrite", "Mail.ReadWrite.Shared"]
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 

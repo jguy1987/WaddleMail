@@ -18,6 +18,25 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   adds up the unread mail in the subfolders it hides. Collapsed/expanded state is remembered.
 - Message list served from a local SQLite store, kept current with Graph **delta queries** (one
   cursor per folder). If the first sync fails (offline), the stored mail is still shown.
+  - Columns: read dot, replied/forwarded, attachment, importance, From (To in Sent Items, Drafts
+    and Outbox), Subject, Received, flag; To and Size can be switched on. Click a header to sort
+    by it, drag headers to reorder, right-click the header to show/hide columns. Order, widths
+    and sort are remembered.
+  - Unread mail is bold. Click the dot (or press **M**) to toggle read, click the flag column
+    (or press **S**) to toggle the flag; both work on the whole selection. Message menu and
+    right-click menu: Open in new window, Mark as read/unread (Ctrl+U), flag, Mark flag complete.
+  - **Quick filter bar** (Thunderbird style, Ctrl+Shift+K): Unread / Flagged / Attachment
+    toggles and a search box; every word typed must appear in the sender, recipients, subject or
+    preview. Esc clears. The filter resets when you change folder.
+- **Reading pane** (View > Reading pane): Right, Bottom or Off. On the right the list switches to
+  compact two-line rows with a Sort button. The pane shows a header (subject, sender, To/Cc,
+  date) above the body. Mail shown there is marked read, immediately or after a delay
+  (Preferences > Mail), or not at all. With the pane off, selecting doesn't mark anything read.
+- **Double-click** (or Enter) opens a message in its own window and marks it read; Esc closes it.
+- Read/flag changes show at once and are queued locally, then sent to the server (also when
+  offline: they go out on the next successful sync). If the server refuses one, for example in a
+  shared mailbox you can only read, it is undone locally.
+- Window size, pane layout and splitter positions are remembered.
 - **Hybrid reader**: headers and previews are synced; a message body is fetched from the server the
   first time you open it, then cached (LRU). Nothing has to be downloaded up front.
 - Sandboxed reader: JavaScript off, HTML sanitized (nh3), a Content-Security-Policy blocks remote
@@ -46,7 +65,9 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
 ## Not yet
 
 Sending mail and saving events (the New dialogs open but only collect input), personal contacts,
-calendar views, search, attachments and inline (`cid:`) images, marking read, move/delete.
+calendar views, server-side search (the quick filter only searches mail stored locally, and the
+preview rather than the full body), attachments and inline (`cid:`) images, move/delete,
+conversation threading.
 
 ## Register the app (one time)
 
@@ -56,8 +77,9 @@ In the Entra admin center (entra.microsoft.com) > App registrations > New regist
    accounts* (or single tenant if it is only for your organization).
 2. Redirect URI: platform **Mobile and desktop applications**, value `http://localhost`.
 3. Under **Authentication**, set "Allow public client flows" to **Yes**.
-4. **API permissions** > Microsoft Graph > Delegated: `Mail.Read` and `Mail.Read.Shared` (shared
-   mailboxes and folders) for now. Existing users are asked to consent once more after upgrading. Sending and events will
+4. **API permissions** > Microsoft Graph > Delegated: `Mail.ReadWrite` (mark read, flag) and
+   `Mail.ReadWrite.Shared` (shared mailboxes and folders). Existing users are asked to consent
+   once more after upgrading. Sending and events will
    need `Mail.Send` and `Calendars.ReadWrite` (add them to `SCOPES` in `config.py` as well). In your
    own tenant you can click "Grant admin consent" so users never see a prompt.
 5. Copy the **Application (client) ID**.
@@ -82,7 +104,7 @@ unless you change the data location in Preferences.
 
 ```bash
 pytest                                   # sync, cache, Graph client, renderer, settings (no network)
-QT_QPA_PLATFORM=offscreen QTWEBENGINE_CHROMIUM_FLAGS="--no-sandbox" python tests/smoke_ui.py
+QT_QPA_PLATFORM=offscreen QTWEBENGINE_CHROMIUM_FLAGS="--no-sandbox --disable-gpu" python tests/smoke_ui.py
 ```
 
 ## Layout
@@ -99,6 +121,8 @@ waddlemail/bodies.py       Cache-first body access (the hybrid mode)
 waddlemail/settings.py     Preferences (QSettings) and their defaults
 waddlemail/ui/             main window + menus/toolbar, preferences, new mail/event dialogs, safe rendering
 waddlemail/ui/folder_pane.py  folder tree: mailbox headings, folder order, icons, unread counts
+waddlemail/ui/message_list.py  message model/view (columns, sorting, compact rows), quick filter bar
+waddlemail/ui/message_view.py  message header + sandboxed body; the separate message window
 waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 ```
 
@@ -113,10 +137,17 @@ waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 - Immutable IDs: moving a message between folders keeps its id, so cached bodies stay valid, and a
   "removed" notice from the old folder cannot delete a message already re-homed in the new one.
 - Delta updates merge field by field, so a partial update never blanks a subject or sender.
+- Replied/forwarded state and size come from MAPI properties (`PidTagLastVerbExecuted` 0x1081,
+  `PidTagMessageSize` 0x0E08) expanded in the same delta request. If a server refuses the
+  `$expand`, sync continues without them. Adding these fields reset the delta cursors once, so
+  existing mail gets them on the next sync.
+- A queued read/flag change wins over an older value arriving in a delta page, so the list
+  never flickers back to unread while the change is on its way.
 
 ## Next steps
 
-1. Outbox queue and real sending (`Mail.Send`), then mark-read/move/delete through the same queue.
+1. Real sending (`Mail.Send`) through an outbox, and move/delete through the change queue
+   (`pending` table) that read/flag already use.
 2. Personal contacts (`/me/contacts`) and recipient autocomplete.
 3. Events (`Calendars.ReadWrite`), then calendar views.
 4. FTS5 search over metadata and cached bodies; attachments and `cid:` images.
