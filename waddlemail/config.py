@@ -12,8 +12,9 @@ AUTHORITY = f"https://login.microsoftonline.com/{TENANT}"
 
 # Delegated scopes. offline_access/openid/profile are added by MSAL itself.
 # ReadWrite: marking read/unread and flagging. The .Shared variant covers shared mailboxes and
-# folders other people have shared with you.
-SCOPES = ["Mail.ReadWrite", "Mail.ReadWrite.Shared"]
+# folders other people have shared with you. Contacts: personal contacts and contact groups.
+# User.ReadBasic.All: the organization directory (names, addresses, titles; no admin consent).
+SCOPES = ["Mail.ReadWrite", "Mail.ReadWrite.Shared", "Contacts.ReadWrite", "User.ReadBasic.All"]
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 

@@ -48,6 +48,23 @@ class RecordingNotifier(Notifier):
 
 main_window_module.make_notifier = lambda tray: RecordingNotifier()
 
+from tests.test_contacts import FakeGraph as FakeContacts  # noqa: E402
+_fake_contacts = FakeContacts()
+saved_contacts: list[dict] = []
+graph.GraphClient.contacts = lambda self, folder_id=None: _fake_contacts.contacts(folder_id)
+graph.GraphClient.contact_folders = lambda self: _fake_contacts.contact_folders()
+graph.GraphClient.directory_users = lambda self, limit=50_000: _fake_contacts.directory_users()
+graph.GraphClient.contact_groups = lambda self: _fake_contacts.contact_groups()
+
+
+def _save_contact(self, fields, contact_id=None, folder_id=None):
+    saved_contacts.append(fields)
+    return {"id": contact_id or "new-contact", **fields}
+
+
+graph.GraphClient.save_contact = _save_contact
+graph.GraphClient.delete_contact = lambda self, cid: None
+
 
 def offline(self, url, params=None, headers=None, retries=5, method="GET", json=None):
     raise graph.GraphError("offline", 503)
@@ -321,6 +338,7 @@ def checks():
     integration_checks()
     older_mail_checks()
     status_checks()
+    contacts_checks()
 
     w.close()
     saved = Settings(str(tmp / "settings.ini"))
@@ -599,6 +617,67 @@ def status_checks():
     wait(100)
     check(ind.label.text().startswith("Up to date ·") or "waiting" in ind.label.text(),
           "idle: up to date with the time of the last sync")
+
+
+def contacts_checks():
+    from waddlemail.contacts import suggestions
+    from waddlemail.ui.recipients import RecipientEdit
+    view = w.contacts_view
+    w.refresh_contacts()
+    wait(800)
+    w.setFocus()
+    QTest.keyClick(w, Qt.Key.Key_2, Qt.KeyboardModifier.ControlModifier)
+    wait(100)
+    check(w.pages.currentWidget() is view and w._nav["contacts"].isChecked(),
+          "Ctrl+2 / the rail switch to Contacts")
+    sources = [view.sources.topLevelItem(i).text(0)
+               for i in range(view.sources.topLevelItemCount())]
+    check(sources == ["All contacts", "Contact groups", "Organization", "Recent recipients"]
+          and view.sources.topLevelItem(0).childCount() == 2,
+          "sources: contacts (with folders), groups, directory, recent")
+    names = [view.list.topLevelItem(i).text(0) for i in range(view.list.topLevelItemCount())]
+    check(names == ["Bo Chan", "Mom Lee", "Priya Shah"], "all personal contacts, A-Z")
+    view.search.setText("contoso")
+    wait(300)
+    check(view.list.topLevelItemCount() == 1, "search by company")
+    view.search.clear()
+    wait(300)
+
+    view.sources.setCurrentItem(view.sources.topLevelItem(1))  # groups: first one shown
+    html_text = view.details.toHtml()
+    check("Project Team" in html_text and "ana@x.com" in html_text and "bo@y.org" in html_text,
+          "a contact group's members with their addresses")
+    composed = []
+    real_new_mail = w.new_mail
+    w.new_mail = lambda to=None: composed.append(to)
+    view.email_selected()
+    check(composed and len(composed[-1]) == 3, "email a whole group")
+
+    view.sources.setCurrentItem(view.sources.topLevelItem(2))  # directory
+    check(view.list.topLevelItemCount() == 1 and view.list.topLevelItem(0).text(0) == "Ana Ruiz"
+          and not view.act_edit.isEnabled() and view.act_add.isEnabled(),
+          "directory: read-only, can be added to your contacts")
+    w.new_mail = real_new_mail
+
+    w.save_contact({"displayName": "Zed Quinn", "givenName": "Zed", "surname": "Quinn",
+                    "emailAddresses": [{"address": "zed@q.io", "name": "Zed Quinn"}]},
+                   "", "", "Contacts")
+    wait(400)
+    check(saved_contacts and st.contact_row("new-contact")["display_name"] == "Zed Quinn",
+          "new contact saved on the server and here")
+
+    edit = RecipientEdit(suggestions(st))
+    edit.setText("Ann <a@x>; proj")
+    comp = edit.completer()
+    comp.setCompletionPrefix("proj")
+    check(comp.completionCount() == 1 and comp.currentCompletion().endswith("; "),
+          "To field: typing finds a contact group")
+    edit.setText(comp.pathFromIndex(comp.completionModel().index(0, 0)))
+    check(len(edit.addresses()) == 4 and edit.addresses()[0] == "Ann <a@x>",
+          "choosing a group inserts all its members after what was typed")
+    comp.setCompletionPrefix("contoso")
+    check(comp.completionCount() >= 1, "a company name finds its people")
+    w.show_page("mail")
 
 
 def travel_id():

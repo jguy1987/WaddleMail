@@ -70,6 +70,23 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   offline: they go out on the next successful sync). If the server refuses one, for example in a
   shared mailbox you can only read, it is undone locally.
 - Window size, pane layout and splitter positions are remembered.
+- **Contacts** (the rail on the far left, or Ctrl+2; Ctrl+1 back to Mail):
+  - Sources: all personal contacts and each contact folder, **contact groups**, the
+    **organization directory**, and **recent recipients** (people you send to, from Sent
+    Items, and people whose mail you replied to; most used first).
+  - Search by name, address, company, title or department; a details card with avatar,
+    addresses (click to write), phones and notes; "Email everyone in this group".
+  - Personal contacts can be created, edited and deleted; directory people and recent
+    recipients can be added to your contacts. The directory and groups are read-only here.
+  - Refreshed at start-up, hourly and with Refresh. A source that can't be loaded (no
+    directory for personal Microsoft accounts; contact groups if the preview API is missing)
+    is named in a note instead of breaking the rest.
+  - **Autocomplete** in To and Cc of a new message: any part of a name, address or company;
+    people you write to most come first, then contacts, groups (choosing one inserts all its
+    members) and the directory.
+  - Contact groups come from Microsoft Graph's **beta** `distributionLists` API (added in
+    2026; there was no Graph API for them before, and EWS is being retired), so they may
+    change or break without notice.
 - **Status indicator** (bottom right): a dot for the connection (green: the server answered the
   last request; red: it couldn't be reached; amber: connecting or sign-in needed), what is
   running now with a spinner ("Syncing with server…", "Sending changes…", "Searching
@@ -141,9 +158,10 @@ In the Entra admin center (entra.microsoft.com) > App registrations > New regist
    accounts* (or single tenant if it is only for your organization).
 2. Redirect URI: platform **Mobile and desktop applications**, value `http://localhost`.
 3. Under **Authentication**, set "Allow public client flows" to **Yes**.
-4. **API permissions** > Microsoft Graph > Delegated: `Mail.ReadWrite` (mark read, flag) and
-   `Mail.ReadWrite.Shared` (shared mailboxes and folders). Existing users are asked to consent
-   once more after upgrading. Sending and events will
+4. **API permissions** > Microsoft Graph > Delegated: `Mail.ReadWrite` (mark read, flag, move),
+   `Mail.ReadWrite.Shared` (shared mailboxes and folders), `Contacts.ReadWrite` (contacts and
+   contact groups) and `User.ReadBasic.All` (the organization directory; no admin consent
+   needed). Existing users are asked to consent once more after upgrading. Sending and events will
    need `Mail.Send` and `Calendars.ReadWrite` (add them to `SCOPES` in `config.py` as well). In your
    own tenant you can click "Grant admin consent" so users never see a prompt.
 5. Copy the **Application (client) ID**.
@@ -189,6 +207,7 @@ waddlemail/bodies.py       Cache-first body access (the hybrid mode)
 waddlemail/text.py         plain text from HTML bodies, for the full-text index
 waddlemail/desktop.py      app icon paths; launcher + icon install for the application menu
 waddlemail/notify.py       desktop notifications and the task manager unread badge
+waddlemail/contacts.py     contacts/directory/contact group sync, To/Cc suggestions
 waddlemail/resources/      app icon (SVG + PNG sizes), tray icons, launcher template
 waddlemail/settings.py     Preferences (QSettings) and their defaults
 waddlemail/ui/             main window + menus/toolbar, preferences, new mail/event dialogs, safe rendering
@@ -200,6 +219,8 @@ waddlemail/ui/dnd.py       drag-and-drop data format and drag image
 waddlemail/ui/splash.py    splash screen
 waddlemail/ui/tray.py      system tray icon
 waddlemail/ui/status_indicator.py  connection dot and activity in the status bar
+waddlemail/ui/contacts_view.py  the Contacts page and the contact editor
+waddlemail/ui/recipients.py  To/Cc field with name completion
 waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 ```
 
@@ -228,7 +249,7 @@ waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 
 1. Real sending (`Mail.Send`) through an outbox, and deleting messages through the change
    queue (`pending` table) that read/flag/move already use.
-2. Personal contacts (`/me/contacts`) and recipient autocomplete.
+2. Editing contact groups (the beta API has addMembers/deleteMembers); contact photos.
 3. Events (`Calendars.ReadWrite`), then calendar views.
 4. Attachments and `cid:` images; search across all folders; optional background download of
    bodies so local search covers everything offline.

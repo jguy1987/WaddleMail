@@ -39,6 +39,14 @@ MESSAGE_FIELDS = (
     "id,parentFolderId,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,"
     "isRead,hasAttachments,importance,flag,bodyPreview"
 )
+CONTACT_FIELDS = (
+    "id,displayName,givenName,surname,emailAddresses,businessPhones,mobilePhone,homePhones,"
+    "companyName,jobTitle,department,officeLocation,personalNotes,parentFolderId"
+)
+DIRECTORY_FIELDS = (
+    "id,displayName,givenName,surname,mail,userPrincipalName,jobTitle,department,"
+    "officeLocation,businessPhones,mobilePhone,companyName"
+)
 # MAPI properties Graph has no first-class field for: PidTagLastVerbExecuted (102 replied,
 # 103 replied to all, 104 forwarded) and PidTagMessageSize (bytes).
 PROP_LAST_VERB = "Integer 0x1081"
@@ -207,6 +215,66 @@ class GraphClient:
         """Remove a folder and everything in it (recoverable only by an administrator).
         To delete the way Outlook does, move it to Deleted Items instead."""
         self._request(f"{self._root}/mailFolders/{quote(folder_id, safe='')}", method="DELETE")
+
+    # -- contacts ------------------------------------------------------
+    def contact_folders(self) -> list[dict]:
+        """Every contact folder below the default Contacts folder (which isn't listed)."""
+        out: list[dict] = []
+
+        def walk(url: str) -> None:
+            for f in self._paged(url, params={"$top": 100, "$select": "id,displayName"}):
+                out.append(f)
+                walk(f"{self._root}/contactFolders/{quote(f['id'], safe='')}/childFolders")
+
+        walk(f"{self._root}/contactFolders")
+        return out
+
+    def contacts(self, folder_id: str | None = None) -> list[dict]:
+        """All contacts in a folder (None: the default Contacts folder)."""
+        url = (f"{self._root}/contactFolders/{quote(folder_id, safe='')}/contacts" if folder_id
+               else f"{self._root}/contacts")
+        return list(self._paged(url, params={"$top": 500, "$select": CONTACT_FIELDS},
+                                headers=_prefer()))
+
+    def save_contact(self, fields: dict, contact_id: str | None = None,
+                     folder_id: str | None = None) -> dict:
+        """Create (no `contact_id`) or update a personal contact; returns it."""
+        if contact_id:
+            return self._request(f"{self._root}/contacts/{quote(contact_id, safe='')}",
+                                 method="PATCH", json=fields, headers=_prefer())
+        url = (f"{self._root}/contactFolders/{quote(folder_id, safe='')}/contacts" if folder_id
+               else f"{self._root}/contacts")
+        return self._request(url, method="POST", json=fields, headers=_prefer())
+
+    def delete_contact(self, contact_id: str) -> None:
+        self._request(f"{self._root}/contacts/{quote(contact_id, safe='')}", method="DELETE")
+
+    def directory_users(self, limit: int = 50_000) -> list[dict]:
+        """People in the organization's directory (work/school accounts only)."""
+        out: list[dict] = []
+        for u in self._paged("/users", params={"$top": 999, "$select": DIRECTORY_FIELDS}):
+            out.append(u)
+            if len(out) >= limit:
+                break
+        return out
+
+    def contact_groups(self) -> list[dict]:
+        """Personal contact groups with their members. Microsoft Graph only offers these in
+        its beta API (distributionLists, since 2026), so this may change or be missing."""
+        beta = self._base.rsplit("/", 1)[0] + "/beta"
+        groups = list(self._paged(f"{beta}{self._root}/distributionLists",
+                                  params={"$top": 100}, headers=_prefer()))
+        for g in groups:
+            url = f"{beta}{self._root}/distributionLists/{quote(g['id'], safe='')}"
+            try:  # members with their contacts' addresses, if the server can nest that
+                full = self._request(url, params={"$expand": "members($expand=contact)"},
+                                     headers=_prefer())
+            except GraphError as exc:
+                if exc.status != 400:
+                    raise
+                full = self._request(url, params={"$expand": "members"}, headers=_prefer())
+            g["members"] = full.get("members") or []
+        return groups
 
     # -- messages ------------------------------------------------------
     def messages_delta(self, folder_id: str, delta_link: str | None = None,

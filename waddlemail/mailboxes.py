@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 from .auth import Authenticator
 from .bodies import BodyService
+from .contacts import ContactSync
 from .graph import GraphClient
 from .store import Store
 from .sync import SyncEngine
@@ -26,6 +27,7 @@ class Mailbox:
     graph: GraphClient
     sync: SyncEngine
     bodies: BodyService
+    contacts: ContactSync | None = None  # an account's own mailbox only
 
     @property
     def shared(self) -> bool:
@@ -63,7 +65,9 @@ class MailboxManager:
             sync.initial_days = self.initial_days
         if self.max_bytes is not None:
             bodies.max_bytes = self.max_bytes
-        return Mailbox(r["id"], account_id, r["address"], r["display_name"], graph, sync, bodies)
+        contacts = None if r["address"] else ContactSync(self.store, graph, account_id)
+        return Mailbox(r["id"], account_id, r["address"], r["display_name"], graph, sync, bodies,
+                       contacts)
 
     def all(self) -> list[Mailbox]:
         return list(self._boxes.values())

@@ -10,16 +10,18 @@ from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWebEngineCore import QWebEnginePage
 from PySide6.QtWidgets import (
     QApplication, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QSplitter,
-    QSystemTrayIcon, QTextEdit, QToolBar, QToolButton, QVBoxLayout, QWidget,
+    QStackedWidget, QSystemTrayIcon, QTextEdit, QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .. import __version__, desktop, graph
+from ..contacts import personal_row, suggestions
 from ..graph import NO_SUBFOLDERS
 from ..mailboxes import MailboxManager
 from ..notify import make_notifier
 from ..settings import Settings
 from ..store import Store
 from . import iconset
+from .contacts_view import ContactsView
 from .dialogs import ComposeDialog, EventDialog, SharedMailboxDialog
 from .folder_pane import FolderPane
 from .folder_picker import TOP, FolderPicker
@@ -130,7 +132,17 @@ class MainWindow(QMainWindow):
         self.outer.addWidget(self.content)
         self.outer.setStretchFactor(1, 1)  # resizing the window grows the mail, not the folders
         self.outer.setSizes([240, 960])
-        self.setCentralWidget(self.outer)
+        # Mail and Contacts are pages of one window, switched with the rail on the left.
+        self.contacts_view = ContactsView(store)
+        self.contacts_view.composeRequested.connect(lambda to: self.new_mail(to))
+        self.contacts_view.refreshRequested.connect(self.refresh_contacts)
+        self.contacts_view.saveRequested.connect(self.save_contact)
+        self.contacts_view.deleteRequested.connect(self.delete_contact)
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self.outer)
+        self.pages.addWidget(self.contacts_view)
+        self.setCentralWidget(self.pages)
+        self._contacts_busy = False
 
         # Session toggle in the View menu; its starting value comes from Preferences.
         self.images_action = QAction("Load remote &images", self)
@@ -139,6 +151,7 @@ class MainWindow(QMainWindow):
         self.images_action.toggled.connect(self.msg_view.rerender)
 
         self._build_actions()
+        self._build_nav()
         self._build_menus()
         self._build_toolbar()
         self.folder_tree.set_context_actions([self.act_add_shared, self.act_add_account])
@@ -167,6 +180,9 @@ class MainWindow(QMainWindow):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.sync_current)
+        self.contacts_timer = QTimer(self)  # contacts change slowly: hourly is plenty
+        self.contacts_timer.setInterval(60 * 60_000)
+        self.contacts_timer.timeout.connect(self.refresh_contacts)
         self._apply_settings()
         self._restore_layout()
 
@@ -249,6 +265,8 @@ class MainWindow(QMainWindow):
             self.status.synced()
         self.timer.start()
         self._notify_new(new)  # mail that arrived while WaddleMail was closed
+        self.contacts_timer.start()
+        self.refresh_contacts()
 
     # -- folders ------------------------------------------------------
     def _populate_folders(self):
@@ -669,6 +687,97 @@ class MainWindow(QMainWindow):
 
         self._run(lambda: box.sync.fetch_older(fid), done, on_failed=failed,
                   activity="Downloading older mail…")
+
+    # -- contacts -----------------------------------------------------------
+    def show_page(self, page: str):
+        """"mail" or "contacts"."""
+        widget = self.contacts_view if page == "contacts" else self.outer
+        self.pages.setCurrentWidget(widget)
+        self._nav[page].setChecked(True)
+        if page == "contacts":
+            self.contacts_view.search.setFocus()
+
+    def refresh_contacts(self):
+        """Download contacts, contact groups and the directory for every account, and
+        recount the people you write to (from Sent Items, synced here too)."""
+        if self._contacts_busy:
+            return
+        boxes = [b for b in self.mailboxes.all() if b.contacts is not None]
+        if not boxes:
+            return
+        self._contacts_busy = True
+
+        def job():
+            problems = []
+            for box in boxes:
+                res = box.contacts.refresh()
+                problems += [f"{box.display_name}: {p}" for p in res.problems]
+                if res.groups is None:
+                    problems.append(f"{box.display_name}: contact groups are unavailable "
+                                    "(Microsoft offers them only in a preview API).")
+                sent = self.store.well_known_folder(box.id, "sentitems")
+                if sent:
+                    try:
+                        box.sync.sync_folder(sent)
+                    except Exception as exc:
+                        log.warning("sent items sync failed: %s", exc)
+            self.store.rebuild_recipients()
+            return problems
+
+        def done(problems: list[str]):
+            self._contacts_busy = False
+            self.contacts_view.reload()
+            self.contacts_view.show_problems(sorted(set(problems)))
+
+        def failed(_msg: str):
+            self._contacts_busy = False
+
+        self._run(job, done, on_failed=failed, activity="Updating contacts…")
+
+    def _contacts_box(self, account_id: str | None = None):
+        own = [b for b in self.mailboxes.all() if b.contacts is not None]
+        return next((b for b in own if b.account_id == account_id), own[0] if own else None)
+
+    def save_contact(self, fields: dict, contact_id: str, folder_id: str, folder_name: str):
+        row = self.store.contact_row(contact_id) if contact_id else None
+        box = self._contacts_box(row["account_id"] if row else None)
+        if box is None:
+            return
+
+        def job():
+            item = box.graph.save_contact(fields, contact_id or None, folder_id or None)
+            self.store.upsert_contact(personal_row(item, box.account_id, folder_id, folder_name))
+            return item["id"]
+
+        def done(new_id: str):
+            self.contacts_view.reload()
+            self.contacts_view.select_contact(new_id)
+            self.statusBar().showMessage("Contact saved", 3000)
+
+        self._run(job, done, activity="Saving contact…", on_failed=lambda msg: QMessageBox.warning(
+            self, "Contacts", f"Couldn't save the contact.\n\n{msg}"))
+
+    def delete_contact(self, contact_id: str):
+        row = self.store.contact_row(contact_id)
+        box = self._contacts_box(row["account_id"] if row else None)
+        if row is None or box is None:
+            return
+        if QMessageBox.question(self, "Delete contact",
+                                f"Delete {row['display_name']} from your contacts?") \
+                != QMessageBox.StandardButton.Yes:
+            return
+
+        def job():
+            box.graph.delete_contact(contact_id)
+            self.store.delete_contact(contact_id)
+
+        def done(_):
+            self.contacts_view.reload()
+            self.statusBar().showMessage("Contact deleted", 3000)
+
+        self._run(job, done, activity="Deleting contact…",
+                  on_failed=lambda msg: QMessageBox.warning(
+                      self, "Contacts", f"Couldn't delete the contact.\n\n{msg}"))
 
     # -- move / copy --------------------------------------------------------
     def _pick_folder(self, mailbox_id: str, title: str, prompt: str, parent=None,
@@ -1133,6 +1242,27 @@ class MainWindow(QMainWindow):
         act.setSeparator(True)
         return act
 
+    def _build_nav(self):
+        """The rail on the far left: Mail / Contacts (Ctrl+1 / Ctrl+2)."""
+        rail = QToolBar("Navigation", self)
+        rail.setObjectName("nav-rail")
+        rail.setMovable(False)
+        rail.setOrientation(Qt.Orientation.Vertical)
+        rail.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+        rail.setIconSize(rail.iconSize() * 1.2)
+        group = QActionGroup(self)
+        self._nav: dict[str, QAction] = {}
+        for page, label, icon, key in (("mail", "Mail", "mail", "Ctrl+1"),
+                                       ("contacts", "Contacts", "contact", "Ctrl+2")):
+            act = self._themed(label, icon, lambda p=page: self.show_page(p), key,
+                               tip=f"{label} ({key})")
+            act.setCheckable(True)
+            group.addAction(act)
+            rail.addAction(act)
+            self._nav[page] = act
+        self._nav["mail"].setChecked(True)
+        self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, rail)
+
     def _build_toolbar(self):
         bar = QToolBar("Main", self)
         bar.setObjectName("main-toolbar")
@@ -1227,6 +1357,9 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self._action("&Preferences…", self.show_preferences, "Ctrl+,"))
 
         view_menu = mb.addMenu("&View")
+        view_menu.addAction(self._nav["mail"])
+        view_menu.addAction(self._nav["contacts"])
+        view_menu.addSeparator()
         pane_menu = view_menu.addMenu("&Reading pane")
         for mode, _label in READING_PANE_MODES:
             pane_menu.addAction(self._pane_actions[mode])
@@ -1267,8 +1400,8 @@ class MainWindow(QMainWindow):
             self, "About WaddleMail",
             f"WaddleMail {__version__}\n\nA Linux mail client for Microsoft 365.")
 
-    def new_mail(self):
-        dlg = ComposeDialog(self)
+    def new_mail(self, to: list[str] | None = None):
+        dlg = ComposeDialog(self, suggestions(self.store), to)
         if dlg.exec():
             _values = dlg.values()  # TODO: queue in outbox, then POST /me/sendMail
             self.statusBar().showMessage("Sending isn't wired up yet", 5000)

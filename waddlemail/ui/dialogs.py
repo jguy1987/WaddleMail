@@ -23,20 +23,29 @@ class _Base(QDialog):
 
 
 class ComposeDialog(_Base):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, suggestions=(), to: list[str] | None = None):
+        """`suggestions` (contacts.suggestions()) feed name completion in To and Cc; `to`
+        fills in the recipients (from the Contacts view, say)."""
         super().__init__(parent)
+        from .recipients import RecipientEdit  # (keeps this module light for the tests)
         self.setWindowTitle("New message")
         self.resize(640, 480)
         form = QFormLayout(self)
-        self.to, self.subject, self.body = QLineEdit(), QLineEdit(), QPlainTextEdit()
+        suggestions = list(suggestions)
+        self.to, self.cc = RecipientEdit(suggestions), RecipientEdit(suggestions)
+        self.subject, self.body = QLineEdit(), QPlainTextEdit()
+        if to:
+            self.to.setText("; ".join(to) + "; ")
         form.addRow("To:", self.to)
+        form.addRow("Cc:", self.cc)
         form.addRow("Subject:", self.subject)
         form.addRow(self.body)
         self._finish(form, "Send")
+        (self.subject if to else self.to).setFocus()
 
     def values(self) -> dict:
-        return {"to": _split(self.to.text()), "subject": self.subject.text(),
-                "body": self.body.toPlainText()}
+        return {"to": self.to.addresses(), "cc": self.cc.addresses(),
+                "subject": self.subject.text(), "body": self.body.toPlainText()}
 
 
 class EventDialog(_Base):

@@ -80,6 +80,37 @@ CREATE VIRTUAL TABLE IF NOT EXISTS body_fts USING fts5(
 CREATE TRIGGER IF NOT EXISTS bodies_fts_delete AFTER DELETE ON bodies BEGIN
     DELETE FROM body_fts WHERE rowid = old.rowid;
 END;
+-- People: personal contacts (any contact folder) and the organization directory.
+CREATE TABLE IF NOT EXISTS contacts(
+    id TEXT PRIMARY KEY,            -- Graph contact id, or "dir:" + directory user id
+    account_id TEXT NOT NULL,
+    source TEXT NOT NULL,           -- personal / directory
+    folder_id TEXT,                 -- contact folder ("" = the default Contacts folder)
+    folder_name TEXT,
+    display_name TEXT NOT NULL,
+    given_name TEXT, surname TEXT,
+    company TEXT, job_title TEXT, department TEXT, office TEXT,
+    emails TEXT,                    -- JSON [[name, address], ...]
+    phones TEXT,                    -- JSON [[label, number], ...]
+    notes TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_contacts_source ON contacts(source, account_id);
+-- Personal contact groups (Outlook "contact lists").
+CREATE TABLE IF NOT EXISTS contact_groups(
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    notes TEXT,
+    members TEXT                    -- JSON [[name, address, type], ...]
+);
+-- People you send to and reply to, for the Recent list and autocomplete.
+CREATE TABLE IF NOT EXISTS recipients(
+    address TEXT PRIMARY KEY,       -- lower case
+    name TEXT,
+    sent INTEGER DEFAULT 0,         -- messages you sent them (To/Cc)
+    replied INTEGER DEFAULT 0,      -- their messages you replied to
+    last_used TEXT
+);
 """
 
 # Message columns added after the first release; adding them resets the delta cursors so
@@ -559,6 +590,120 @@ class Store:
                     break
                 c.execute("DELETE FROM bodies WHERE message_id=?", (oldest["message_id"],))
                 total -= oldest["size"]
+
+    # -- contacts ----------------------------------------------------------
+    _CONTACT_COLUMNS = ("id", "account_id", "source", "folder_id", "folder_name",
+                        "display_name", "given_name", "surname", "company", "job_title",
+                        "department", "office", "emails", "phones", "notes")
+
+    def replace_contacts(self, account_id: str, source: str, rows: list[dict]) -> None:
+        """Make `rows` the account's whole set of contacts from `source`."""
+        cols = self._CONTACT_COLUMNS
+        with self.conn as c:
+            c.execute("DELETE FROM contacts WHERE account_id=? AND source=?", (account_id, source))
+            c.executemany(
+                f"INSERT OR REPLACE INTO contacts({','.join(cols)}) "
+                f"VALUES({','.join('?' * len(cols))})",
+                [tuple(r.get(k) for k in cols) for r in rows])
+
+    def upsert_contact(self, row: dict) -> None:
+        cols = self._CONTACT_COLUMNS
+        with self.conn as c:
+            c.execute(f"INSERT OR REPLACE INTO contacts({','.join(cols)}) "
+                      f"VALUES({','.join('?' * len(cols))})", tuple(row.get(k) for k in cols))
+
+    def delete_contact(self, contact_id: str) -> None:
+        with self.conn as c:
+            c.execute("DELETE FROM contacts WHERE id=?", (contact_id,))
+
+    def contact_row(self, contact_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM contacts WHERE id=?", (contact_id,)).fetchone()
+
+    def contacts(self, source: str | None = None, folder_id: str | None = None,
+                 search: str = "") -> list[sqlite3.Row]:
+        """Contacts A-Z; every word of `search` must appear in the name, an address, the
+        company, title or department."""
+        sql, args = "SELECT * FROM contacts WHERE 1", []
+        if source:
+            sql += " AND source=?"
+            args.append(source)
+        if folder_id is not None:
+            sql += " AND folder_id=?"
+            args.append(folder_id)
+        for word in search.split():
+            sql += (" AND (display_name LIKE ? OR emails LIKE ? OR company LIKE ?"
+                    " OR job_title LIKE ? OR department LIKE ?)")
+            args.extend([f"%{word}%"] * 5)
+        return self.conn.execute(sql + " ORDER BY display_name COLLATE NOCASE", args).fetchall()
+
+    def contact_folders(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT DISTINCT account_id, folder_id, folder_name FROM contacts "
+            "WHERE source='personal' ORDER BY folder_id != '', folder_name COLLATE NOCASE"
+        ).fetchall()
+
+    def replace_groups(self, account_id: str, groups: list[dict]) -> None:
+        with self.conn as c:
+            c.execute("DELETE FROM contact_groups WHERE account_id=?", (account_id,))
+            c.executemany(
+                "INSERT OR REPLACE INTO contact_groups(id, account_id, name, notes, members)"
+                " VALUES(?,?,?,?,?)",
+                [(g["id"], account_id, g["name"], g.get("notes"), json.dumps(g["members"]))
+                 for g in groups])
+
+    def groups(self, search: str = "") -> list[sqlite3.Row]:
+        sql, args = "SELECT * FROM contact_groups WHERE 1", []
+        for word in search.split():
+            sql += " AND (name LIKE ? OR members LIKE ?)"
+            args.extend([f"%{word}%"] * 2)
+        return self.conn.execute(sql + " ORDER BY name COLLATE NOCASE", args).fetchall()
+
+    def group_row(self, group_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM contact_groups WHERE id=?",
+                                 (group_id,)).fetchone()
+
+    def rebuild_recipients(self) -> int:
+        """Recount who you write to (To/Cc of mail in Sent Items) and reply to (senders of
+        mail marked replied/replied-all). Returns how many people that is."""
+        people: dict[str, dict] = {}
+
+        def bump(name, address, field, when):
+            if not address or "@" not in address:
+                return
+            p = people.setdefault(address.lower(), {"name": "", "sent": 0, "replied": 0,
+                                                    "last_used": ""})
+            p[field] += 1
+            if name and (not p["name"] or (when or "") >= p["last_used"]):
+                p["name"] = name
+            p["last_used"] = max(p["last_used"], when or "")
+
+        for r in self.conn.execute(
+                "SELECT m.to_recipients, m.cc_recipients, m.received FROM messages m "
+                "JOIN folders f ON f.id = m.folder_id WHERE f.well_known = 'sentitems'"):
+            for name, address in recipients(r["to_recipients"]) + recipients(r["cc_recipients"]):
+                bump(name, address, "sent", r["received"])
+        for r in self.conn.execute(
+                "SELECT sender_name, sender_addr, received FROM messages "
+                "WHERE last_verb IN (102, 103)"):
+            bump(r["sender_name"], r["sender_addr"], "replied", r["received"])
+        mine = {(m["address"] or "").lower() for m in self.mailbox_rows()}
+        mine |= {(m["display_name"] or "").lower() for m in self.mailbox_rows()}
+        with self.conn as c:
+            c.execute("DELETE FROM recipients")
+            c.executemany(
+                "INSERT INTO recipients(address, name, sent, replied, last_used) VALUES(?,?,?,?,?)",
+                [(a, p["name"], p["sent"], p["replied"], p["last_used"])
+                 for a, p in people.items() if a not in mine])
+        return len(people)
+
+    def recent_recipients(self, search: str = "", limit: int = 500) -> list[sqlite3.Row]:
+        """Most used first: replies count double, recent use breaks ties."""
+        sql, args = "SELECT * FROM recipients WHERE 1", []
+        for word in search.split():
+            sql += " AND (name LIKE ? OR address LIKE ?)"
+            args.extend([f"%{word}%"] * 2)
+        sql += " ORDER BY sent + 2 * replied DESC, last_used DESC LIMIT ?"
+        return self.conn.execute(sql, (*args, limit)).fetchall()
 
     def has_body(self, message_id: str) -> bool:
         return self.conn.execute(
