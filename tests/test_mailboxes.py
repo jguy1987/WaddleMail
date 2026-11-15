@@ -126,3 +126,29 @@ def test_folder_order_puts_defaults_first():
         ("Inbox", "inbox"), ("Zebra", None), ("Drafts", "drafts")]]
     assert [r["name"] for r in folder_order(rows)] == [
         "Inbox", "Drafts", "Sent Items", "Archive", "aardvark", "Zebra"]
+
+
+def test_requests_report_the_connection(monkeypatch):
+    import requests
+
+    from waddlemail import graph
+    from waddlemail.auth import AuthError
+    seen = []
+    monkeypatch.setattr(graph, "status_hook", lambda state, detail: seen.append(state))
+
+    class Down:
+        def request(self, *a, **k):
+            raise requests.ConnectionError("no route")
+
+    with pytest.raises(requests.ConnectionError):
+        GraphClient(lambda: "t", session=Down()).list_folders()
+    s = FakeSession({("POST", "/$batch"): (403, {}), ("GET", "/me/mailFolders"): (200, {"value": []})})
+    with pytest.raises(GraphError):
+        GraphClient(lambda: "t", session=s).well_known_folders()  # refused, but reachable
+
+    def no_token():
+        raise AuthError("sign-in required")
+
+    with pytest.raises(AuthError):
+        GraphClient(no_token, session=s).inbox_id()
+    assert seen == ["offline", "online", "signin"]

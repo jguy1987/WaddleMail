@@ -70,6 +70,12 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   offline: they go out on the next successful sync). If the server refuses one, for example in a
   shared mailbox you can only read, it is undone locally.
 - Window size, pane layout and splitter positions are remembered.
+- **Status indicator** (bottom right): a dot for the connection (green: the server answered the
+  last request; red: it couldn't be reached; amber: connecting or sign-in needed), what is
+  running now with a spinner ("Syncing with server…", "Sending changes…", "Searching
+  server…", ...), and otherwise "Up to date · 14:32" or "Offline · 3 changes waiting". Hover
+  for details; click to sync now. The connection state comes from the requests themselves
+  (`graph.status_hook`), not from a separate check.
 - **Desktop integration**
   - App icon (the courier penguin, `waddlemail/resources/`) for the window, task manager and
     application menu; a splash screen while starting (Preferences > General to turn it off).
@@ -193,6 +199,7 @@ waddlemail/ui/folder_picker.py  "choose a folder" dialog for Move/Copy to folder
 waddlemail/ui/dnd.py       drag-and-drop data format and drag image
 waddlemail/ui/splash.py    splash screen
 waddlemail/ui/tray.py      system tray icon
+waddlemail/ui/status_indicator.py  connection dot and activity in the status bar
 waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 ```
 

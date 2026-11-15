@@ -9,8 +9,23 @@ from urllib.parse import quote
 import requests
 
 from . import config
+from .auth import AuthError
 
 log = logging.getLogger(__name__)
+
+# Connection reporting: called (from whichever thread made the request) with "online" when
+# the server answered (whatever it said), "offline" when it couldn't be reached, or "signin"
+# when no token could be had; plus a detail text. The UI's status indicator listens.
+ONLINE, OFFLINE, SIGNIN = "online", "offline", "signin"
+status_hook: Callable[[str, str], None] | None = None
+
+
+def _report(state: str, detail: str = "") -> None:
+    if status_hook is not None:
+        try:
+            status_hook(state, detail)
+        except Exception:  # reporting must never break a request
+            log.debug("status hook failed", exc_info=True)
 
 FOLDER_FIELDS = "id,displayName,parentFolderId,childFolderCount,unreadItemCount,totalItemCount"
 # Default folders, in the order the folder pane shows them (other folders follow, A-Z).
@@ -30,6 +45,14 @@ PROP_LAST_VERB = "Integer 0x1081"
 PROP_SIZE = "Integer 0x0E08"
 EXTENDED_PROPS = (f"singleValueExtendedProperties($filter=id eq '{PROP_LAST_VERB}'"
                   f" or id eq '{PROP_SIZE}')")
+
+
+def _network_problem(exc: requests.RequestException) -> str:
+    if isinstance(exc, requests.Timeout):
+        return "The server didn't answer in time."
+    if isinstance(exc, requests.ConnectionError):
+        return "Can't reach the server (no network connection?)."
+    return f"Network error: {exc.__class__.__name__}"
 
 
 class GraphError(Exception):
@@ -74,8 +97,17 @@ class GraphClient:
         full = self._url(url)
         refreshed = False
         for attempt in range(retries):
-            hdrs = {"Authorization": f"Bearer {self._token()}", **(headers or {})}
-            r = self._s.request(method, full, params=params, headers=hdrs, json=json, timeout=30)
+            try:
+                hdrs = {"Authorization": f"Bearer {self._token()}", **(headers or {})}
+                r = self._s.request(method, full, params=params, headers=hdrs, json=json,
+                                    timeout=30)
+            except AuthError as exc:
+                _report(SIGNIN, str(exc))
+                raise
+            except requests.RequestException as exc:  # DNS, refused, timeout, TLS, ...
+                _report(OFFLINE, _network_problem(exc))
+                raise
+            _report(ONLINE)
             if r.status_code in (429, 503, 504):
                 wait = float(r.headers.get("Retry-After", 2 ** attempt))
                 log.info("Graph %s; retrying in %.1fs", r.status_code, wait)

@@ -560,6 +560,14 @@ class Store:
                 c.execute("DELETE FROM bodies WHERE message_id=?", (oldest["message_id"],))
                 total -= oldest["size"]
 
+    def has_body(self, message_id: str) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM bodies WHERE message_id=?", (message_id,)).fetchone() is not None
+
+    def pending_count(self) -> int:
+        """Local changes not yet sent, all mailboxes."""
+        return self.conn.execute("SELECT COUNT(*) FROM pending").fetchone()[0]
+
     def body_cache_size(self) -> int:
         return self.conn.execute("SELECT COALESCE(SUM(size),0) FROM bodies").fetchone()[0]
 

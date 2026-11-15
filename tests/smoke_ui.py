@@ -320,6 +320,7 @@ def checks():
     move_checks()
     integration_checks()
     older_mail_checks()
+    status_checks()
 
     w.close()
     saved = Settings(str(tmp / "settings.ini"))
@@ -560,6 +561,44 @@ def older_mail_checks():
     check(st.message_row("older1") is not None and "older2" in ids(),
           "Download older mail fetches it into the list")
     check(not bar.isVisible(), "the bar goes away when everything is here")
+
+
+def status_checks():
+    import threading
+    ind = w.status
+    check(graph.status_hook == ind.report, "requests report to the status indicator")
+    # reported from a worker thread, as real requests are
+    threading.Thread(target=graph._report,
+                     args=(graph.OFFLINE, "Can't reach the server.")).start()
+    wait(200)
+    check(ind.state == graph.OFFLINE and ind.dot.color.name() == "#e03131"
+          and ind.label.text().startswith("Offline")
+          and "Can't reach the server." in ind.toolTip(), "offline: red dot, text, details")
+    w.mark_read([ids()[0]], False)
+    w.mark_read([ids()[0]], True)  # toggled twice: no change left to send
+    w.mark_read([ids()[1]], not st.message_row(ids()[1])["is_read"])
+    n = st.pending_count()
+    check(n > 0 and f"{n} change{'s' if n != 1 else ''} waiting" in ind.label.text(),
+          "offline: changes waiting are counted")
+    graph._report(graph.ONLINE)
+    wait(100)
+    check(ind.dot.color.name() == "#2f9e44" and ind.label.text().startswith("Online"),
+          "online: green dot")
+    token = ind.begin("Downloading older mail…")
+    check(ind.spinner.isVisible() and ind.label.text() == "Downloading older mail…",
+          "activity: spinner and what is happening")
+    ind.end(token)
+    check(not ind.spinner.isVisible(), "spinner stops when it's done")
+    wait(2000)  # let pending sends / syncs finish
+    w._syncing = False
+    QTest.mouseClick(ind, Qt.MouseButton.LeftButton)
+    check(ind.label.text() == "Syncing with server…", "clicking it syncs now")
+    wait(500)
+    ind.synced()
+    graph._report(graph.ONLINE)
+    wait(100)
+    check(ind.label.text().startswith("Up to date ·") or "waiting" in ind.label.text(),
+          "idle: up to date with the time of the last sync")
 
 
 def travel_id():

@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon, QTextEdit, QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
-from .. import __version__, desktop
+from .. import __version__, desktop, graph
 from ..graph import NO_SUBFOLDERS
 from ..mailboxes import MailboxManager
 from ..notify import make_notifier
@@ -27,6 +27,7 @@ from .message_list import OUTGOING, FilterBar, MessageListView, OlderMailBar
 from .message_view import MessageView, MessageWindow
 from .preferences import PreferencesDialog
 from .render import placeholder
+from .status_indicator import StatusIndicator
 from .tray import Tray
 
 log = logging.getLogger(__name__)
@@ -75,6 +76,12 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("WaddleMail")
         self.resize(1200, 760)
+
+        # Bottom right: connection state and what's happening.
+        self.status = StatusIndicator(self.store.pending_count)
+        self.status.clicked.connect(self.sync_current)
+        self.statusBar().addPermanentWidget(self.status)
+        graph.status_hook = self.status.report
 
         # folders
         self.folder_tree = FolderPane(store)
@@ -167,12 +174,16 @@ class MainWindow(QMainWindow):
         self._start_initial_sync()
 
     # -- background plumbing ------------------------------------------
-    def _run(self, fn, on_done, *args, on_failed=None):
+    def _run(self, fn, on_done, *args, on_failed=None, activity: str | None = None):
+        """Run `fn` on a worker thread; `activity` names it in the status indicator."""
         w = Worker(fn, *args)
         self._workers.add(w)
+        token = self.status.begin(activity) if activity else None
 
         def cleanup():
             self._workers.discard(w)
+            if token is not None:
+                self.status.end(token)
 
         w.signals.done.connect(on_done)
         w.signals.done.connect(cleanup)
@@ -183,6 +194,8 @@ class MainWindow(QMainWindow):
         self.pool.start(w)
 
     def _on_error(self, msg: str):
+        if self.status.state in (graph.OFFLINE, graph.SIGNIN):
+            return  # the indicator already says so; no need to repeat it on the left
         self.statusBar().showMessage(f"Error: {msg}", 10_000)
 
     def _sync_failed(self, _msg: str):
@@ -190,7 +203,6 @@ class MainWindow(QMainWindow):
 
     # -- startup ------------------------------------------------------
     def _start_initial_sync(self):
-        self.statusBar().showMessage("Signing in…")
         mailboxes = self.mailboxes
 
         def job():
@@ -208,7 +220,8 @@ class MainWindow(QMainWindow):
             return inbox, error, new
 
         self._syncing = True
-        self._run(job, self._initial_sync_done, on_failed=self._sync_failed)
+        self._run(job, self._initial_sync_done, on_failed=self._sync_failed,
+                  activity="Connecting…")
 
     def _sync_all_folders(self):
         """Send queued changes and refresh every mailbox's folder list and counts (worker
@@ -233,7 +246,7 @@ class MainWindow(QMainWindow):
         if error:
             self.statusBar().showMessage(f"Couldn't sync, showing stored mail: {error}", 10_000)
         else:
-            self.statusBar().showMessage("Up to date", 3000)
+            self.status.synced()
         self.timer.start()
         self._notify_new(new)  # mail that arrived while WaddleMail was closed
 
@@ -277,7 +290,7 @@ class MainWindow(QMainWindow):
             box.sync.sync_folders()
             return box.id
 
-        self._run(job, self._mailbox_added, on_failed=self._sync_failed)
+        self._run(job, self._mailbox_added, on_failed=self._sync_failed, activity="Signing in…")
 
     def add_shared_mailbox(self):
         accounts = [(b.account_id, b.display_name) for b in self.mailboxes.all() if not b.shared]
@@ -301,7 +314,7 @@ class MainWindow(QMainWindow):
                 f"Couldn't open {v['address']}.\n\nCheck the address and that you've been "
                 f"given access to the mailbox or some of its folders.\n\n{msg}")
 
-        self._run(job, self._mailbox_added, on_failed=failed)
+        self._run(job, self._mailbox_added, on_failed=failed, activity="Opening mailbox…")
 
     def _mailbox_added(self, mailbox_id: str):
         self._syncing = False
@@ -386,8 +399,9 @@ class MainWindow(QMainWindow):
             self.folder_tree.select_folder(folder_id)
             self.statusBar().showMessage(f"Created {name}", 3000)
 
-        self._run(job, done, on_failed=lambda msg: self._folder_failed(
-            "New folder", f"Couldn't create \"{name}\".\n\n{msg}"))
+        self._run(job, done, activity="Creating folder…",
+                  on_failed=lambda msg: self._folder_failed(
+                      "New folder", f"Couldn't create \"{name}\".\n\n{msg}"))
 
     def _rename_folder(self, folder_id: str, name: str):
         row = self.store.folder_row(folder_id)
@@ -409,8 +423,9 @@ class MainWindow(QMainWindow):
             self._populate_folders()
             self.statusBar().showMessage(f"Renamed to {name}", 3000)
 
-        self._run(job, done, on_failed=lambda msg: self._folder_failed(
-            "Rename folder", f"Couldn't rename \"{row['name']}\".\n\n{msg}"))
+        self._run(job, done, activity="Renaming folder…",
+                  on_failed=lambda msg: self._folder_failed(
+                      "Rename folder", f"Couldn't rename \"{row['name']}\".\n\n{msg}"))
 
     def delete_folder(self, folder_id: str):
         """Move a folder to Deleted Items, as Outlook does; one already in Deleted Items is
@@ -458,8 +473,9 @@ class MainWindow(QMainWindow):
                 self._populate_folders()
             self.statusBar().showMessage(f"Deleted {row['name']}", 3000)
 
-        self._run(job, done, on_failed=lambda msg: self._folder_failed(
-            title, f"Couldn't delete \"{row['name']}\".\n\n{msg}"))
+        self._run(job, done, activity="Deleting folder…",
+                  on_failed=lambda msg: self._folder_failed(
+                      title, f"Couldn't delete \"{row['name']}\".\n\n{msg}"))
 
     # -- message list ---------------------------------------------------
     def _refresh_messages(self):
@@ -514,7 +530,7 @@ class MainWindow(QMainWindow):
                 self._search_note = "server search unavailable"
                 self.filter_bar.set_count(len(self._listed_ids()), self._search_note)
 
-        self._run(job, done, on_failed=failed)
+        self._run(job, done, on_failed=failed, activity="Searching server…")
 
     def _listed_ids(self) -> list[str]:
         return [m["id"] for m in self.msg_list.model_.root.messages()]
@@ -525,7 +541,6 @@ class MainWindow(QMainWindow):
         if box is None or self._syncing:
             return
         self._syncing = True
-        self.statusBar().showMessage("Syncing…")
 
         max_age_days = self.settings.get("cache/max_age_days")  # read on the UI thread
 
@@ -546,18 +561,19 @@ class MainWindow(QMainWindow):
                 self.store.purge_bodies_older_than(max_age_days)
             return fid, res, new
 
-        self._run(job, self._sync_done, on_failed=self._sync_failed)
+        self._run(job, self._sync_done, on_failed=self._sync_failed,
+                  activity="Syncing with server…")
 
     def _sync_done(self, payload):
         self._syncing = False
         fid, res, new = payload
+        self.status.synced()
         self._notify_new(new)
         if res.upserted or res.removed:  # new mail may match a search: ask the server again
             self._server_hits = {k: v for k, v in self._server_hits.items() if k[0] != fid}
         self._populate_folders()
         if fid == self._current_folder:
             self._refresh_messages()
-        self.statusBar().showMessage(f"Synced (+{res.upserted} / -{res.removed})", 4000)
 
     def _on_message_selected(self, *_):
         self._update_message_actions()
@@ -583,7 +599,8 @@ class MainWindow(QMainWindow):
             return
         self.msg_view.show_message(row)
         self._run(lambda: (mid, box.bodies.get(mid)), self._body_ready,
-                  on_failed=lambda msg: self._body_failed(mid, msg))
+                  on_failed=lambda msg: self._body_failed(mid, msg),
+                  activity=None if self.store.has_body(mid) else "Downloading message…")
         if self.settings.get("read/mark_on_view") and not row["is_read"]:
             self._read_timer.start(self.settings.get("read/mark_delay_sec") * 1000)
 
@@ -614,6 +631,7 @@ class MainWindow(QMainWindow):
         win.show()
         self._run(lambda: box.bodies.get(mid),
                   lambda body: win.set_body(body.content_type, body.content),
+                  activity=None if self.store.has_body(mid) else "Downloading message…",
                   on_failed=win.show_error)
         self.mark_read([mid], True)
 
@@ -649,7 +667,8 @@ class MainWindow(QMainWindow):
             self._downloading.discard(fid)
             self._update_older_bar()
 
-        self._run(lambda: box.sync.fetch_older(fid), done, on_failed=failed)
+        self._run(lambda: box.sync.fetch_older(fid), done, on_failed=failed,
+                  activity="Downloading older mail…")
 
     # -- move / copy --------------------------------------------------------
     def _pick_folder(self, mailbox_id: str, title: str, prompt: str, parent=None,
@@ -702,8 +721,9 @@ class MainWindow(QMainWindow):
                     self._refresh_messages()
                 self.statusBar().showMessage(f"Copied {what} to {name}", 4000)
 
-            self._run(job, done, on_failed=lambda msg: QMessageBox.warning(
-                parent or self, "Copy to folder", f"Couldn't copy {what}.\n\n{msg}"))
+            self._run(job, done, activity="Copying messages…",
+                      on_failed=lambda msg: QMessageBox.warning(
+                          parent or self, "Copy to folder", f"Couldn't copy {what}.\n\n{msg}"))
             return
         follow = self.msg_list.neighbor_after(set(ids))  # Outlook moves on to the next one
         moved = self.store.move_messages(box.id, ids, dest)
@@ -762,8 +782,9 @@ class MainWindow(QMainWindow):
                 self.folder_tree.select_folder(new_id)
             self.statusBar().showMessage(f"Moved {row['name']} to {target}", 4000)
 
-        self._run(job, done, on_failed=lambda msg: self._folder_failed(
-            "Move folder", f"Couldn't move \"{row['name']}\".\n\n{msg}"))
+        self._run(job, done, activity="Moving folder…",
+                  on_failed=lambda msg: self._folder_failed(
+                      "Move folder", f"Couldn't move \"{row['name']}\".\n\n{msg}"))
 
     # -- read / flag ------------------------------------------------------
     def _mark_viewed_read(self):
@@ -814,10 +835,12 @@ class MainWindow(QMainWindow):
                 except Exception as exc:  # offline: stays queued for the next sync
                     log.warning("sending changes for %s failed: %s", box.display_name, exc)
 
-        self._run(job, self._changes_sent, on_failed=self._sync_failed)
+        self._run(job, self._changes_sent, on_failed=self._sync_failed,
+                  activity="Sending changes…")
 
     def _changes_sent(self, _):
         self._syncing = False
+        self.status.refresh()  # fewer changes waiting
         # A change the server refused was undone in the store; show that.
         self._refresh_messages()
         self._counts_changed()
@@ -826,6 +849,7 @@ class MainWindow(QMainWindow):
     def _counts_changed(self):
         self.folder_tree.refresh_counts()
         self._update_unread_indicators()
+        self.status.refresh()  # read/flag/move changes waiting to be sent
 
     def _own_inboxes(self) -> list[tuple[str, str]]:
         """(mailbox display name, inbox folder id) for each signed-in account."""
