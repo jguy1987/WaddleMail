@@ -450,9 +450,10 @@ class Store:
 
     # -- messages ------------------------------------------------------
     def apply_message_changes(self, folder_id: str, items: list[dict],
-                              new: list[str] | None = None) -> tuple[int, int]:
+                              new: list[str] | None = None,
+                              changed: list[str] | None = None) -> tuple[int, int]:
         """Apply one page of delta results. Returns (upserted, removed); ids of messages
-        that weren't stored before are appended to `new`."""
+        that weren't stored before are appended to `new`, of ones that were to `changed`."""
         up = rm = 0
         with self.conn as c:
             for item in items:
@@ -463,9 +464,12 @@ class Store:
                                     (item["id"], folder_id))
                     rm += cur.rowcount
                 else:
-                    if new is not None and c.execute(
-                            "SELECT 1 FROM messages WHERE id=?", (item["id"],)).fetchone() is None:
-                        new.append(item["id"])
+                    if new is not None or changed is not None:
+                        known = c.execute("SELECT 1 FROM messages WHERE id=?",
+                                          (item["id"],)).fetchone() is not None
+                        target = changed if known else new
+                        if target is not None:
+                            target.append(item["id"])
                     c.execute(_UPSERT_MESSAGE, _row_from_item(item, folder_id))
                     up += 1
         return up, rm
@@ -532,6 +536,16 @@ class Store:
             sql += " AND m.has_attachments = 1"
         sql += " ORDER BY m.received DESC LIMIT ? OFFSET ?"
         return self.conn.execute(sql, (*args, limit, offset)).fetchall()
+
+    def set_verbs(self, verbs: dict[str, int | None]) -> None:
+        """Replied (102) / replied to all (103) / forwarded (104), or None, per message."""
+        with self.conn as c:
+            c.executemany("UPDATE messages SET last_verb=? WHERE id=?",
+                          [(v, k) for k, v in verbs.items()])
+
+    def message_ids(self, folder_id: str) -> set[str]:
+        return {r["id"] for r in self.conn.execute(
+            "SELECT id FROM messages WHERE folder_id=?", (folder_id,))}
 
     def missing_sizes(self, folder_id: str) -> set[str]:
         return {r["id"] for r in self.conn.execute(

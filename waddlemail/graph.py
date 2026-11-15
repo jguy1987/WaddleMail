@@ -57,13 +57,14 @@ EVENT_FIELDS = (
 CALENDAR_FIELDS = ("id,name,hexColor,color,isDefaultCalendar,canEdit,"
                    "allowedOnlineMeetingProviders,owner")
 # MAPI properties Graph has no first-class field for: PidTagLastVerbExecuted (102 replied,
-# 103 replied to all, 104 forwarded) and PidTagMessageSize (bytes). Only one can be expanded
-# per request: the $filter in $expand=singleValueExtendedProperties takes "id eq" and nothing
-# else (an "or" for both made Exchange refuse it). So the delta brings the reply state and
-# message_sizes() fetches sizes separately, cheaply (ids and sizes only, 500 a page).
+# 103 replied to all, 104 forwarded) and PidTagMessageSize (bytes). The delta query doesn't
+# return extended properties (it accepts $expand but sends nothing back), and the $filter in
+# $expand=singleValueExtendedProperties takes only "id eq" (one property per request). So:
+# sizes come from message_sizes(), the reply state from messages_with_verb() (a one-time
+# back-fill per folder) and message_verbs() (for messages a sync reports as changed).
 PROP_LAST_VERB = "Integer 0x1081"
 PROP_SIZE = "Integer 0x0E08"
-EXTENDED_PROPS = f"singleValueExtendedProperties($filter=id eq '{PROP_LAST_VERB}')"
+VERBS = (102, 103, 104)
 # Delta cursors remember the query they were made with: when it changes, they are made again.
 DELTA_QUERY_VERSION = "2"  # 2: reply state with a single "id eq" filter
 
@@ -105,8 +106,7 @@ class GraphClient:
         self._token = token_provider
         self._base = base.rstrip("/")
         self._root = f"/users/{quote(user, safe='@')}" if user else "/me"
-        self._expand_props = True  # turned off if the server refuses the $expand
-        self.expand_refused = ""
+
         self._s = session or requests.Session()
         self._sleep = sleep
 
@@ -437,27 +437,51 @@ class GraphClient:
         else:
             url = f"{self._root}/mailFolders/{quote(folder_id, safe='')}/messages/delta"
             params = {"$select": MESSAGE_FIELDS}
-            if self._expand_props:
-                params["$expand"] = EXTENDED_PROPS
             if since:
                 params["$filter"] = f"receivedDateTime ge {since}"
         headers = _prefer("odata.maxpageSize=100")
         while True:
-            try:
-                data = self._request(url, params=params, headers=headers)
-            except GraphError as exc:
-                if exc.status != 400 or not params or "$expand" not in params:
-                    raise
-                log.warning("reply state refused; syncing without it: %s", exc)
-                self._expand_props = False
-                self.expand_refused = str(exc)  # MainWindow says so once
-                params = {k: v for k, v in params.items() if k != "$expand"}
-                continue
+            data = self._request(url, params=params, headers=headers)
             nxt = data.get("@odata.nextLink")
             yield data.get("value", []), data.get("@odata.deltaLink")
             if not nxt:
                 return
             url, params = nxt, None
+
+    def messages_with_verb(self, folder_id: str, verb: int) -> list[str]:
+        """Ids of the folder's messages last replied (102) / replied to all (103) /
+        forwarded (104), by Graph's documented filter on an extended property's value."""
+        url = f"{self._root}/mailFolders/{quote(folder_id, safe='')}/messages"
+        params = {"$select": "id", "$top": 500,
+                  "$filter": ("singleValueExtendedProperties/any(ep: ep/id eq "
+                              f"'{PROP_LAST_VERB}' and cast(ep/value, Edm.Int32) eq {verb})")}
+        return [m["id"] for m in self._paged(url, params=params, headers=_prefer())]
+
+    def message_verbs(self, message_ids: list[str]) -> dict[str, int | None]:
+        """The reply state of particular messages ({id: 102/103/104 or None}), 20 per $batch
+        request, each a documented single-message $expand of the property."""
+        expand = quote(f"singleValueExtendedProperties($filter=id eq '{PROP_LAST_VERB}')",
+                       safe="()$='")
+        out: dict[str, int | None] = {}
+        for i in range(0, len(message_ids), 20):
+            chunk = message_ids[i:i + 20]
+            reqs = [{"id": str(n), "method": "GET", "headers": _prefer(),  # (our ids are
+                     "url": f"{self._root}/messages/{quote(mid, safe='')}?$select=id&"  # immutable)
+                            f"$expand={expand}"}
+                    for n, mid in enumerate(chunk)]
+            data = self._request("/$batch", method="POST", json={"requests": reqs},
+                                 headers=_prefer())
+            for r in data.get("responses", []):
+                if r.get("status") != 200 or not isinstance(r.get("body"), dict):
+                    continue  # gone, or not ours to read: leave it as it is
+                mid = chunk[int(r["id"])]
+                out[mid] = None
+                for prop in r["body"].get("singleValueExtendedProperties") or []:
+                    try:
+                        out[mid] = int(prop.get("value"))
+                    except (TypeError, ValueError):
+                        pass
+        return out
 
     def message_sizes(self, folder_id: str) -> Iterator[dict[str, int]]:
         """{message id: size in bytes} for a folder, a page (up to 500) at a time, newest
@@ -483,8 +507,6 @@ class GraphClient:
         params = {"$select": MESSAGE_FIELDS, "$top": 100,
                   "$filter": f"receivedDateTime lt {before}",
                   "$orderby": "receivedDateTime desc"}
-        if self._expand_props:
-            params["$expand"] = EXTENDED_PROPS
         url = f"{self._root}/mailFolders/{quote(folder_id, safe='')}/messages"
         out: list[dict] = []
         for item in self._paged(url, params=params, headers=_prefer()):

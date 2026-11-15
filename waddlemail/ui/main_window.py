@@ -632,7 +632,7 @@ class MainWindow(QMainWindow):
         fid, res, new = payload
         for box in self.mailboxes.all():  # say it (once) if the server won't give these
             refused = [what for what, why in (("replied/forwarded marks",
-                                               box.graph.expand_refused),
+                                               box.sync.verbs_refused),
                                               ("message sizes", box.sync.sizes_refused)) if why]
             if refused and not getattr(box, "_told_refused", False):
                 box._told_refused = True

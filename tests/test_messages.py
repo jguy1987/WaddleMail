@@ -112,24 +112,6 @@ def test_refused_change_is_undone_but_server_error_is_kept(tmp_path):
     assert st.pending_changes("a") == [] and st.message_row("m1")["is_read"] == 0
 
 
-def test_delta_falls_back_when_expand_is_refused():
-    from tests.test_mailboxes import FakeResponse
-
-    class Session:
-        def __init__(self):
-            self.params = []
-
-        def request(self, method, url, params=None, **kw):
-            self.params.append(dict(params or {}))
-            if params and "$expand" in params:
-                return FakeResponse(400, {"error": "bad expand"})
-            return FakeResponse(200, {"value": [], "@odata.deltaLink": "L"})
-
-    s = Session()
-    pages = list(GraphClient(lambda: "t", session=s).messages_delta("F"))
-    assert pages == [([], "L")]
-    assert "$expand" in s.params[0] and "$expand" not in s.params[1]
-
 
 def test_one_stuck_change_does_not_block_the_rest(tmp_path):
     st = make_store(tmp_path, msg("m1"), msg("m2"))
@@ -240,20 +222,6 @@ def test_list_has_no_size_cap(tmp_path):
     assert len(st.list_messages("F")) == 5200
 
 
-def test_delta_asks_for_reply_state_with_a_plain_eq_filter():
-    """Exchange accepts only "id eq" in this filter; an "or" made it refuse the request."""
-    from tests.test_mailboxes import FakeResponse
-
-    class Session:
-        def request(self, method, url, params=None, **kw):
-            self.params = dict(params or {})
-            return FakeResponse(200, {"value": [], "@odata.deltaLink": "L"})
-
-    s = Session()
-    list(GraphClient(lambda: "t", session=s).messages_delta("F"))
-    assert s.params["$expand"] == ("singleValueExtendedProperties("
-                                   "$filter=id eq 'Integer 0x1081')")
-
 
 def test_cursors_are_remade_once_when_the_query_changes(tmp_path):
     st = make_store(tmp_path, msg("m1"))
@@ -318,3 +286,95 @@ def test_fill_sizes(tmp_path):
     st.apply_message_changes("F", [msg("m4")])
     refusing = SyncEngine(st, G(status=400), "a")
     assert refusing.fill_sizes("F") == 0 and refusing.sizes_refused
+
+
+
+def test_delta_doesnt_ask_for_extended_properties():
+    """Exchange ignores $expand in a delta query, so it isn't sent (see graph.py)."""
+    from tests.test_mailboxes import FakeResponse
+
+    class Session:
+        def request(self, method, url, params=None, **kw):
+            self.params = dict(params or {})
+            return FakeResponse(200, {"value": [], "@odata.deltaLink": "L"})
+
+    s = Session()
+    assert list(GraphClient(lambda: "t", session=s).messages_delta("F")) == [([], "L")]
+    assert "$expand" not in s.params
+
+
+def test_reply_mark_requests():
+    from tests.test_mailboxes import FakeResponse
+
+    class Session:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, method, url, params=None, json=None, **kw):
+            self.calls.append((method, url.split("v1.0")[1], params, json))
+            if method == "POST":  # the $batch: m1 replied, m2 nothing, m3 gone
+                return FakeResponse(200, {"responses": [
+                    {"id": "0", "status": 200, "body": {"id": "m1",
+                     "singleValueExtendedProperties": [{"id": "Integer 0x1081",
+                                                        "value": "102"}]}},
+                    {"id": "1", "status": 200, "body": {"id": "m2"}},
+                    {"id": "2", "status": 404, "body": {}}]})
+            return FakeResponse(200, {"value": [{"id": "m9"}]})
+
+    s = Session()
+    g = GraphClient(lambda: "t", session=s)
+    assert g.messages_with_verb("F", 104) == ["m9"]
+    assert s.calls[0][2]["$filter"] == ("singleValueExtendedProperties/any(ep: ep/id eq "
+                                        "'Integer 0x1081' and cast(ep/value, Edm.Int32) eq 104)")
+    assert g.message_verbs(["m1", "m2", "m3"]) == {"m1": 102, "m2": None}
+    batch = s.calls[1][3]["requests"]
+    assert len(batch) == 3 and batch[0]["url"].startswith("/me/messages/m1?$select=id&$expand=")
+    assert "ImmutableId" in batch[0]["headers"]["Prefer"]
+
+
+class VerbGraph:
+    """A server where m1 was replied to, m2 forwarded; delta pages as given."""
+
+    def __init__(self, pages):
+        self.pages, self.verbs = pages, {"m1": 102, "m2": 104}
+        self.backfills = self.lookups = 0
+
+    def messages_delta(self, folder_id, link, since):
+        yield from self.pages
+
+    def messages_with_verb(self, folder_id, verb):
+        self.backfills += 1
+        return [m for m, v in self.verbs.items() if v == verb]
+
+    def message_verbs(self, ids):
+        self.lookups += 1
+        return {m: self.verbs.get(m) for m in ids}
+
+
+def test_reply_marks_backfilled_then_kept_current(tmp_path):
+    st = make_store(tmp_path)
+    g = VerbGraph([([msg("m1"), msg("m2"), msg("m3")], "L1")])
+    eng = SyncEngine(st, g, "a")
+    eng.sync_folder("F")  # first sync: back-fill (one query per kind of mark)
+    marks = {m: st.message_row(m)["last_verb"] for m in ("m1", "m2", "m3")}
+    assert marks == {"m1": 102, "m2": 104, "m3": None} and g.backfills == 3
+    g.verbs["m3"] = 103  # replied to all in Outlook: the delta reports m3 changed
+    g.pages = [([msg("m3", subject="RE: whatever")], "L2")]
+    eng.sync_folder("F")
+    assert st.message_row("m3")["last_verb"] == 103
+    assert g.backfills == 3 and g.lookups == 1  # only the changed message was looked up
+    g.pages = [([msg("m4")], "L3")]  # new mail: nothing to look up
+    eng.sync_folder("F")
+    assert g.lookups == 1
+
+
+def test_reply_marks_never_fail_the_sync(tmp_path):
+    st = make_store(tmp_path)
+
+    class Broken(VerbGraph):
+        def messages_with_verb(self, folder_id, verb):
+            raise GraphError("filter not supported", 400)
+
+    eng = SyncEngine(st, Broken([([msg("m1")], "L1")]), "a")
+    assert eng.sync_folder("F").upserted == 1 and eng.verbs_refused
+    assert st.get_state("verbs:F") is None  # tried again next time

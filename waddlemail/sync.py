@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass, field
 
 from . import config
-from .graph import DeltaResetError, GraphClient, GraphError
+from .graph import VERBS, DeltaResetError, GraphClient, GraphError
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -20,6 +20,7 @@ class SyncResult:
     # Messages that arrived since the last sync (empty on a first or full sync, which
     # downloads everything and so can't tell what is new).
     new_ids: list[str] = field(default_factory=list)
+    changed_ids: list[str] = field(default_factory=list)  # stored messages that changed
 
 
 class SyncEngine:
@@ -30,6 +31,7 @@ class SyncEngine:
         self.mailbox_id = mailbox_id
         self.initial_days = initial_days
         self.sizes_refused = ""  # set if the server won't send message sizes
+        self.verbs_refused = ""  # ... or replied/forwarded marks
 
     def sync_folders(self) -> None:
         self.store.upsert_folders(self.mailbox_id, self.graph.list_folders())
@@ -83,7 +85,37 @@ class SyncEngine:
             self.store.delete_state(key)
             result = self._run(folder_id, key, None)
         self.store.purge_orphan_bodies()
+        self._update_verbs(folder_id, result)
         return result
+
+    # -- replied / forwarded ---------------------------------------------------------
+    def _update_verbs(self, folder_id: str, result: SyncResult) -> None:
+        """Keep the replied/forwarded marks current (the delta can't bring them): a
+        back-fill the first time (and after a full sync), then a look at whatever changed.
+        Best effort: a failure here never fails the sync."""
+        key = f"verbs:{folder_id}"
+        try:
+            if result.full or self.store.get_state(key) is None:
+                self.backfill_verbs(folder_id)
+                self.store.set_state(key, "1")
+            elif result.changed_ids:
+                self.store.set_verbs(self.graph.message_verbs(result.changed_ids))
+        except Exception as exc:  # (incl. network trouble: the next sync tries again)
+            log.warning("replied/forwarded marks not updated: %s", exc)
+            if isinstance(exc, GraphError) and exc.status == 400:
+                self.verbs_refused = str(exc)
+
+    def backfill_verbs(self, folder_id: str) -> int:
+        """Mark every stored message of the folder that was replied to or forwarded (and
+        clear marks that are no longer so). Returns how many are marked."""
+        found: dict[str, int | None] = {}
+        for verb in VERBS:
+            for mid in self.graph.messages_with_verb(folder_id, verb):
+                found[mid] = verb
+        stored = self.store.message_ids(folder_id)
+        marks = {mid: found.get(mid) for mid in stored}
+        self.store.set_verbs(marks)
+        return sum(1 for v in marks.values() if v)
 
     def _since(self) -> str:
         """The oldest receivedDateTime the current sync period covers."""
@@ -98,7 +130,7 @@ class SyncEngine:
 
     def fill_sizes(self, folder_id: str, max_pages: int = 4) -> int:
         """Fetch the sizes of the folder's messages that don't have one yet (the delta can't
-        bring them; see graph.EXTENDED_PROPS), newest first, up to `max_pages` x 500 per
+        bring them; see graph.PROP_LAST_VERB), newest first, up to `max_pages` x 500 per
         call. Costs nothing when every size is known. Returns how many were filled."""
         if self.sizes_refused:
             return 0
@@ -137,7 +169,8 @@ class SyncEngine:
         final_link: str | None = None
         for items, delta_link in self.graph.messages_delta(folder_id, link, since):
             up, rm = self.store.apply_message_changes(
-                folder_id, items, None if full else result.new_ids)
+                folder_id, items, None if full else result.new_ids,
+                None if full else result.changed_ids)
             result.upserted += up
             result.removed += rm
             if full:

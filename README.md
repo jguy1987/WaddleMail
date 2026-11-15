@@ -310,17 +310,17 @@ waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 - Immutable IDs: moving a message between folders keeps its id, so cached bodies stay valid, and a
   "removed" notice from the old folder cannot delete a message already re-homed in the new one.
 - Delta updates merge field by field, so a partial update never blanks a subject or sender.
-- Replied/forwarded state comes from the MAPI property `PidTagLastVerbExecuted` (0x1081),
-  expanded in the same delta request. The filter inside that `$expand` accepts only
-  `id eq '...'`, one property per request (an earlier `or` for the message size too made
-  Exchange refuse it, and sync silently went on without both). Sizes (`PidTagMessageSize`,
-  0x0E08) come from a second request on the folder's message list, ids and sizes only, 500 a
-  page, newest first; it runs after a sync only while some messages lack a size (a few pages
-  at a time for a first fill). If a server refuses either, sync continues and the status bar
-  says so. Delta cursors remember their
-  query, so a change to it (`DELTA_QUERY_VERSION`) makes them again once; headers are
-  downloaded again, bodies and queued changes stay. Replies and forwards sent from WaddleMail
-  mark the original at once.
+- Replied/forwarded state is the MAPI property `PidTagLastVerbExecuted` (0x1081; 102 replied,
+  103 replied to all, 104 forwarded) and size is `PidTagMessageSize` (0x0E08). Exchange's delta
+  query accepts `$expand` for extended properties but returns nothing for it, and the filter in
+  that `$expand` takes only `id eq` (one property per request). So: the replied/forwarded marks
+  are back-filled once per folder (and after a full re-download) with Graph's documented
+  property filter, one small query per kind of mark that returns only the marked messages;
+  after that, messages a sync reports as changed (replying in Outlook changes the original)
+  are looked up with a single-message `$expand`, 20 per `$batch`. Sizes come from the folder's
+  message list, ids and sizes only, 500 a page, while any are missing. Replies and forwards
+  sent from WaddleMail mark the original at once. None of this can fail a sync; if Exchange
+  refuses it, the status bar says so.
 - A queued read/flag change wins over an older value arriving in a delta page, so the list
   never flickers back to unread while the change is on its way.
 - Search: `body_fts` is an FTS5 table keyed by the `bodies` rowid. `put_body` adds the text and
