@@ -90,8 +90,19 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
     first slot (weekdays 8:00-18:00) all attendees are free, optionally avoiding tentative.
   - Invitations show Accept / Tentative / Decline (the organizer is told) and **Join Teams**.
     Deleting a meeting you organised cancels it for the attendees.
-  - The period shown is fetched when you go to it, and refreshed every 5 minutes; recurring
-    meetings appear as their occurrences (editing one changes that occurrence).
+  - **Repeating events**: Repeat offers Outlook's choices for the event's date (daily, every
+    weekday, weekly on that day, monthly on that date or on its Nth weekday, yearly) and
+    **Custom…**: every N days / weeks (choose the weekdays) / months / years, ending never,
+    on a date or after a number of times. Opening or deleting a repeating event asks "just
+    this one, or the whole series?"; the series editor can change or stop the pattern.
+  - Times are sent in your own time zone (by its Windows name, e.g. Central Standard Time),
+    so a weekly 9:00 meeting stays at 9:00 across daylight saving changes.
+  - **Reminders**: a window that stays on top lists what is due (soonest first, "in 10
+    min"), with Join Teams, Open item, Dismiss, Dismiss all and Snooze (5 minutes to a day),
+    plus a desktop notification (alarm sound, stays until dealt with). Dismiss and snooze are
+    sent to Exchange too, so Outlook elsewhere agrees. The coming week is kept cached, so
+    reminders also work offline. Preferences > General can turn them off.
+  - The period shown is fetched when you go to it, and refreshed every 5 minutes.
 - **Contacts** (the rail, or Ctrl+3; Ctrl+1 is Mail):
   - Sources: all personal contacts and each contact folder, **contact groups**, the
     **organization directory**, and **recent recipients** (people you send to, from Sent
@@ -150,7 +161,10 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
 - Menus: **File** (New > Mail message / Event, Send/Receive F5, Quit), **Edit** (Cut, Copy, Paste,
   Select all, Preferences), **View** (Load remote images for this session, folder pane), **Help**
   (About, shows the version).
-- Toolbar: **New** (button + dropdown for Mail message / Event), **Send/Receive**, **Cut / Copy /
+- Toolbar: **New** follows the page you're on (New Mail, New Event, New Contact); its arrow
+  offers Mail message (Ctrl+N), Event (Ctrl+Shift+E), Contact (Ctrl+Shift+C) and Folder from
+  anywhere.
+  The toolbar also has **Send/Receive**, **Cut / Copy /
   Paste**, and Reply / Reply all / Forward / Delete (disabled placeholders until implemented).
   Toolbar and menus share the same actions. Cut/Copy/Paste act on whichever field has focus (the
   reader is read-only, so Copy/Select all work there and Cut/Paste enable once compose is a window
@@ -255,6 +269,8 @@ waddlemail/ui/tray.py      system tray icon
 waddlemail/ui/status_indicator.py  connection dot and activity in the status bar
 waddlemail/ui/calendar_view.py  the Calendar page: day/week/month views and event details
 waddlemail/ui/event_editor.py  the event/meeting editor and the scheduling assistant
+waddlemail/ui/recurrence_dialog.py  custom repeat pattern
+waddlemail/ui/reminders.py  reminders window and the service that raises it
 waddlemail/ui/contacts_view.py  the Contacts page
 waddlemail/ui/contact_dialogs.py  contact editor (with photo), contact group editor, avatars
 waddlemail/ui/recipients.py  To/Cc field with name completion
@@ -287,8 +303,8 @@ waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 1. Real sending (`Mail.Send`) through an outbox, and deleting messages through the change
    queue (`pending` table) that read/flag/move already use.
 2. Removing a contact's photo (Graph has no call for it); photos in lists and autocomplete.
-3. Calendar: recurring events (create/edit a series), reminders as notifications, shared
-   calendars of other people, room booking.
+3. Calendar: other people's shared calendars, room booking; reminders dismissed on another
+   device aren't noticed here until they'd fire (Graph's reminderView could tell).
 4. Attachments and `cid:` images; search across all folders; optional background download of
    bodies so local search covers everything offline.
 5. Publisher verification of the app registration before sharing with other organizations.

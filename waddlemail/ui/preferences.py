@@ -70,7 +70,9 @@ class PreferencesDialog(QDialog):
         self.close_to_tray.setEnabled(self.tray.isChecked())
         self.splash = QCheckBox("Show the splash screen while starting")
         self.splash.setChecked(settings.get("view/splash"))
-        for box in (self.notify, self.tray, self.close_to_tray, self.splash):
+        self.reminders = QCheckBox("Show event reminders")
+        self.reminders.setChecked(settings.get("reminders/enabled"))
+        for box in (self.notify, self.reminders, self.tray, self.close_to_tray, self.splash):
             f.addRow(box)
         tabs.addTab(general, "General")
 
@@ -149,6 +151,7 @@ class PreferencesDialog(QDialog):
         s.set("tray/show", self.tray.isChecked())
         s.set("tray/close_to_tray", self.close_to_tray.isChecked())
         s.set("view/splash", self.splash.isChecked())
+        s.set("reminders/enabled", self.reminders.isChecked())
         s.set("sync/window_days", self.sync_window.days())
         s.set("list/window_days", self.list_window.days())
         s.set("read/mark_on_view", self.mark_read.isChecked())

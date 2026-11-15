@@ -33,8 +33,9 @@ class Notifier(QObject):
     """No-op base: used when nothing better is available."""
     activated = Signal(str)  # the key of the notification that was clicked
 
-    def notify(self, summary: str, body: str, key: str, origin: str = "") -> None:
-        pass
+    def notify(self, summary: str, body: str, key: str, origin: str = "",
+               kind: str = "mail") -> None:
+        """`kind`: "mail" (new mail) or "reminder" (an event's reminder)."""
 
     def set_badge(self, count: int) -> None:
         pass
@@ -67,12 +68,18 @@ class FreedesktopNotifier(Notifier):
         self._keys: dict[int, str] = {}  # notification id -> key
         threading.Thread(target=self._listen, name="notifications", daemon=True).start()
 
-    def notify(self, summary: str, body: str, key: str, origin: str = "") -> None:
+    def notify(self, summary: str, body: str, key: str, origin: str = "",
+               kind: str = "mail") -> None:
         if "body-markup" in self.caps:  # then &, < and > must be escaped
             body = html.escape(body, quote=False)
-        hints = {"desktop-entry": ("s", APP_ID), "category": ("s", "email.arrived")}
+        hints = {"desktop-entry": ("s", APP_ID)}
+        if kind == "reminder":  # stays until dealt with, like Outlook's reminders
+            hints["urgency"] = ("y", 2)
+        else:
+            hints["category"] = ("s", "email.arrived")
         if "sound" in self.caps:
-            hints["sound-name"] = ("s", "message-new-email")
+            hints["sound-name"] = ("s", "alarm-clock-elapsed" if kind == "reminder"
+                                   else "message-new-email")
         if origin and "x-kde-origin-name" in self.caps:
             hints["x-kde-origin-name"] = ("s", origin)
         actions = ["default", "Open"] if "actions" in self.caps else []
@@ -131,7 +138,8 @@ class TrayNotifier(Notifier):
         self._last = ""
         tray.messageClicked.connect(lambda: self.activated.emit(self._last))
 
-    def notify(self, summary: str, body: str, key: str, origin: str = "") -> None:
+    def notify(self, summary: str, body: str, key: str, origin: str = "",
+               kind: str = "mail") -> None:
         if self._tray.isVisible():
             self._last = key
             self._tray.showMessage(summary, body, QIcon(str(icon_png(64))), 10_000)

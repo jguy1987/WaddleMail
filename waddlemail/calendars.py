@@ -116,6 +116,86 @@ def event_row(item: dict, account_id: str, calendar_id: str) -> dict:
     }
 
 
+# -- recurrence ------------------------------------------------------------------------------
+WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+ORDINALS = ["first", "second", "third", "fourth", "last"]
+MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August",
+          "September", "October", "November", "December"]
+
+
+def ordinal_of(day: dt.date) -> str:
+    """Which of its weekday in the month a date is: first..fourth, or last."""
+    n = (day.day - 1) // 7
+    if (day + dt.timedelta(days=7)).month != day.month:
+        return "last"
+    return ORDINALS[n]
+
+
+def presets(day: dt.date) -> list[tuple[str, dict]]:
+    """Outlook's "Repeat" choices for an event on `day`: (label, Graph pattern)."""
+    wd = WEEKDAYS[day.weekday()]
+    nth = ordinal_of(day)
+    return [
+        ("Daily", {"type": "daily", "interval": 1}),
+        ("Every weekday", {"type": "weekly", "interval": 1, "daysOfWeek": WEEKDAYS[:5]}),
+        (f"Weekly on {wd.capitalize()}", {"type": "weekly", "interval": 1, "daysOfWeek": [wd]}),
+        (f"Monthly on day {day.day}", {"type": "absoluteMonthly", "interval": 1,
+                                        "dayOfMonth": day.day}),
+        (f"Monthly on the {nth} {wd.capitalize()}",
+         {"type": "relativeMonthly", "interval": 1, "daysOfWeek": [wd], "index": nth}),
+        (f"Yearly on {MONTHS[day.month - 1]} {day.day}",
+         {"type": "absoluteYearly", "interval": 1, "dayOfMonth": day.day, "month": day.month}),
+    ]
+
+
+def make_recurrence(pattern: dict, start: dt.date, end_date: dt.date | None = None,
+                    count: int | None = None, tz: str = "UTC") -> dict:
+    """A Graph recurrence: the pattern, starting on `start`, ending on a date, after `count`
+    occurrences, or never."""
+    pattern = {"firstDayOfWeek": "sunday", **pattern}
+    if end_date:
+        rng = {"type": "endDate", "startDate": start.isoformat(), "endDate": end_date.isoformat()}
+    elif count:
+        rng = {"type": "numbered", "startDate": start.isoformat(), "numberOfOccurrences": count}
+    else:
+        rng = {"type": "noEnd", "startDate": start.isoformat()}
+    rng["recurrenceTimeZone"] = tz
+    return {"pattern": pattern, "range": rng}
+
+
+def describe_recurrence(rec: dict | None) -> str:
+    """"Every 2 weeks on Monday and Wednesday, until 31 Dec 2026" and the like."""
+    if not rec:
+        return "Does not repeat"
+    p, r = rec.get("pattern") or {}, rec.get("range") or {}
+    n = p.get("interval") or 1
+    kind = p.get("type")
+    days = [d.capitalize() for d in p.get("daysOfWeek") or []]
+    day_list = (", ".join(days[:-1]) + " and " + days[-1]) if len(days) > 1 else         (days[0] if days else "")
+    every = lambda unit: f"Every {unit}" if n == 1 else f"Every {n} {unit}s"  # noqa: E731
+    if kind == "daily":
+        text = every("day")
+    elif kind == "weekly":
+        text = ("Every weekday" if n == 1 and [d.lower() for d in days] == WEEKDAYS[:5]
+                else f"{every('week')} on {day_list}")
+    elif kind == "absoluteMonthly":
+        text = f"{every('month')} on day {p.get('dayOfMonth')}"
+    elif kind == "relativeMonthly":
+        text = f"{every('month')} on the {p.get('index', 'first')} {day_list}"
+    elif kind == "absoluteYearly":
+        text = f"{every('year')} on {MONTHS[(p.get('month') or 1) - 1]} {p.get('dayOfMonth')}"
+    elif kind == "relativeYearly":
+        text = (f"{every('year')} on the {p.get('index', 'first')} {day_list} of "
+                f"{MONTHS[(p.get('month') or 1) - 1]}")
+    else:
+        text = "Repeats"
+    if r.get("type") == "endDate" and r.get("endDate"):
+        text += f", until {r['endDate'][:10]}"
+    elif r.get("type") == "numbered":
+        text += f", {r.get('numberOfOccurrences')} times"
+    return text
+
+
 @dataclass
 class EventDraft:
     """What the editor produces; fields() turns it into a Graph event."""
@@ -132,16 +212,24 @@ class EventDraft:
     reminder: int | None = 15
     body: str | None = None       # None: leave the body as it is
     private: bool = False
+    recurrence: dict | None = None  # make_recurrence(...): a series
+    stop_repeating: bool = False    # editing a series and choosing "Does not repeat"
+    tz: str = "UTC"                 # your time zone (Windows name): DST-proof repeating times
 
     def fields(self) -> dict:
         if self.all_day:
             first = self.start.date()
             last = max(self.end.date(), first + dt.timedelta(days=1))
-            when = {"start": {"dateTime": f"{first.isoformat()}T00:00:00", "timeZone": "UTC"},
-                    "end": {"dateTime": f"{last.isoformat()}T00:00:00", "timeZone": "UTC"}}
-        else:
+            when = {"start": {"dateTime": f"{first.isoformat()}T00:00:00", "timeZone": self.tz},
+                    "end": {"dateTime": f"{last.isoformat()}T00:00:00", "timeZone": self.tz}}
+        elif self.tz == "UTC":
             when = {"start": {"dateTime": utc_iso(self.start).rstrip("Z"), "timeZone": "UTC"},
                     "end": {"dateTime": utc_iso(self.end).rstrip("Z"), "timeZone": "UTC"}}
+        else:  # wall-clock time in your zone (start/end are local times)
+            fmt = "%Y-%m-%dT%H:%M:%S"
+            when = {"start": {"dateTime": self.start.astimezone().strftime(fmt),
+                              "timeZone": self.tz},
+                    "end": {"dateTime": self.end.astimezone().strftime(fmt), "timeZone": self.tz}}
         out = {
             "subject": self.subject, **when, "isAllDay": self.all_day,
             "location": {"displayName": self.location},
@@ -160,6 +248,13 @@ class EventDraft:
             out["onlineMeetingProvider"] = "teamsForBusiness"
         if self.body is not None:
             out["body"] = {"contentType": "text", "content": self.body}
+        if self.recurrence:
+            rec = json.loads(json.dumps(self.recurrence))  # (a copy)
+            rec["range"]["startDate"] = self.start.date().isoformat()
+            rec["range"]["recurrenceTimeZone"] = self.tz
+            out["recurrence"] = rec
+        elif self.stop_repeating:
+            out["recurrence"] = None
         return out
 
 
@@ -193,6 +288,30 @@ class CalendarSync:
             self.store.replace_events(cal["id"], start_utc, end_utc, d1, d2, rows)
             total += len(rows)
         return total
+
+
+# -- reminders ------------------------------------------------------------------------------
+def reminder_time(row) -> dt.datetime | None:
+    """When an event's reminder goes off (local), or None if it has none."""
+    if row["reminder"] is None or row["cancelled"] or row["response"] == "declined":
+        return None
+    return event_span(row)[0] - dt.timedelta(minutes=row["reminder"])
+
+
+def due_reminders(rows, now: dt.datetime, state: dict) -> list:
+    """Events whose reminder has gone off and that haven't ended, minus the dismissed and
+    the snoozed (state: {(event id, start): (dismissed, snoozed until ISO or None)}),
+    soonest first."""
+    due = []
+    for row in rows:
+        fire = reminder_time(row)
+        if fire is None or fire > now or event_span(row)[1] <= now:
+            continue
+        dismissed, until = state.get((row["id"], row["start"]), (False, None))
+        if dismissed or (until and parse_utc(until) > now):
+            continue
+        due.append(row)
+    return sorted(due, key=lambda r: event_span(r)[0])
 
 
 # -- layout and free time ----------------------------------------------------------------

@@ -21,7 +21,8 @@ from PySide6.QtWidgets import (
 )
 
 from ..calendars import (
-    REMINDERS, SHOW_AS, EventDraft, busy_periods, event_span, find_free_time,
+    REMINDERS, SHOW_AS, EventDraft, busy_periods, describe_recurrence, event_span,
+    find_free_time, make_recurrence, presets,
 )
 from ..contacts import format_address
 from . import iconset
@@ -137,11 +138,19 @@ class EventEditor(QDialog):
 
     def __init__(self, calendars: list, categories: dict[str, str], suggestions: list,
                  schedule=None, me: str = "", row=None, start: dt.datetime | None = None,
-                 end: dt.datetime | None = None, all_day: bool = False, parent=None):
+                 end: dt.datetime | None = None, all_day: bool = False,
+                 recurrence: dict | None = None, series: bool = False, tz: str = "UTC",
+                 parent=None):
+        """`series`: editing a whole repeating series (`row` is its first occurrence, as the
+        series master has it, and `recurrence` its pattern). A `row` that is one occurrence
+        of a series (opened on its own) can't change how the series repeats."""
         super().__init__(parent)
         self.row = row
         self._schedule, self._me = schedule, me
         self._body_changed = False
+        self.series, self.tz = series, tz
+        self.occurrence = bool(row is not None and not series and row["series_id"])
+        self._custom: dict | None = None  # a custom repeat pattern
         self.setWindowTitle("Edit event" if row else "New event")
         self.resize(720, 620)
         outer = QVBoxLayout(self)
@@ -176,6 +185,16 @@ class EventEditor(QDialog):
         when.addWidget(self.all_day)
         when.addStretch()
         form.addRow("When:", when)
+        self.repeat = QComboBox()
+        self.repeat.setMinimumContentsLength(28)
+        self.repeat.activated.connect(self._repeat_chosen)
+        self._repeat_index = 0
+        self.repeat_note = QLabel()
+        self.repeat_note.setForegroundRole(QPalette.ColorRole.PlaceholderText)
+        repeat = QHBoxLayout()
+        repeat.addWidget(self.repeat)
+        repeat.addWidget(self.repeat_note, 1)
+        form.addRow("Repeat:", repeat)
         self.teams = QCheckBox("Teams meeting (adds a join link)")
         form.addRow("", self.teams)
 
@@ -293,6 +312,12 @@ class EventEditor(QDialog):
             self.show_as.setCurrentIndex(self.show_as.findData("free" if all_day else "busy"))
             self.reminder.setCurrentIndex(self.reminder.findData(15))
         self._last_start = self._start()
+        self._fill_repeat()
+        if recurrence:
+            self._load_recurrence(recurrence)
+        if self.occurrence:
+            self.repeat.setEnabled(False)
+            self.repeat_note.setText("One occurrence of a repeating event")
         self._teams_allowed()
         self._show_categories()
         self._attendees_changed()
@@ -360,6 +385,59 @@ class EventEditor(QDialog):
         duration = self._end() - self._last_start
         start = self._start()
         self._set_times(start, start + max(duration, dt.timedelta(0)))
+        self._fill_repeat(keep=True)  # "Weekly on Monday" follows the date
+
+    # -- repeat ---------------------------------------------------------------------------
+    def _fill_repeat(self, keep: bool = False):
+        index = self.repeat.currentIndex() if keep else 0
+        self.repeat.blockSignals(True)
+        self.repeat.clear()
+        self.repeat.addItem("Does not repeat")
+        for label, _ in presets(self._start().date()):
+            self.repeat.addItem(label)
+        self.repeat.addItem(describe_recurrence(self._custom) if self._custom else "Custom…")
+        self.repeat.setCurrentIndex(max(index, 0))
+        self.repeat.blockSignals(False)
+        self._repeat_index = self.repeat.currentIndex()
+
+    def _repeat_chosen(self, index: int):
+        if index == self.repeat.count() - 1:  # Custom…: open the full pattern editor
+            from .recurrence_dialog import RecurrenceDialog
+            dlg = RecurrenceDialog(self._start().date(), self._custom or self.recurrence(),
+                                   self.tz, self)
+            if dlg.exec():
+                self._custom = dlg.recurrence()
+                self._fill_repeat()
+                self.repeat.setCurrentIndex(self.repeat.count() - 1)
+            else:
+                self.repeat.setCurrentIndex(self._repeat_index)
+        self._repeat_index = self.repeat.currentIndex()
+
+    def _load_recurrence(self, rec: dict):
+        """Show a series' pattern: as a preset if it is one (repeating forever), else as
+        custom."""
+        pattern = rec.get("pattern") or {}
+        endless = (rec.get("range") or {}).get("type") == "noEnd"
+        for i, (_, preset) in enumerate(presets(self._start().date())):
+            if endless and _same_pattern(preset, pattern):
+                self._fill_repeat()
+                self.repeat.setCurrentIndex(i + 1)
+                self._repeat_index = i + 1
+                return
+        self._custom = rec
+        self._fill_repeat()
+        self.repeat.setCurrentIndex(self.repeat.count() - 1)
+        self._repeat_index = self.repeat.count() - 1
+
+    def recurrence(self) -> dict | None:
+        """The chosen repeat pattern (a Graph recurrence), or None."""
+        index = self.repeat.currentIndex()
+        if index <= 0:
+            return None
+        if index == self.repeat.count() - 1:
+            return self._custom
+        pattern = presets(self._start().date())[index - 1][1]
+        return make_recurrence(pattern, self._start().date(), tz=self.tz)
 
     def _all_day_toggled(self, on: bool):
         self.start_time.setEnabled(not on)
@@ -398,8 +476,12 @@ class EventEditor(QDialog):
         req, opt = self.attendees()
         meeting = bool(req or opt)
         self.save_button.setText("Send" if meeting else "Save")
-        self.setWindowTitle(("Edit " if self.row else "New ") + ("meeting" if meeting
-                                                                 else "event"))
+        what = "meeting" if meeting else "event"
+        if self.series:
+            what += " series"
+        elif self.occurrence:
+            what = "occurrence"
+        self.setWindowTitle(("Edit " if self.row else "New ") + what)
         self._sched_timer.start()
 
     def _load_schedule(self):
@@ -485,10 +567,22 @@ class EventEditor(QDialog):
             show_as=self.show_as.currentData(), categories=tuple(self.categories()),
             reminder=self.reminder.currentData(),
             body=self.notes.toPlainText() if (self._body_changed or self.row is None) else None,
-            private=self.private.isChecked())
+            private=self.private.isChecked(),
+            recurrence=None if self.occurrence else self.recurrence(),
+            stop_repeating=self.series and self.recurrence() is None, tz=self.tz)
 
 
 def _next_half_hour() -> dt.datetime:
     now = dt.datetime.now().astimezone().replace(second=0, microsecond=0)
     return now + dt.timedelta(minutes=30 - now.minute % 30)
 
+
+def _same_pattern(a: dict, b: dict) -> bool:
+    """Equal repeat patterns, ignoring fields that don't apply (Graph fills them with 0s)."""
+    def norm(p: dict) -> tuple:
+        relative = p.get("type", "").startswith("relative")
+        return (p.get("type"), p.get("interval") or 1,
+                sorted(d.lower() for d in p.get("daysOfWeek") or []),
+                None if relative else (p.get("dayOfMonth") or None),
+                p.get("month") or None, (p.get("index") or "first") if relative else None)
+    return norm(a) == norm(b)

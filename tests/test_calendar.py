@@ -138,3 +138,82 @@ def test_schedule_and_respond_requests():
     assert body["startTime"] == {"dateTime": "2026-11-16T08:00:00", "timeZone": "UTC"}
     assert s.calls[1] == ("POST", "/me/events/E/tentativelyAccept",
                           {"comment": "maybe", "sendResponse": True})
+
+
+def test_repeat_presets_and_wording():
+    from waddlemail.calendars import describe_recurrence, make_recurrence, ordinal_of, presets
+    monday = dt.date(2026, 11, 30)  # the last Monday of November
+    assert ordinal_of(monday) == "last" and ordinal_of(dt.date(2026, 11, 16)) == "third"
+    labels = [label for label, _ in presets(monday)]
+    assert labels == ["Daily", "Every weekday", "Weekly on Monday", "Monthly on day 30",
+                      "Monthly on the last Monday", "Yearly on November 30"]
+    weekly = presets(monday)[2][1]
+    rec = make_recurrence(weekly, monday, count=10, tz="Central Standard Time")
+    assert rec["range"] == {"type": "numbered", "startDate": "2026-11-30",
+                            "numberOfOccurrences": 10,
+                            "recurrenceTimeZone": "Central Standard Time"}
+    assert describe_recurrence(rec) == "Every week on Monday, 10 times"
+    two = make_recurrence({"type": "weekly", "interval": 2, "daysOfWeek": ["monday",
+                                                                           "wednesday"]},
+                          monday, end_date=dt.date(2026, 12, 31))
+    assert describe_recurrence(two) == "Every 2 weeks on Monday and Wednesday, until 2026-12-31"
+    assert describe_recurrence(make_recurrence(presets(monday)[1][1], monday)) == \
+        "Every weekday"
+    assert describe_recurrence(None) == "Does not repeat"
+
+
+def test_drafts_in_a_time_zone_and_series():
+    from waddlemail.calendars import make_recurrence, presets
+    start = local(2026, 11, 16, 9)
+    rec = make_recurrence(presets(start.date())[2][1], dt.date(2000, 1, 1))
+    f = EventDraft("Standup", start, start + dt.timedelta(minutes=15), recurrence=rec,
+                   tz="Central Standard Time").fields()
+    assert f["start"] == {"dateTime": "2026-11-16T09:00:00", "timeZone": "Central Standard Time"}
+    assert f["recurrence"]["range"]["startDate"] == "2026-11-16"  # follows the event
+    assert f["recurrence"]["range"]["recurrenceTimeZone"] == "Central Standard Time"
+    stop = EventDraft("x", start, start, stop_repeating=True).fields()
+    assert "recurrence" in stop and stop["recurrence"] is None
+
+
+def test_due_reminders(tmp_path):
+    from waddlemail.calendars import due_reminders
+    now = local(2026, 11, 16, 8, 50)
+
+    def ev(eid, h, reminder=15, **kw):
+        return {"id": eid, "start": utc_iso(local(2026, 11, 16, h)),
+                "end": utc_iso(local(2026, 11, 16, h + 1)), "all_day": 0,
+                "reminder": reminder, "cancelled": 0, "response": "organizer", **kw}
+
+    rows = [ev("soon", 9), ev("later", 11), ev("none", 9, reminder=None),
+            ev("declined", 9, response="declined"), ev("running", 8), ev("done", 7)]
+    assert [r["id"] for r in due_reminders(rows, now, {})] == ["running", "soon"]
+    soon = rows[0]
+    later = utc_iso(now + dt.timedelta(minutes=5))
+    assert [r["id"] for r in due_reminders(rows, now, {("soon", soon["start"]):
+                                                       (False, later)})] == ["running"]
+    assert [r["id"] for r in due_reminders(rows, now, {("soon", soon["start"]):
+                                                       (True, None)})] == ["running"]
+    st = Store(tmp_path / "m.db")
+    st.set_reminder_state("soon", soon["start"], snoozed_until=later)
+    assert st.reminder_states() == {("soon", soon["start"]): (False, later)}
+
+
+def test_series_and_reminder_requests():
+    class S:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, method, url, params=None, headers=None, json=None, **kw):
+            self.calls.append((method, url.split("v1.0")[1], json, params))
+            return FakeResponse(200, {"id": "M", "recurrence": {}})
+
+    s = S()
+    g = GraphClient(lambda: "t", session=s)
+    g.get_event("M")
+    g.dismiss_reminder("E")
+    g.snooze_reminder("E", "2026-11-16T15:05:00Z")
+    assert "recurrence" in s.calls[0][3]["$select"]
+    assert [c[:2] for c in s.calls[1:]] == [("POST", "/me/events/E/dismissReminder"),
+                                            ("POST", "/me/events/E/snoozeReminder")]
+    assert s.calls[2][2] == {"newReminderTime": {"dateTime": "2026-11-16T15:05:00",
+                                                 "timeZone": "UTC"}}

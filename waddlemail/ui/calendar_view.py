@@ -132,7 +132,7 @@ class TimeGrid(QWidget):
     eventActivated = Signal(str)
     slotActivated = Signal(object, object)  # local start, end
 
-    HOUR_H, GUTTER = 48, 56
+    HOUR_H, GUTTER = 48, 64
 
     def __init__(self):
         super().__init__()

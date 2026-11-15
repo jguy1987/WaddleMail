@@ -39,8 +39,9 @@ class RecordingNotifier(Notifier):
         super().__init__()
         self.sent, self.badges = [], []
 
-    def notify(self, summary, body, key, origin=""):
+    def notify(self, summary, body, key, origin="", kind="mail"):
         self.sent.append((summary, body, key, origin))
+        self.kinds = getattr(self, "kinds", []) + [kind]
 
     def set_badge(self, count):
         self.badges.append(count)
@@ -341,6 +342,9 @@ def checks():
     contacts_checks()
     contact_edit_checks()
     calendar_checks()
+    recurrence_checks()
+    reminder_checks()
+    new_button_checks()
 
     w.close()
     saved = Settings(str(tmp / "settings.ini"))
@@ -825,6 +829,23 @@ class FakeCalendarServer:
                        "onlineMeeting": {"joinUrl": "https://teams.microsoft.com/l/meetup-join/x"}},
         }
         self.saved, self.responses, self.schedules = [], [], []
+        self.reminder_calls, self.deleted = [], []
+        # a weekly series on Thursdays at 16:00, two occurrences in view
+        self.master = {"id": "series1", "subject": "Weekly 1:1", "isOrganizer": True,
+                       "start": {"dateTime": at(4, 16)}, "end": {"dateTime": at(4, 17)},
+                       "showAs": "busy", "type": "seriesMaster",
+                       "recurrence": {"pattern": {"type": "weekly", "interval": 1,
+                                                  "daysOfWeek": [
+                                                      (self.monday + dt.timedelta(days=4))
+                                                      .strftime("%A").lower()],
+                                                  "firstDayOfWeek": "sunday"},
+                                      "range": {"type": "noEnd",
+                                                "startDate": (self.monday + dt.timedelta(
+                                                    days=4)).isoformat()}}}
+        for k, d in (("occ1", 4), ("occ2", 11)):
+            self.events[k] = {"id": k, "subject": "Weekly 1:1", "isOrganizer": True,
+                              "start": {"dateTime": at(d, 16)}, "end": {"dateTime": at(d, 17)},
+                              "showAs": "busy", "type": "occurrence", "seriesMasterId": "series1"}
 
     def install(self):
         G = graph.GraphClient
@@ -839,10 +860,13 @@ class FakeCalendarServer:
             for e in self.events.values()
             if e["start"]["dateTime"] < end and e["end"]["dateTime"] > start]
         G.save_event = lambda c, fields, eid=None, cid=None: self._save(fields, eid)
-        G.delete_event = lambda c, eid: self.events.pop(eid)
+        G.delete_event = lambda c, eid: (self.deleted.append(eid), self.events.pop(eid, None))
         G.respond_event = lambda c, eid, resp, comment="": self.responses.append((eid, resp))
         G.event_body = lambda c, eid: ("text", "Full agenda")
         G.schedule = lambda c, addresses, start, end, interval=30: self._schedule(addresses)
+        G.get_event = lambda c, eid: dict(self.master, id=eid)
+        G.dismiss_reminder = lambda c, eid: self.reminder_calls.append(("dismiss", eid))
+        G.snooze_reminder = lambda c, eid, until: self.reminder_calls.append(("snooze", eid))
 
     def _save(self, fields, eid):
         self.saved.append(fields)
@@ -869,7 +893,8 @@ def utc(t):
 def calendar_checks():
     from PySide6.QtCore import QPointF
     from waddlemail.ui.calendar_view import MONTH, DAY, WEEK
-    server = FakeCalendarServer()
+    global _calendar_server
+    server = _calendar_server = FakeCalendarServer()
     server.install()
     page = w.calendar_page
     w.setFocus()
@@ -880,7 +905,8 @@ def calendar_checks():
     wait(600)
     check(w.pages.currentWidget() is page and page.cal_list.count() == 1,
           "Ctrl+2 opens the Calendar with its calendars")
-    check(sorted(e.subject for e in page.grid.events) == ["Design review", "Standup"],
+    check(sorted(e.subject for e in page.grid.events) == ["Design review", "Standup",
+                                                           "Weekly 1:1"],
           "the week's events are shown")
     standup = next(e for e in page.grid.events if e.id == "standup")
     check(standup.color.name() == "#4f8cff", "an event takes its category's colour")
@@ -964,6 +990,122 @@ def calendar_checks():
     wait(400)
     check("standup" not in server.events and st.event_row("standup") is None,
           "delete (a meeting you organised: cancel)")
+    w.show_page("mail")
+
+
+def recurrence_checks():
+    from waddlemail.calendars import event_row as cal_row
+    from waddlemail.ui.recurrence_dialog import RecurrenceDialog
+    server = _calendar_server
+    w.show_page("calendar")
+    nine = dt.datetime.combine(server.monday + dt.timedelta(days=14), dt.time(9)).astimezone()
+    dlg = w._event_editor(start=nine, end=nine + dt.timedelta(hours=1))
+    dlg.title.setText("Team sync")
+    labels = [dlg.repeat.itemText(i) for i in range(dlg.repeat.count())]
+    weekday = nine.strftime("%A")
+    check(labels[0] == "Does not repeat" and f"Weekly on {weekday}" in labels
+          and labels[-1] == "Custom…", "Repeat offers Outlook's choices for the date")
+    dlg.repeat.setCurrentIndex(labels.index(f"Weekly on {weekday}"))
+    asked_before = len(server.saved)
+    w._save_event(dlg, None)
+    wait(500)
+    f = server.saved[-1] if len(server.saved) > asked_before else {}
+    rec = f.get("recurrence") or {}
+    check(rec.get("pattern", {}).get("daysOfWeek") == [weekday.lower()]
+          and rec["range"]["startDate"] == nine.date().isoformat()
+          and f["start"]["timeZone"] == rec["range"]["recurrenceTimeZone"] != "",
+          "a weekly series is sent with its pattern, in your time zone")
+
+    rd = RecurrenceDialog(nine.date())
+    rd.kind.setCurrentIndex(2)          # monthly
+    rd.m_on_nth.setChecked(True)
+    rd.interval.setValue(2)
+    rd.end_after.setChecked(True)
+    rd.count.setValue(6)
+    rec = rd.recurrence()
+    check(rec["pattern"]["type"] == "relativeMonthly" and rec["pattern"]["interval"] == 2
+          and rec["range"]["numberOfOccurrences"] == 6
+          and rd.summary.text().startswith("Every 2 months on the"),
+          "custom repeat: every 2 months on the Nth weekday, 6 times")
+
+    master = cal_row(dict(server.master, start={"dateTime": server.master["start"]["dateTime"],
+                                                "timeZone": "UTC"},
+                          end={"dateTime": server.master["end"]["dateTime"], "timeZone": "UTC"}),
+                     "a", "cal")
+    dlg = w._event_editor(row=master, recurrence=server.master["recurrence"], series=True)
+    check(dlg.repeat.currentText().startswith("Weekly on") and dlg.windowTitle() ==
+          "Edit event series", "editing a series shows its pattern")
+    dlg.repeat.setCurrentIndex(0)
+    f = dlg.draft().fields()
+    check("recurrence" in f and f["recurrence"] is None, "...and can stop it repeating")
+    w.refresh_calendar()
+    wait(500)
+    occ = st.event_row("occ1")
+    dlg = w._event_editor(row=occ)
+    check(occ is not None and not dlg.repeat.isEnabled() and dlg.windowTitle() ==
+          "Edit occurrence", "one occurrence on its own can't change the pattern")
+    w._series_choice = lambda row, verb: "series"
+    w.delete_event("occ1")
+    wait(500)
+    check(server.deleted[-1] == "series1", "deleting the whole series deletes its master")
+    del w._series_choice
+
+
+def reminder_checks():
+    server = _calendar_server
+    soon = dt.datetime.now().astimezone() + dt.timedelta(minutes=10)
+    for k, minutes in (("rem1", 10), ("rem2", 12)):
+        t = dt.datetime.now().astimezone() + dt.timedelta(minutes=minutes)
+        server.events[k] = {"id": k, "subject": f"Call {k}", "isOrganizer": True,
+                            "showAs": "busy", "isReminderOn": True,
+                            "reminderMinutesBeforeStart": 15,
+                            "start": {"dateTime": utc(t)},
+                            "end": {"dateTime": utc(t + dt.timedelta(minutes=30))}}
+    w.notifier.sent.clear()
+    w.refresh_calendar()
+    wait(600)
+    rw = w.reminder_window
+    check(rw.isVisible() and rw.list.topLevelItemCount() == 2
+          and "in 10 min" in rw.list.topLevelItem(0).text(1),
+          "reminders window: what is due, soonest first")
+    check(getattr(w.notifier, "kinds", [])[-2:] == ["reminder", "reminder"],
+          "a notification per reminder")
+    first = rw.list.topLevelItem(0)
+    rw.list.clearSelection()
+    first.setSelected(True)
+    rw.snooze_for.setCurrentIndex(0)  # 5 minutes
+    rw.snooze.click()
+    wait(300)
+    check(rw.list.topLevelItemCount() == 1 and ("snooze", "rem1") in server.reminder_calls,
+          "snooze: gone for now, and Exchange is told")
+    rw.dismissRequested.emit(rw.all_keys())
+    wait(300)
+    check(not rw.isVisible() and ("dismiss", "rem2") in server.reminder_calls,
+          "dismiss all: the window goes away")
+    w.reminders.check(soon + dt.timedelta(minutes=1))  # 6 minutes on: rem1's snooze is over
+    check(rw.isVisible() and rw.list.topLevelItemCount() == 1, "a snoozed reminder comes back")
+    rw.dismissRequested.emit(rw.all_keys())
+    w.show_page("mail")
+
+
+def new_button_checks():
+    calls = []
+    real = {name: getattr(w, name) for name in ("new_mail", "new_event", "new_contact")}
+    for name in real:
+        setattr(w, name, lambda name=name: calls.append(name))
+    seen = []
+    for page in ("mail", "calendar", "contacts"):
+        w.show_page(page)
+        w.new_btn.click()
+        seen.append(w.new_btn.text())
+    check(seen == ["New Mail", "New Event", "New Contact"]
+          and calls == ["new_mail", "new_event", "new_contact"],
+          "the New button makes what belongs to the page you're on")
+    menu = [a.text() for a in w.new_btn.menu().actions() if not a.isSeparator()]
+    check(menu[:3] == ["&Mail message", "&Event", "&Contact…"],
+          "its arrow still offers mail, event and contact from anywhere")
+    for name, fn in real.items():
+        setattr(w, name, fn)
     w.show_page("mail")
 
 

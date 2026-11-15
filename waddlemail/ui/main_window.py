@@ -6,8 +6,8 @@ import json
 import logging
 import sys
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction, QActionGroup, QKeySequence
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QKeySequence
 from PySide6.QtWebEngineCore import QWebEnginePage
 from PySide6.QtWidgets import (
     QApplication, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QSplitter,
@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 
 from .. import __version__, desktop, graph
 from ..calendars import event_row as calendar_event_row
+from ..calendars import event_span
 from ..contacts import personal_row, removal_payload, suggestions
 from ..graph import NO_SUBFOLDERS
 from ..mailboxes import MailboxManager
@@ -28,6 +29,7 @@ from .contacts_view import ContactsView
 from .calendar_view import CalendarPage
 from .dialogs import ComposeDialog, SharedMailboxDialog
 from .event_editor import EventEditor
+from .reminders import ReminderService, ReminderWindow
 from .folder_pane import FolderPane
 from .folder_picker import TOP, FolderPicker
 from .message_list import OUTGOING, FilterBar, MessageListView, OlderMailBar
@@ -161,6 +163,12 @@ class MainWindow(QMainWindow):
         self._calendar_fetch_soon.setInterval(300)
         self._calendar_fetch_soon.timeout.connect(self.refresh_calendar)
         self._calendar_busy = False
+        self.reminder_window = ReminderWindow(self)
+        rw = self.reminder_window
+        rw.dismissRequested.connect(self.dismiss_reminders)
+        rw.snoozeRequested.connect(self.snooze_reminders)
+        rw.openRequested.connect(self._open_event)
+        rw.joinRequested.connect(lambda url: QDesktopServices.openUrl(QUrl(url)))
         self.pages = QStackedWidget()
         self.pages.addWidget(self.outer)
         self.pages.addWidget(self.calendar_page)
@@ -201,6 +209,8 @@ class MainWindow(QMainWindow):
         self.tray = Tray(self, self.sync_current, self.quit_app)
         self.notifier = make_notifier(self.tray)
         self.notifier.activated.connect(self._open_from_notification)
+        self.reminders = ReminderService(self.store, self.notifier, self.reminder_window,
+                                         lambda: self.settings.get("reminders/enabled"))
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.sync_current)
@@ -296,6 +306,7 @@ class MainWindow(QMainWindow):
         self.refresh_contacts()
         self.calendar_timer.start()
         self.refresh_calendar(calendars=True)
+        self.reminders.start()
 
     # -- folders ------------------------------------------------------
     def _populate_folders(self):
@@ -718,12 +729,31 @@ class MainWindow(QMainWindow):
                   activity="Downloading older mail…")
 
     # -- contacts -----------------------------------------------------------
+    _NEW = {"mail": ("New Mail", "mail-plus", "New mail message (Ctrl+N)"),
+            "calendar": ("New Event", "calendar-plus", "New event (Ctrl+Shift+E)"),
+            "contacts": ("New Contact", "user-plus", "New contact (Ctrl+Shift+C)")}
+
+    def _update_new_button(self, page: str):
+        text, icon, tip = self._NEW[page]
+        self.new_btn.setText(text)
+        self.new_btn.setIcon(iconset.load(icon))
+        self.new_btn.setToolTip(f"{tip}; the arrow offers the others")
+        self._new_page = page
+
+    def _new_for_page(self):
+        {"calendar": self.new_event, "contacts": self.new_contact}.get(
+            self._new_page, self.new_mail)()
+
+    def new_contact(self):
+        self.contacts_view.new_contact()
+
     def show_page(self, page: str):
         """"mail", "calendar" or "contacts"."""
         widget = {"contacts": self.contacts_view, "calendar": self.calendar_page}.get(
             page, self.outer)
         self.pages.setCurrentWidget(widget)
         self._nav[page].setChecked(True)
+        self._update_new_button(page)
         if page == "contacts":
             self.contacts_view.search.setFocus()
         elif page == "calendar":
@@ -1118,6 +1148,11 @@ class MainWindow(QMainWindow):
             self.notifier.notify(summary, body, key, origin=mailbox)
 
     def _open_from_notification(self, key: str):
+        if key.startswith("event|"):  # a reminder: show the reminders
+            self.reminder_window.show()
+            self.reminder_window.raise_()
+            self.reminder_window.activateWindow()
+            return
         self.tray.show_window()
         folder, _, message = key.partition("|")
         if folder:
@@ -1273,6 +1308,8 @@ class MainWindow(QMainWindow):
             "&Mail message", "mail-plus", self.new_mail, QKeySequence.StandardKey.New))
         self.new_menu.addAction(self._themed(
             "&Event", "calendar-plus", self.new_event, "Ctrl+Shift+E"))
+        self.new_menu.addAction(self._themed(
+            "&Contact…", "user-plus", self.new_contact, "Ctrl+Shift+C"))
         self.new_menu.addSeparator()
         self.new_menu.addAction(self._themed("&Folder…", "folder-plus", self.new_folder))
 
@@ -1381,15 +1418,15 @@ class MainWindow(QMainWindow):
         self.addToolBar(bar)
         self.toolbar = bar
 
-        new_btn = QToolButton()
-        new_btn.setText("New")
-        new_btn.setIcon(iconset.load("mail-plus"))
-        new_btn.setToolTip("New mail message (Ctrl+N); use the arrow for more")
+        # The button makes what belongs to the page you're on (New Mail / New Event /
+        # New Contact); its arrow still offers everything.
+        self.new_btn = new_btn = QToolButton()
         new_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
         new_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         new_btn.setMenu(self.new_menu)
-        new_btn.clicked.connect(lambda checked=False: self.new_mail())
+        new_btn.clicked.connect(lambda checked=False: self._new_for_page())
         bar.addWidget(new_btn)
+        self._update_new_button("mail")
         bar.addAction(self.act_send_receive)
         bar.addSeparator()
         for act in (self.act_cut, self.act_copy, self.act_paste):
@@ -1544,9 +1581,15 @@ class MainWindow(QMainWindow):
                                         for c in self.store.calendar_rows()):
                     box.calendar.sync_calendars()
                 box.calendar.fetch(first, last)
+                if not (first <= today and last >= ahead):  # keep the coming week for reminders
+                    box.calendar.fetch(today - dt.timedelta(days=1), ahead)
+
+        today = dt.date.today()
+        ahead = today + dt.timedelta(days=ReminderService.WINDOW_DAYS)
 
         def done(_):
             self._calendar_busy = False
+            self.reminders.check()
             if calendars:
                 self.calendar_page.reload_calendars()
             self.calendar_page.reload()
@@ -1557,6 +1600,15 @@ class MainWindow(QMainWindow):
             self._calendar_busy = False
 
         self._run(job, done, on_failed=failed, activity="Updating calendar…")
+
+    @staticmethod
+    def _time_zone() -> str:
+        """This computer's time zone by its Windows name (what Exchange understands best),
+        so repeating events keep their wall-clock time across daylight saving changes."""
+        from PySide6.QtCore import QTimeZone
+        iana = QTimeZone.systemTimeZoneId()  # (a QByteArray, which the next call wants)
+        windows = bytes(QTimeZone.ianaIdToWindowsId(iana)).decode() if not iana.isEmpty() else ""
+        return windows or "UTC"
 
     def _event_editor(self, row=None, **kwargs) -> EventEditor:
         box = self._calendar_box(row["account_id"] if row else None)
@@ -1572,7 +1624,8 @@ class MainWindow(QMainWindow):
                       activity="Checking availability…")
 
         dlg = EventEditor(self.store.calendar_rows(), self.store.category_colors(),
-                          suggestions(self.store), schedule, me, row=row, parent=self, **kwargs)
+                          suggestions(self.store), schedule, me, row=row, parent=self,
+                          tz=self._time_zone(), **kwargs)
         if row is not None and box is not None:  # the full notes (the list has a preview)
             event_id = row["id"]
             self._run(lambda: box.graph.event_body(event_id),
@@ -1587,13 +1640,95 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             self._save_event(dlg, None)
 
+    def _series_choice(self, row, verb: str) -> str | None:
+        """For an occurrence of a repeating event: "one", "series", or None (cancelled)."""
+        if not row["series_id"]:
+            return "one"
+        box = QMessageBox(QMessageBox.Icon.Question, "Repeating event",
+                          f"\"{row['subject']}\" is part of a series. {verb.capitalize()} just "
+                          "this one, or the whole series?", parent=self)
+        one = box.addButton("Just this one", QMessageBox.ButtonRole.AcceptRole)
+        series = box.addButton("The whole series", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        return {one: "one", series: "series"}.get(box.clickedButton())
+
     def edit_event(self, event_id: str):
         row = self.store.event_row(event_id)
         if row is None:
             return
-        dlg = self._event_editor(row=row)
-        if dlg.exec():
-            self._save_event(dlg, row)
+        choice = self._series_choice(row, "open")
+        if choice == "one":
+            dlg = self._event_editor(row=row)
+            if dlg.exec():
+                self._save_event(dlg, row)
+        elif choice == "series":
+            self._edit_series(row)
+
+    def _edit_series(self, occurrence):
+        """Fetch the series' master event (it has the pattern) and edit that."""
+        box = self._calendar_box(occurrence["account_id"])
+        if box is None:
+            return
+        series_id, calendar_id = occurrence["series_id"], occurrence["calendar_id"]
+
+        def done(master: dict):
+            row = calendar_event_row(master, box.account_id, calendar_id)
+            dlg = self._event_editor(row=row, recurrence=master.get("recurrence"), series=True)
+            if dlg.exec():
+                self._save_event(dlg, row)
+
+        self._run(lambda: box.graph.get_event(series_id), done, activity="Opening series…",
+                  on_failed=lambda msg: QMessageBox.warning(
+                      self, "Calendar", f"Couldn't open the series.\n\n{msg}"))
+
+    def _open_event(self, event_id: str):
+        """From a reminder: show the event in the Calendar and open it."""
+        row = self.store.event_row(event_id)
+        if row is None:
+            return
+        self.tray.show_window()
+        self.show_page("calendar")
+        self.calendar_page.go_to(event_span(row)[0].date())
+        self.calendar_page.select_event(event_id)
+        self.edit_event(event_id)
+
+    def dismiss_reminders(self, keys: list):
+        for event_id, start in keys:
+            self.store.set_reminder_state(event_id, start, dismissed=True)
+        self.reminders.check()
+        self._reminder_calls([(eid, None) for eid, _ in keys])
+
+    def snooze_reminders(self, keys: list, minutes: int):
+        until = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=minutes)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        for event_id, start in keys:
+            self.store.set_reminder_state(event_id, start, snoozed_until=until)
+        self.reminders.check()
+        self._reminder_calls([(eid, until) for eid, _ in keys])
+
+    def _reminder_calls(self, items: list):
+        """Tell Exchange too (dismiss, or snooze until), so Outlook elsewhere agrees. Best
+        effort: it is already remembered here."""
+        work = []
+        for event_id, until in items:
+            row = self.store.event_row(event_id)
+            box = self._calendar_box(row["account_id"] if row else None)
+            if box is not None:
+                work.append((box, event_id, until))
+
+        def job():
+            for box, event_id, until in work:
+                try:
+                    if until:
+                        box.graph.snooze_reminder(event_id, until)
+                    else:
+                        box.graph.dismiss_reminder(event_id)
+                except Exception as exc:
+                    log.info("reminder not synced for %s: %s", event_id, exc)
+
+        if work:
+            self._run(job, lambda _: None)
 
     def _save_event(self, dlg: EventEditor, row):
         draft, calendar_id = dlg.draft(), (row["calendar_id"] if row else dlg.calendar_id())
@@ -1603,15 +1738,21 @@ class MainWindow(QMainWindow):
             return
         fields = draft.fields()
         meeting = bool(draft.required or draft.optional)
+        # A series (new, changed, or no longer repeating): its occurrences have to be fetched
+        # again. A single event or occurrence comes back whole and is stored as it is.
+        series = bool(draft.recurrence) or dlg.series
 
         def job():
             item = box.graph.save_event(fields, row["id"] if row else None, calendar_id)
-            self.store.upsert_event(calendar_event_row(item, box.account_id, calendar_id))
+            if not series:
+                self.store.upsert_event(calendar_event_row(item, box.account_id, calendar_id))
             return item["id"]
 
         def done(event_id: str):
-            self.calendar_page.selected = event_id
+            self.calendar_page.selected = None if series else event_id
             self.calendar_page.reload()
+            if series:
+                self.refresh_calendar()
             what = "Meeting sent" if meeting and row is None else (
                 "Update sent" if meeting else "Event saved")
             self.statusBar().showMessage(what, 4000)
@@ -1624,8 +1765,17 @@ class MainWindow(QMainWindow):
         box = self._calendar_box(row["account_id"] if row else None)
         if row is None or box is None:
             return
+        choice = self._series_choice(row, "delete")
+        if choice is None:
+            return
+        target = row["series_id"] if choice == "series" else event_id
+        what = "the whole series " if choice == "series" else ""
         attendees = json.loads(row["attendees"] or "[]")
-        if attendees and row["is_organizer"]:
+        if choice == "series":
+            q = (f"Delete {what}\"{row['subject']}\"?"
+                 + (f"\n\nThe {len(attendees)} attendee(s) are sent a cancellation."
+                    if attendees and row["is_organizer"] else ""))
+        elif attendees and row["is_organizer"]:
             q = (f"Cancel \"{row['subject']}\"?\n\nThe {len(attendees)} attendee(s) are sent "
                  "a cancellation.")
         elif attendees:
@@ -1637,12 +1787,14 @@ class MainWindow(QMainWindow):
             return
 
         def job():
-            box.graph.delete_event(event_id)
+            box.graph.delete_event(target)
             self.store.delete_event(event_id)
 
         def done(_):
             self.calendar_page.reload()
             self.statusBar().showMessage("Deleted", 3000)
+            if choice == "series":
+                self.refresh_calendar()  # the other occurrences go too
 
         self._run(job, done, activity="Deleting event…", on_failed=lambda msg: QMessageBox.warning(
             self, "Calendar", f"Couldn't delete the event.\n\n{msg}"))

@@ -22,6 +22,7 @@ DEFAULTS = {
     "tray/show": True,             # icon in the system tray / status area
     "tray/close_to_tray": False,   # closing the window keeps WaddleMail running in the tray
     "view/splash": True,           # splash screen while starting
+    "reminders/enabled": True,     # event reminders (window + notification)
     # Window layout, saved on exit (not shown in Preferences).
     "window/geometry": QByteArray(),
     "window/folder_split": QByteArray(),

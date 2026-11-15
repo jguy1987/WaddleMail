@@ -144,6 +144,14 @@ CREATE TABLE IF NOT EXISTS events(
     reminder INTEGER                -- minutes before; NULL = no reminder
 );
 CREATE INDEX IF NOT EXISTS idx_events_time ON events(calendar_id, start);
+-- Reminders you dismissed or snoozed, per occurrence (event id + its start).
+CREATE TABLE IF NOT EXISTS reminder_state(
+    event_id TEXT NOT NULL,
+    start TEXT NOT NULL,
+    dismissed INTEGER DEFAULT 0,
+    snoozed_until TEXT,             -- UTC ISO
+    PRIMARY KEY(event_id, start)
+);
 CREATE TABLE IF NOT EXISTS categories(
     account_id TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -856,6 +864,27 @@ class Store:
             "JOIN calendars k ON k.id = e.calendar_id WHERE k.visible = 1 AND "
             "((e.all_day=0 AND e.start<? AND e.end>?) OR (e.all_day=1 AND e.start<? AND e.end>?))"
             " ORDER BY e.all_day DESC, e.start, e.subject COLLATE NOCASE",
+            (end_utc, start_utc, last_day, first_day)).fetchall()
+
+    def reminder_states(self) -> dict:
+        return {(r["event_id"], r["start"]): (bool(r["dismissed"]), r["snoozed_until"])
+                for r in self.conn.execute("SELECT * FROM reminder_state")}
+
+    def set_reminder_state(self, event_id: str, start: str, dismissed: bool = False,
+                           snoozed_until: str | None = None) -> None:
+        with self.conn as c:
+            c.execute("INSERT OR REPLACE INTO reminder_state(event_id, start, dismissed,"
+                      " snoozed_until) VALUES(?,?,?,?)",
+                      (event_id, start, int(dismissed), snoozed_until))
+            # forget states of events long gone
+            c.execute("DELETE FROM reminder_state WHERE start < date('now', '-30 days')")
+
+    def events_with_reminders(self, start_utc: str, end_utc: str, first_day: str,
+                              last_day: str) -> list[sqlite3.Row]:
+        """Events with a reminder in a period, from every calendar (hidden ones too)."""
+        return self.conn.execute(
+            "SELECT * FROM events WHERE reminder IS NOT NULL AND "
+            "((all_day=0 AND start<? AND end>?) OR (all_day=1 AND start<? AND end>?))",
             (end_utc, start_utc, last_day, first_day)).fetchall()
 
     def replace_categories(self, account_id: str, rows: list[tuple[str, str]]) -> None:

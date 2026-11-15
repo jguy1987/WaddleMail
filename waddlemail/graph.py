@@ -244,6 +244,21 @@ class GraphClient:
                     "$select": EVENT_FIELDS},
             headers=_prefer('outlook.timezone="UTC"')))
 
+    def get_event(self, event_id: str) -> dict:
+        """One event with its recurrence (for a series' master event)."""
+        return self._request(f"{self._root}/events/{quote(event_id, safe='')}",
+                             params={"$select": EVENT_FIELDS + ",recurrence"},
+                             headers=_prefer('outlook.timezone="UTC"'))
+
+    def dismiss_reminder(self, event_id: str) -> None:
+        self._request(f"{self._root}/events/{quote(event_id, safe='')}/dismissReminder",
+                      method="POST")
+
+    def snooze_reminder(self, event_id: str, until_utc: str) -> None:
+        self._request(f"{self._root}/events/{quote(event_id, safe='')}/snoozeReminder",
+                      method="POST", json={"newReminderTime": {
+                          "dateTime": until_utc.rstrip("Z"), "timeZone": "UTC"}})
+
     def event_body(self, event_id: str) -> tuple[str, str]:
         data = self._request(f"{self._root}/events/{quote(event_id, safe='')}",
                              params={"$select": "body"}, headers=_prefer())
