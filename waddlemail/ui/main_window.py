@@ -76,6 +76,9 @@ class MainWindow(QMainWindow):
         self.folder_tree.setMinimumWidth(160)
         self.folder_tree.folderSelected.connect(self._on_folder_selected)
         self.folder_tree.removeMailboxRequested.connect(self.remove_mailbox)
+        self.folder_tree.createFolderRequested.connect(self._create_folder)
+        self.folder_tree.renameFolderRequested.connect(self._rename_folder)
+        self.folder_tree.deleteFolderRequested.connect(self.delete_folder)
 
         # messages: quick filter bar over the list
         self.filter_bar = FilterBar()
@@ -302,6 +305,128 @@ class MainWindow(QMainWindow):
             self.msg_view.show_placeholder("Select a folder.")
         self.mailboxes.remove(mailbox_id)
         self._populate_folders()
+
+    # -- folder management --------------------------------------------
+    def new_folder(self):
+        """New subfolder of the selected folder (File > New > Folder)."""
+        if self.folder_tree.currentItem() is None:
+            self.statusBar().showMessage("Select a folder or mailbox first", 4000)
+            return
+        self.folder_tree.setFocus()
+        self.folder_tree.start_new_folder()
+
+    def _name_problem(self, mailbox_id: str, parent_id: str, name: str,
+                      exclude: str | None = None) -> str | None:
+        """Why `name` can't be used under `parent_id` ("" = top of the mailbox), if it can't."""
+        if not name:
+            return "A folder needs a name."
+        if len(name) > 255:
+            return "That name is too long."
+        rows = self.store.folder_rows(mailbox_id)
+        ids = {r["id"] for r in rows}
+        for r in rows:
+            sibling_parent = r["parent_id"] if r["parent_id"] in ids else ""
+            if sibling_parent == parent_id and r["id"] != exclude \
+                    and r["name"].casefold() == name.casefold():
+                return f"There is already a folder called \"{r['name']}\" there."
+        return None
+
+    def _folder_failed(self, title: str, msg: str):
+        self._populate_folders()  # put the pane back the way the store has it
+        QMessageBox.warning(self, title, msg)
+
+    def _create_folder(self, mailbox_id: str, parent_id: str, name: str):
+        box = self.mailboxes.get(mailbox_id)
+        problem = self._name_problem(mailbox_id, parent_id, name) if box else "No such mailbox."
+        if problem:
+            self._folder_failed("New folder", problem)
+            return
+        self.statusBar().showMessage(f"Creating {name}…")
+
+        def job():
+            folder = box.graph.create_folder(name, parent_id or None)
+            box.sync.sync_folders()
+            return folder["id"]
+
+        def done(folder_id: str):
+            self._populate_folders()
+            self.folder_tree.select_folder(folder_id)
+            self.statusBar().showMessage(f"Created {name}", 3000)
+
+        self._run(job, done, on_failed=lambda msg: self._folder_failed(
+            "New folder", f"Couldn't create \"{name}\".\n\n{msg}"))
+
+    def _rename_folder(self, folder_id: str, name: str):
+        row = self.store.folder_row(folder_id)
+        box = self.mailboxes.for_folder(folder_id)
+        if row is None or box is None:
+            return
+        ids = {r["id"] for r in self.store.folder_rows(box.id)}
+        parent = row["parent_id"] if row["parent_id"] in ids else ""
+        problem = self._name_problem(box.id, parent, name, exclude=folder_id)
+        if problem:
+            self._folder_failed("Rename folder", problem)
+            return
+
+        def job():
+            box.graph.rename_folder(folder_id, name)
+            box.sync.sync_folders()
+
+        def done(_):
+            self._populate_folders()
+            self.statusBar().showMessage(f"Renamed to {name}", 3000)
+
+        self._run(job, done, on_failed=lambda msg: self._folder_failed(
+            "Rename folder", f"Couldn't rename \"{row['name']}\".\n\n{msg}"))
+
+    def delete_folder(self, folder_id: str):
+        """Move a folder to Deleted Items, as Outlook does; one already in Deleted Items is
+        deleted for good."""
+        row = self.store.folder_row(folder_id)
+        box = self.mailboxes.for_folder(folder_id)
+        if row is None or box is None or row["well_known"]:
+            return
+        in_trash = any(r["well_known"] == "deleteditems" for r in self.store.folder_path(folder_id))
+        subtree = self.store.folder_subtree(folder_id)
+        items = sum(r["total"] or 0 for r in subtree)
+        parts = [f"{items} message{'s' if items != 1 else ''}"]
+        if len(subtree) > 1:
+            n = len(subtree) - 1
+            parts.append(f"{n} subfolder{'s' if n != 1 else ''}")
+        contents = " and ".join(parts)
+        if in_trash:
+            title = "Delete folder permanently"
+            q = (f"Permanently delete \"{row['name']}\" and its {contents}?\n\n"
+                 "This can't be undone.")
+        else:
+            title = "Delete folder"
+            q = f"Move \"{row['name']}\" and its {contents} to Deleted Items?"
+        if QMessageBox.question(self, title, q) != QMessageBox.StandardButton.Yes:
+            return
+        gone = {r["id"] for r in subtree}
+        self.statusBar().showMessage(f"Deleting {row['name']}…")
+
+        def job():
+            if in_trash:
+                box.graph.delete_folder(folder_id)
+            else:
+                box.graph.move_folder(folder_id, "deleteditems")
+            box.sync.sync_folders()
+
+        def done(_):
+            if in_trash and self._current_folder in gone:
+                # the folder we were looking at no longer exists: go to the Inbox
+                self._current_folder = None
+                inbox = self.store.well_known_folder(box.id, "inbox")
+                self._populate_folders()
+                if inbox:
+                    self.folder_tree.select_folder(inbox)
+            else:
+                self._populate_folders()
+            self.statusBar().showMessage(f"Deleted {row['name']}", 3000)
+
+        self._run(job, done, on_failed=lambda msg: self._folder_failed(
+            title, f"Couldn't delete \"{row['name']}\".\n\n{msg}"))
 
     # -- message list ---------------------------------------------------
     def _refresh_messages(self):
@@ -620,6 +745,8 @@ class MainWindow(QMainWindow):
             "&Mail message", "mail-plus", self.new_mail, QKeySequence.StandardKey.New))
         self.new_menu.addAction(self._themed(
             "&Event", "calendar-plus", self.new_event, "Ctrl+Shift+E"))
+        self.new_menu.addSeparator()
+        self.new_menu.addAction(self._themed("&Folder…", "folder-plus", self.new_folder))
 
         self.act_add_account = self._action("Add &account…", self.add_account)
         self.act_add_shared = self._action("Add &shared mailbox…", self.add_shared_mailbox)

@@ -148,6 +148,29 @@ class GraphClient:
                 f["wellKnownName"] = names[f["id"]]
         return out
 
+    def create_folder(self, name: str, parent_id: str | None = None) -> dict:
+        """A new folder under `parent_id`, or at the top of the mailbox."""
+        url = f"{self._root}/mailFolders"
+        if parent_id:
+            url += f"/{quote(parent_id, safe='')}/childFolders"
+        return self._request(url, method="POST", json={"displayName": name},
+                             headers=_prefer())
+
+    def rename_folder(self, folder_id: str, name: str) -> dict:
+        return self._request(f"{self._root}/mailFolders/{quote(folder_id, safe='')}",
+                             method="PATCH", json={"displayName": name}, headers=_prefer())
+
+    def move_folder(self, folder_id: str, destination_id: str) -> dict:
+        """Move under another folder; `destination_id` may be a well-known name."""
+        return self._request(f"{self._root}/mailFolders/{quote(folder_id, safe='')}/move",
+                             method="POST", json={"destinationId": destination_id},
+                             headers=_prefer())
+
+    def delete_folder(self, folder_id: str) -> None:
+        """Remove a folder and everything in it (recoverable only by an administrator).
+        To delete the way Outlook does, move it to Deleted Items instead."""
+        self._request(f"{self._root}/mailFolders/{quote(folder_id, safe='')}", method="DELETE")
+
     # -- messages ------------------------------------------------------
     def messages_delta(self, folder_id: str, delta_link: str | None = None,
                        since: str | None = None) -> Iterator[tuple[list[dict], str | None]]:

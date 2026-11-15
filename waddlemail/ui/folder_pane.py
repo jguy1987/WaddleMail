@@ -4,10 +4,13 @@ Default folders (Inbox, Drafts, Sent Items, ...) come first in a fixed order, th
 subfolders are A-Z. Each row shows an icon for its folder type and a right-aligned count: unread
 mail (accent colour), or the number of items for Drafts and Outbox. A collapsed folder also counts
 the unread mail in the subfolders it hides, in a dimmer colour.
+
+New folder and Rename edit the name in place (as in Outlook); the pane only asks, through
+signals, and MainWindow does the work on the server and repopulates.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QRect, QSize, Qt, Signal
+from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QFrame, QMenu, QStyle, QStyledItemDelegate,
@@ -61,6 +64,12 @@ def _accent(pal: QPalette, group) -> QColor:
 
 
 class FolderDelegate(QStyledItemDelegate):
+    edited = Signal(str)  # the text typed when an in-place edit is committed
+
+    def setModelData(self, editor, model, index):
+        # Don't write the name into the item: the pane decides (and the server may refuse).
+        self.edited.emit(editor.text())
+
     def sizeHint(self, option, index):
         size = super().sizeHint(option, index)
         return QSize(size.width(), max(size.height(), option.fontMetrics.height() + 10))
@@ -132,6 +141,9 @@ class FolderDelegate(QStyledItemDelegate):
 class FolderPane(QTreeWidget):
     folderSelected = Signal(str)
     removeMailboxRequested = Signal(str)
+    createFolderRequested = Signal(str, str, str)  # mailbox id, parent folder id ("" = top), name
+    renameFolderRequested = Signal(str, str)       # folder id, new name
+    deleteFolderRequested = Signal(str)            # folder id
 
     def __init__(self, store: Store, parent=None):
         super().__init__(parent)
@@ -144,7 +156,13 @@ class FolderPane(QTreeWidget):
         self.setUniformRowHeights(True)
         self.setIconSize(QSize(16, 16))
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.setItemDelegate(FolderDelegate(self))
+        self._delegate = FolderDelegate(self)
+        self.setItemDelegate(self._delegate)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)  # F2 / menu only
+        self._edit: dict | None = None     # the in-place edit in progress
+        self._populate_later = False       # a refresh that arrived while editing
+        self._delegate.edited.connect(self._on_edited)
+        self._delegate.closeEditor.connect(lambda *_: QTimer.singleShot(0, self._edit_closed))
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.DefaultContextMenu)
         self.itemSelectionChanged.connect(self._on_selection)
         self.itemClicked.connect(self._on_clicked)
@@ -157,6 +175,10 @@ class FolderPane(QTreeWidget):
 
     # -- building -------------------------------------------------------
     def populate(self) -> None:
+        if self._edit is not None:  # rebuilding would destroy the editor: do it afterwards
+            self._populate_later = True
+            return
+        self._populate_later = False
         current = self.current_folder()
         scroll = self.verticalScrollBar().value()
         self.blockSignals(True)
@@ -301,13 +323,100 @@ class FolderPane(QTreeWidget):
         is_open = item.isExpanded() and item.childCount() > 0
         item.setIcon(0, iconset.load("folder-open" if is_open else "folder"))
 
+    # -- new / rename / delete ---------------------------------------------
+    @staticmethod
+    def _mailbox_of(item: QTreeWidgetItem) -> QTreeWidgetItem:
+        while item.parent() is not None:
+            item = item.parent()
+        return item
+
+    def start_new_folder(self, parent: QTreeWidgetItem | None = None) -> None:
+        """Add a "New folder" row under `parent` (a folder or a mailbox heading; default: the
+        current folder) and let the user type its name."""
+        parent = parent or self.currentItem()
+        if parent is None or self._edit is not None:
+            return
+        item = QTreeWidgetItem(["New folder"])
+        item.setIcon(0, iconset.load("folder"))
+        item.setData(0, KIND_ROLE, "new")
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsEditable)
+        parent.addChild(item)
+        parent.setExpanded(True)
+        mailbox = self._mailbox_of(parent)
+        self._edit = {"mode": "new", "item": item, "mailbox": mailbox.data(0, ID_ROLE),
+                      "parent": parent.data(0, ID_ROLE)
+                      if parent.data(0, KIND_ROLE) == "folder" else "", "text": None}
+        self.scrollToItem(item)
+        self.editItem(item, 0)
+
+    def start_rename(self, item: QTreeWidgetItem | None = None) -> None:
+        item = item or self.currentItem()
+        if item is None or self._edit is not None or not self.can_change(item):
+            return
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+        self._edit = {"mode": "rename", "item": item, "text": None}
+        self.editItem(item, 0)
+
+    def request_delete(self, item: QTreeWidgetItem | None = None) -> None:
+        item = item or self.currentItem()
+        if item is not None and self.can_change(item):
+            self.deleteFolderRequested.emit(item.data(0, ID_ROLE))
+
+    @staticmethod
+    def can_change(item: QTreeWidgetItem) -> bool:
+        """Default folders (Inbox, Sent Items, ...) can't be renamed or deleted."""
+        return item.data(0, KIND_ROLE) == "folder" and not item.data(0, WELL_KNOWN_ROLE)
+
+    def _on_edited(self, text: str):
+        if self._edit is not None:
+            self._edit["text"] = text.strip()
+
+    def _edit_closed(self):
+        edit, self._edit = self._edit, None
+        if edit is None:
+            return
+        item, text = edit["item"], edit["text"]
+        if edit["mode"] == "new":
+            if text:
+                item.setText(0, text)  # shown until the refresh after the server answers
+                self.createFolderRequested.emit(edit["mailbox"], edit["parent"], text)
+            else:  # Esc, or nothing typed
+                item.parent().removeChild(item)
+        else:
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            if text and text != item.text(0):
+                item.setText(0, text)
+                self.renameFolderRequested.emit(item.data(0, ID_ROLE), text)
+        if self._populate_later:
+            self.populate()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_F2:
+            self.start_rename()
+            return
+        if event.key() == Qt.Key.Key_Delete:
+            self.request_delete()
+            return
+        super().keyPressEvent(event)
+
     # -- context menu ------------------------------------------------------
     def contextMenuEvent(self, event):
         item = self.itemAt(event.pos())
         menu = QMenu(self)
-        root = item
-        while root is not None and root.parent() is not None:
-            root = root.parent()
+        if item is not None and item.data(0, KIND_ROLE) in ("folder", "mailbox"):
+            where = "&New folder…" if item.data(0, KIND_ROLE) == "mailbox" else "&New subfolder…"
+            menu.addAction(iconset.load("folder-plus"), where,
+                           lambda: self.start_new_folder(item))
+            if item.data(0, KIND_ROLE) == "folder":
+                changeable = self.can_change(item)
+                act = menu.addAction(iconset.load("pencil"), "&Rename\tF2",
+                                     lambda: self.start_rename(item))
+                act.setEnabled(changeable)
+                act = menu.addAction(iconset.load("trash-2"), "&Delete\tDel",
+                                     lambda: self.request_delete(item))
+                act.setEnabled(changeable)
+            menu.addSeparator()
+        root = self._mailbox_of(item) if item is not None else None
         if root is not None:
             shared = bool(root.data(0, NOTE_ROLE))
             label = "&Remove shared mailbox" if shared else "Sign &out of this account"
@@ -318,7 +427,7 @@ class FolderPane(QTreeWidget):
             menu.addAction(act)
         menu.addSeparator()
         menu.addAction("&Expand all", lambda: self._set_all_expanded(True))
-        menu.addAction("&Collapse all", lambda: self._set_all_expanded(False))
+        menu.addAction("Co&llapse all", lambda: self._set_all_expanded(False))
         menu.exec(event.globalPos())
 
     def _set_all_expanded(self, expanded: bool):

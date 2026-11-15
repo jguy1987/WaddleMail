@@ -301,6 +301,23 @@ class Store:
     def folder_row(self, folder_id: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM folders WHERE id=?", (folder_id,)).fetchone()
 
+    def folder_path(self, folder_id: str) -> list[sqlite3.Row]:
+        """The folder and its ancestors, top-most first."""
+        path, seen = [], set()
+        row = self.folder_row(folder_id)
+        while row is not None and row["id"] not in seen:
+            seen.add(row["id"])
+            path.append(row)
+            row = self.folder_row(row["parent_id"]) if row["parent_id"] else None
+        return path[::-1]
+
+    def folder_subtree(self, folder_id: str) -> list[sqlite3.Row]:
+        """The folder and all folders below it."""
+        return self.conn.execute(
+            """WITH RECURSIVE sub(id) AS (
+                   SELECT ? UNION SELECT f.id FROM folders f JOIN sub ON f.parent_id = sub.id)
+               SELECT folders.* FROM folders JOIN sub USING(id)""", (folder_id,)).fetchall()
+
     def folder_mailbox(self, folder_id: str) -> str | None:
         row = self.conn.execute(
             "SELECT mailbox_id FROM folders WHERE id=?", (folder_id,)).fetchone()

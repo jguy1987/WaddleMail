@@ -16,6 +16,12 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   Outbox, then other folders A-Z (subfolders A-Z). Each default folder has its own icon; unread
   counts are right-aligned (Drafts/Outbox show how many items they hold), and a collapsed folder
   adds up the unread mail in the subfolders it hides. Collapsed/expanded state is remembered.
+- **Folder management**: right-click a folder for New subfolder, Rename (F2) and Delete (Del),
+  or a mailbox heading for New folder; also File > New > Folder. Names are typed in place, as in
+  Outlook (Enter saves, Esc cancels); a name already used next to it is refused. Delete moves
+  the folder and everything in it to Deleted Items; deleting a folder that is already in Deleted
+  Items removes it for good (after a warning). Default folders (Inbox, Sent Items, ...) can't be
+  renamed or deleted.
 - Message list served from a local SQLite store, kept current with Graph **delta queries** (one
   cursor per folder). If the first sync fails (offline), the stored mail is still shown.
   - Columns: read dot, replied/forwarded, attachment, importance, From (To in Sent Items, Drafts
@@ -80,7 +86,7 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
 
 Sending mail and saving events (the New dialogs open but only collect input), personal contacts,
 calendar views, searching all folders at once, attachments and inline (`cid:`) images,
-move/delete. Conversations only group messages within the current folder (your replies in Sent
+move/delete of messages, moving folders (drag and drop). Conversations only group messages within the current folder (your replies in Sent
 Items are not pulled in, as Outlook does).
 
 ## Register the app (one time)

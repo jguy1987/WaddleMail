@@ -43,8 +43,57 @@ def server_search(self, folder_id, words, limit=250):
     return []
 
 
+class FakeFolders:
+    """The server's folder tree, for create / rename / move / delete."""
+
+    def __init__(self):
+        self.folders = {
+            "in": {"id": "in", "displayName": "Inbox", "wellKnownName": "inbox",
+                   "unreadItemCount": 3},
+            "del": {"id": "del", "displayName": "Deleted Items", "wellKnownName": "deleteditems"},
+        }
+        self.n = 0
+
+    def list_folders(self, client):
+        return [dict(f) for f in self.folders.values()]
+
+    def create(self, client, name, parent_id=None):
+        self.n += 1
+        fid = f"new{self.n}"
+        self.folders[fid] = {"id": fid, "displayName": name, "parentFolderId": parent_id}
+        return {"id": fid}
+
+    def rename(self, client, fid, name):
+        self.folders[fid]["displayName"] = name
+
+    def move(self, client, fid, dest):
+        self.folders[fid]["parentFolderId"] = {"deleteditems": "del"}.get(dest, dest)
+
+    def delete(self, client, fid):
+        doomed = {fid}
+        while True:
+            more = {k for k, f in self.folders.items() if f.get("parentFolderId") in doomed}
+            if more <= doomed:
+                break
+            doomed |= more
+        for k in doomed:
+            del self.folders[k]
+
+
+server = FakeFolders()
 graph.GraphClient._request = offline
 graph.GraphClient.search_messages = server_search
+graph.GraphClient.list_folders = lambda self: server.list_folders(self)
+graph.GraphClient.create_folder = lambda self, name, parent_id=None: server.create(self, name, parent_id)
+graph.GraphClient.rename_folder = lambda self, fid, name: server.rename(self, fid, name)
+graph.GraphClient.move_folder = lambda self, fid, dest: server.move(self, fid, dest)
+graph.GraphClient.delete_folder = lambda self, fid: server.delete(self, fid)
+
+# Dialogs would block the test: answer Yes, and record warnings.
+from PySide6.QtWidgets import QLineEdit, QMessageBox  # noqa: E402
+warnings: list[str] = []
+QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+QMessageBox.warning = staticmethod(lambda parent, title, text, *a: warnings.append(text))
 
 
 class FakeAuth:
@@ -236,11 +285,71 @@ def checks():
     wait(300)
     check(len(w._windows) == 1 and "m3" not in unread(), "double-click opens and marks read")
 
+    folder_checks()
+
     w.close()
     saved = Settings(str(tmp / "settings.ini"))
     check(saved.get("view/reading_pane") == "off" and not saved.get("list/header").isEmpty(),
           "layout saved on exit")
     app.exit(1 if failures else 0)
+
+
+def type_in_editor(text: str, key=Qt.Key.Key_Return) -> bool:
+    wait(100)
+    # (offscreen windows never get keyboard focus, so look for the editor itself)
+    editors = [e for e in w.folder_tree.viewport().findChildren(QLineEdit) if e.isVisible()]
+    if not editors:
+        return False
+    editor = editors[0]
+    editor.selectAll()
+    QTest.keyClicks(editor, text)
+    QTest.keyClick(editor, key)
+    wait(400)
+    return True
+
+
+def folder_named(name):
+    return next((r for r in st.folder_rows() if r["name"] == name), None)
+
+
+def folder_checks():
+    pane = w.folder_tree
+    pane.select_folder("in")
+    wait(100)
+    pane.start_new_folder()
+    check(type_in_editor("Projects"), "New folder: name edited in place")
+    made = folder_named("Projects")
+    check(made is not None and made["parent_id"] == "in", "new subfolder created under Inbox")
+    check(w._current_folder == (made and made["id"]), "the new folder is selected")
+
+    pane.select_folder("in")
+    pane.start_new_folder()
+    type_in_editor("projects")
+    check(warnings and "already a folder" in warnings[-1], "duplicate name refused")
+    pane.start_new_folder()
+    type_in_editor("Ignored", key=Qt.Key.Key_Escape)
+    check(folder_named("Ignored") is None and pane._edit is None, "Esc cancels a new folder")
+
+    pane.select_folder(made["id"])
+    pane.setFocus()
+    QTest.keyClick(pane, Qt.Key.Key_F2)
+    check(type_in_editor("Clients"), "F2 renames in place")
+    check(st.folder_row(made["id"])["name"] == "Clients", "renamed on the server and here")
+
+    pane.select_folder("in")
+    QTest.keyClick(pane, Qt.Key.Key_F2)
+    wait(100)
+    check(pane._edit is None, "Inbox can't be renamed")
+
+    pane.select_folder(made["id"])
+    QTest.keyClick(pane, Qt.Key.Key_Delete)
+    wait(400)
+    check(st.folder_row(made["id"])["parent_id"] == "del", "Delete moves it to Deleted Items")
+    pane.select_folder(made["id"])
+    QTest.keyClick(pane, Qt.Key.Key_Delete)
+    wait(400)
+    check(st.folder_row(made["id"]) is None and w._current_folder == "in",
+          "deleting it from Deleted Items removes it; Inbox is shown")
 
 
 QTimer.singleShot(1200, run)
