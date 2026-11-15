@@ -165,3 +165,76 @@ def test_new_messages_are_reported_only_on_incremental_sync(tmp_path):
     assert eng.sync_folder("F").new_ids == []  # first sync: everything is "new"
     eng.graph = G([([msg("m3", subject="edited"), msg("m4")], "L2")])
     assert eng.sync_folder("F").new_ids == ["m4"]  # m3 was only updated
+
+
+class PagesGraph:
+    """messages_delta replays fixed pages and records the `since` it was asked for."""
+
+    def __init__(self, pages, older=()):
+        self.pages, self.older, self.calls = pages, list(older), []
+
+    def messages_delta(self, folder_id, link, since):
+        self.calls.append((link, since))
+        yield from self.pages
+
+    def messages_before(self, folder_id, before, limit):
+        self.before = before
+        return [m for m in self.older if m["receivedDateTime"] < before][:limit]
+
+
+def test_longer_sync_period_refetches(tmp_path):
+    st = make_store(tmp_path)
+    g = PagesGraph([([msg("m1")], "L1")])
+    eng = SyncEngine(st, g, "a", initial_days=90)
+    eng.sync_folder("F")
+    eng.sync_folder("F")
+    assert [link for link, _ in g.calls] == [None, "L1"]   # incremental the second time
+    eng.initial_days = 180
+    eng.sync_folder("F")
+    assert g.calls[-1][0] is None                           # period grew: start over
+    assert g.calls[-1][1] < g.calls[0][1]                   # ... reaching further back
+    eng.initial_days = 30
+    eng.sync_folder("F")
+    assert g.calls[-1][0] == "L1"                           # shorter: keep the cursor
+
+
+def test_cursor_without_recorded_period_is_redone_once(tmp_path):
+    st = make_store(tmp_path)
+    st.set_state("delta:F", "OLD")  # made by an earlier version
+    g = PagesGraph([([msg("m1")], "L1")])
+    eng = SyncEngine(st, g, "a", initial_days=180)
+    eng.sync_folder("F")
+    eng.sync_folder("F")
+    assert [link for link, _ in g.calls] == [None, "L1"]
+
+
+def test_older_mail_on_request_survives_a_resync(tmp_path):
+    t = "receivedDateTime"
+    st = make_store(tmp_path, msg("m5", **{t: "2026-11-10T10:00:00Z"}))
+    old = [msg("o1", **{t: "2020-05-01T00:00:00Z"}), msg("o2", **{t: "2019-01-01T00:00:00Z"})]
+    g = PagesGraph([([msg("m5", **{t: "2026-11-10T10:00:00Z"})], "L1")], older=old)
+    eng = SyncEngine(st, g, "a", initial_days=30)
+    assert eng.fetch_older("F") == 2 and g.before == "2026-11-10T10:00:00Z"
+    st.delete_state("delta:F")
+    eng.sync_folder("F")  # full resync of the last 30 days: o1/o2 aren't in it
+    assert {r["id"] for r in st.list_messages("F")} == {"m5", "o1", "o2"}
+
+
+def test_download_period_covers_what_the_list_shows(tmp_path):
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from waddlemail.settings import Settings
+    QApplication.instance() or QApplication([])  # (other tests need a full QApplication)
+    s = Settings(str(tmp_path / "s.ini"))
+    for keep, show, expected in ((180, 0, 0), (180, 30, 180), (90, 365, 365), (0, 30, 0)):
+        s.set("sync/window_days", keep)
+        s.set("list/window_days", show)
+        assert s.download_days() == expected, (keep, show)
+
+
+def test_list_has_no_size_cap(tmp_path):
+    st = make_store(tmp_path)
+    st.apply_message_changes("F", [{"id": f"x{i}", "receivedDateTime": "2024-01-01T00:00:00Z"}
+                                   for i in range(5200)])
+    assert len(st.list_messages("F")) == 5200

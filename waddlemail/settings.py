@@ -43,6 +43,12 @@ class Settings:
         default = DEFAULTS[key]
         return self._q.value(key, default, type=type(default))
 
+    def download_days(self) -> int:
+        """How far back mail is downloaded (headers only; 0 = all): the longer of "Keep mail
+        locally" and "Show in message list", since the list can only show downloaded mail."""
+        keep, show = self.get("sync/window_days"), self.get("list/window_days")
+        return 0 if keep <= 0 or show <= 0 else max(keep, show)
+
     def set(self, key: str, value) -> None:
         if key not in DEFAULTS:
             raise KeyError(key)

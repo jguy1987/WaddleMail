@@ -113,6 +113,9 @@ graph.GraphClient.move_folder = lambda self, fid, dest: server.move(self, fid, d
 graph.GraphClient.delete_folder = lambda self, fid: server.delete(self, fid)
 server_moves: list[tuple[str, str]] = []
 graph.GraphClient.move_message = lambda self, mid, dest: server_moves.append((mid, dest)) or {}
+graph.GraphClient.messages_before = lambda self, fid, before, limit=500: [
+    {"id": f"older{i}", "parentFolderId": fid, "subject": f"Old {i}", "isRead": True,
+     "receivedDateTime": f"2018-0{i}-01T00:00:00Z"} for i in (1, 2)] if fid == "in" else []
 graph.GraphClient.copy_message = lambda self, mid, dest: {
     "id": f"copy-of-{mid}", "parentFolderId": dest, "subject": "copied", "isRead": True,
     "receivedDateTime": "2026-11-01T10:00:00Z"}
@@ -316,6 +319,7 @@ def checks():
     folder_checks()
     move_checks()
     integration_checks()
+    older_mail_checks()
 
     w.close()
     saved = Settings(str(tmp / "settings.ini"))
@@ -539,6 +543,23 @@ def integration_checks():
     img = sp.pixmap().toImage()
     check(not img.isNull() and img.width() >= 440, "splash screen renders")
     sp.close()
+
+
+def older_mail_checks():
+    w.folder_tree.select_folder("in")
+    wait(300)
+    stored = st.message_count("in")
+    st.conn.execute("UPDATE folders SET total = ? WHERE id = 'in'", (stored + 2,))
+    st.conn.commit()
+    w._refresh_messages()
+    bar = w.older_bar
+    check(bar.isVisible() and "2 older messages" in bar.label.text(),
+          "the bar says how much older mail is only on the server")
+    bar.button.click()
+    wait(500)
+    check(st.message_row("older1") is not None and "older2" in ids(),
+          "Download older mail fetches it into the list")
+    check(not bar.isVisible(), "the bar goes away when everything is here")
 
 
 def travel_id():

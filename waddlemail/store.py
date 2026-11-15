@@ -253,7 +253,8 @@ class Store:
                 "SELECT id FROM folders WHERE mailbox_id=?", (mailbox_id,))]
             for fid in fids:
                 c.execute("DELETE FROM messages WHERE folder_id=?", (fid,))
-                c.execute("DELETE FROM sync_state WHERE key=?", (f"delta:{fid}",))
+                c.execute("DELETE FROM sync_state WHERE key IN (?, ?)",
+                          (f"delta:{fid}", f"window:{fid}"))
             c.execute("DELETE FROM folders WHERE mailbox_id=?", (mailbox_id,))
             c.execute("DELETE FROM pending WHERE mailbox_id=?", (mailbox_id,))
             c.execute("DELETE FROM mailboxes WHERE id=?", (mailbox_id,))
@@ -290,7 +291,8 @@ class Store:
                 "SELECT id FROM folders WHERE mailbox_id=?", (mailbox_id,)) if r["id"] not in ids]
             for fid in gone:
                 c.execute("DELETE FROM messages WHERE folder_id=?", (fid,))
-                c.execute("DELETE FROM sync_state WHERE key=?", (f"delta:{fid}",))
+                c.execute("DELETE FROM sync_state WHERE key IN (?, ?)",
+                          (f"delta:{fid}", f"window:{fid}"))
                 c.execute("DELETE FROM folders WHERE id=?", (fid,))
 
     def folder_rows(self, mailbox_id: str | None = None) -> list[sqlite3.Row]:
@@ -357,8 +359,10 @@ class Store:
                     up += 1
         return up, rm
 
-    def prune_folder(self, folder_id: str, keep_ids: set[str]) -> int:
-        """Delete messages in a folder that were not seen during a full resync."""
+    def prune_folder(self, folder_id: str, keep_ids: set[str], since: str | None = None) -> int:
+        """Delete messages in a folder that were not seen during a full resync of the period
+        from `since`. Older mail (downloaded on request, or found by a server search) isn't
+        part of that resync, so it stays."""
         with self.conn as c:
             c.execute("CREATE TEMP TABLE IF NOT EXISTS keep(id TEXT PRIMARY KEY)")
             c.execute("DELETE FROM keep")
@@ -366,16 +370,18 @@ class Store:
             # (a message moved here locally isn't on the server's list yet: keep it)
             cur = c.execute(
                 "DELETE FROM messages WHERE folder_id=? AND id NOT IN (SELECT id FROM keep)"
-                " AND id NOT IN (SELECT message_id FROM pending WHERE field='move')",
-                (folder_id,),
+                " AND id NOT IN (SELECT message_id FROM pending WHERE field='move')"
+                " AND (? IS NULL OR received IS NULL OR received >= ?)",
+                (folder_id, since, since),
             )
             return cur.rowcount
 
-    def list_messages(self, folder_id: str, limit: int = 5000, offset: int = 0,
+    def list_messages(self, folder_id: str, limit: int = -1, offset: int = 0,
                       since: str | None = None, search: str = "", unread: bool = False,
                       flagged: bool = False, attachments: bool = False,
                       also_ids: list[str] | None = None) -> list[sqlite3.Row]:
-        """Newest first. `since` (ISO timestamp) hides older mail without deleting it.
+        """Newest first; `limit` -1 means no limit. `since` (ISO timestamp) hides older mail
+        without deleting it.
 
         `search` keeps messages where every word appears in the sender, recipients, subject or
         preview (anywhere in the text), or starts a word in the cached body. While searching,
@@ -508,6 +514,10 @@ class Store:
                           (row["old"], row["message_id"]))
             else:
                 c.execute("UPDATE messages SET flag=? WHERE id=?", (row["old"], row["message_id"]))
+
+    def oldest_received(self, folder_id: str) -> str | None:
+        return self.conn.execute(
+            "SELECT MIN(received) FROM messages WHERE folder_id=?", (folder_id,)).fetchone()[0]
 
     def message_count(self, folder_id: str) -> int:
         return self.conn.execute(

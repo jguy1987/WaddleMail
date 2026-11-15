@@ -1181,3 +1181,37 @@ class FilterBar(QWidget):
             word = "message" if shown == 1 else "messages"
         self.count.setText(f"{shown} {word}" + (f" · {note}" if note else ""))
         self.count.setToolTip(note)
+
+
+class OlderMailBar(QWidget):
+    """Under the list: says when the server has more of this folder than is stored here
+    (mail older than "Keep mail locally for"), with a button to download it."""
+    requested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 3, 6, 3)
+        self.label = QLabel()
+        self.label.setForegroundRole(QPalette.ColorRole.PlaceholderText)
+        self.label.setWordWrap(True)
+        self.button = QToolButton()
+        self.button.setText("Download older mail")
+        self.button.setIcon(iconset.load("refresh-cw"))
+        self.button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.button.setAutoRaise(True)
+        self.button.clicked.connect(self.requested)
+        lay.addWidget(self.label, 1)
+        lay.addWidget(self.button)
+        self.hide()
+
+    def show_missing(self, missing: int, busy: bool = False) -> None:
+        if missing <= 0:
+            self.hide()
+            return
+        what = "1 older message" if missing == 1 else f"{missing} older messages"
+        self.label.setText(f"{what} in this folder {'is' if missing == 1 else 'are'} only on "
+                           "the server.")
+        self.button.setEnabled(not busy)
+        self.button.setText("Downloading…" if busy else "Download older mail")
+        self.show()

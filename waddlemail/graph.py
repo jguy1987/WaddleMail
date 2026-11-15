@@ -207,6 +207,22 @@ class GraphClient:
                 return
             url, params = nxt, None
 
+    def messages_before(self, folder_id: str, before: str, limit: int = 500) -> list[dict]:
+        """Up to `limit` messages received before `before` (ISO time), newest first: mail
+        older than the sync period, fetched on request."""
+        params = {"$select": MESSAGE_FIELDS, "$top": 100,
+                  "$filter": f"receivedDateTime lt {before}",
+                  "$orderby": "receivedDateTime desc"}
+        if self._expand_props:
+            params["$expand"] = EXTENDED_PROPS
+        url = f"{self._root}/mailFolders/{quote(folder_id, safe='')}/messages"
+        out: list[dict] = []
+        for item in self._paged(url, params=params, headers=_prefer()):
+            out.append(item)
+            if len(out) >= limit:
+                break
+        return out
+
     def search_messages(self, folder_id: str, words: list[str], limit: int = 250) -> list[dict]:
         """Server-side search of one folder (subject, body, people, attachments' names).
         Every word must match. Newest first as Exchange ranks them; at most `limit` results."""

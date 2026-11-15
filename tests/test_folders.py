@@ -107,3 +107,20 @@ def test_move_is_sent_or_undone(tmp_path):
     st.move_messages("a", ["m2"], "B")
     SyncEngine(st, G(403), "a").send_changes()  # e.g. read-only shared mailbox
     assert st.message_row("m2")["folder_id"] == "A"
+
+
+def test_older_messages_request():
+    class Session:
+        def request(self, method, url, params=None, headers=None, json=None, timeout=None):
+            self.params = params
+            return FakeResponse(200, {"value": [{"id": str(i)} for i in range(100)],
+                                      "@odata.nextLink": "https://graph.microsoft.com/v1.0/n"})
+
+    s = Session()
+    out = GraphClient(lambda: "t", session=s).messages_before("F", "2026-01-01T00:00:00Z", 150)
+    assert len(out) == 150  # stops at the limit, across pages
+    first = GraphClient(lambda: "t", session=Session())
+    sess = first._s
+    first.messages_before("F", "2026-01-01T00:00:00Z", 10)
+    assert sess.params["$filter"] == "receivedDateTime lt 2026-01-01T00:00:00Z"
+    assert sess.params["$orderby"] == "receivedDateTime desc"

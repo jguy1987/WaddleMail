@@ -1,9 +1,10 @@
 """Preferences dialog."""
 from __future__ import annotations
 
+from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
-    QLineEdit, QPushButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+    QLabel, QLineEdit, QPushButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from ..settings import Settings
@@ -78,8 +79,19 @@ class PreferencesDialog(QDialog):
         self.sync_window, self.list_window = PeriodEdit(), PeriodEdit()
         self.sync_window.set_days(settings.get("sync/window_days"))
         self.list_window.set_days(settings.get("list/window_days"))
+        self.sync_window.setToolTip(
+            "Mail received in this period (or the \"Show in message list\" period, if that is "
+            "longer) is downloaded and kept up to date. Older mail stays on the server: use "
+            "\"Download older mail\" under the message list to get it. Making the period "
+            "longer downloads the extra mail on the next sync.")
         f.addRow("Keep mail locally for:", self.sync_window)
         f.addRow("Show in message list:", self.list_window)
+        note = QLabel("Mail in the longer of these two periods is downloaded: the sender, "
+                      "subject and date, not the message text (that comes when you open a "
+                      "message). A shorter \"Show\" period only hides older mail from the list.")
+        note.setWordWrap(True)
+        note.setForegroundRole(QPalette.ColorRole.PlaceholderText)
+        f.addRow(note)
         self.mark_read = QCheckBox("Mark messages as read when shown in the reading pane")
         self.mark_read.setChecked(settings.get("read/mark_on_view"))
         self.mark_delay = QSpinBox()

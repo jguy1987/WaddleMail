@@ -69,6 +69,12 @@ class SyncEngine:
             log.warning("sending queued changes failed: %s", exc)
         key = f"delta:{folder_id}"
         link = self.store.get_state(key)
+        if link and self._window_grew(folder_id):
+            # The cursor only covers the period it was made with: start again to fetch the
+            # mail that a longer "Keep mail locally" period now includes.
+            log.info("sync period grew for %s; full resync", folder_id)
+            self.store.delete_state(key)
+            link = None
         try:
             result = self._run(folder_id, key, link)
         except DeltaResetError:
@@ -78,12 +84,28 @@ class SyncEngine:
         self.store.purge_orphan_bodies()
         return result
 
+    def _since(self) -> str:
+        """The oldest receivedDateTime the current sync period covers."""
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=self.initial_days)
+        return cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _window_grew(self, folder_id: str) -> bool:
+        """True if the folder's cursor was made for a shorter period than the current one
+        (or before periods were recorded)."""
+        used = self.store.get_state(f"window:{folder_id}")
+        return used is None or self._since() < used
+
+    def fetch_older(self, folder_id: str, limit: int = 500) -> int:
+        """Download up to `limit` messages older than the oldest one stored for the folder
+        (mail outside the sync period, on request). Returns how many arrived."""
+        before = self.store.oldest_received(folder_id) or self._since()
+        items = self.graph.messages_before(folder_id, before, limit)
+        self.store.apply_message_changes(folder_id, items)
+        return len(items)
+
     def _run(self, folder_id: str, key: str, link: str | None) -> SyncResult:
         full = link is None
-        since = None
-        if full:
-            cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=self.initial_days)
-            since = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+        since = self._since() if full else None
         result = SyncResult(full=full)
         seen: set[str] = set()
         final_link: str | None = None
@@ -97,9 +119,11 @@ class SyncEngine:
             if delta_link:
                 final_link = delta_link
         if full:
-            result.removed += self.store.prune_folder(folder_id, seen)
+            result.removed += self.store.prune_folder(folder_id, seen, since)
         # Persist the cursor only after every page was applied, so a crash
         # mid-sync simply replays the same (idempotent) changes.
         if final_link:
             self.store.set_state(key, final_link)
+            if full:
+                self.store.set_state(f"window:{folder_id}", since)
         return result

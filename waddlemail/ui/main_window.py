@@ -23,7 +23,7 @@ from . import iconset
 from .dialogs import ComposeDialog, EventDialog, SharedMailboxDialog
 from .folder_pane import FolderPane
 from .folder_picker import TOP, FolderPicker
-from .message_list import OUTGOING, FilterBar, MessageListView
+from .message_list import OUTGOING, FilterBar, MessageListView, OlderMailBar
 from .message_view import MessageView, MessageWindow
 from .preferences import PreferencesDialog
 from .render import placeholder
@@ -106,6 +106,11 @@ class MainWindow(QMainWindow):
         lay.setSpacing(0)
         lay.addWidget(self.filter_bar)
         lay.addWidget(self.msg_list)
+        self.older_bar = OlderMailBar()
+        self.older_bar.requested.connect(self.download_older)
+        self._downloading: set[str] = set()  # folders fetching older mail now
+        self._no_older: set[str] = set()     # folders where the server had nothing older
+        lay.addWidget(self.older_bar)
 
         self.msg_view = MessageView()
 
@@ -468,6 +473,7 @@ class MainWindow(QMainWindow):
         self.msg_list.folder_id = self._current_folder  # for dragging messages out
         self.msg_list.set_messages(rows, bool(folder) and folder["well_known"] in OUTGOING)
         self._update_message_actions()
+        self._update_older_bar()
         if not words:
             self._search_note = ""
             self._search_timer.stop()
@@ -610,6 +616,40 @@ class MainWindow(QMainWindow):
                   lambda body: win.set_body(body.content_type, body.content),
                   on_failed=win.show_error)
         self.mark_read([mid], True)
+
+    # -- older mail ---------------------------------------------------------
+    def _update_older_bar(self):
+        fid = self._current_folder
+        folder = self.store.folder_row(fid) if fid else None
+        if folder is None or fid in self._no_older or self.filter_bar.active():
+            self.older_bar.hide()
+            return
+        missing = (folder["total"] or 0) - self.store.message_count(fid)
+        self.older_bar.show_missing(missing, busy=fid in self._downloading)
+
+    def download_older(self):
+        """Fetch the next 500 messages older than what this folder has stored."""
+        fid = self._current_folder
+        box = self.mailboxes.for_folder(fid) if fid else None
+        if box is None or fid in self._downloading:
+            return
+        self._downloading.add(fid)
+        self._update_older_bar()
+
+        def done(count: int):
+            self._downloading.discard(fid)
+            if count == 0:  # the rest aren't messages we can list (or are already here)
+                self._no_older.add(fid)
+            if fid == self._current_folder:
+                self._refresh_messages()
+            self.statusBar().showMessage(
+                f"Downloaded {count} older message{'s' if count != 1 else ''}", 4000)
+
+        def failed(_msg: str):
+            self._downloading.discard(fid)
+            self._update_older_bar()
+
+        self._run(lambda: box.sync.fetch_older(fid), done, on_failed=failed)
 
     # -- move / copy --------------------------------------------------------
     def _pick_folder(self, mailbox_id: str, title: str, prompt: str, parent=None,
@@ -1220,12 +1260,14 @@ class MainWindow(QMainWindow):
         dlg = PreferencesDialog(self.settings, self._clear_cache, self)
         if dlg.exec():
             self._apply_settings()
+            self._no_older.clear()
             self._refresh_messages()
             self.statusBar().showMessage("Preferences saved", 3000)
+            self.sync_current()  # a longer sync period fetches the extra mail now
 
     def _apply_settings(self):
         s = self.settings
-        self.mailboxes.configure(s.get("sync/window_days") or 36500,
+        self.mailboxes.configure(s.download_days() or 36500,
                                  s.get("cache/max_mb") * 1024 * 1024)
         self.timer.setInterval(s.get("sync/interval_min") * 60_000)
         self.tray.setVisible(s.get("tray/show") and QSystemTrayIcon.isSystemTrayAvailable())

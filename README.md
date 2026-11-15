@@ -108,8 +108,15 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
 - **Preferences** (Edit > Preferences, Ctrl+,), saved to `~/.config/WaddleMail/WaddleMail.conf`:
   - Load remote images by default
   - Check for new mail every N minutes
-  - Keep mail locally for N days/months/all (sync window)
-  - Show in message list: last N days/months/all (display filter only; nothing is deleted)
+  - Keep mail locally for N days/months/all (sync window). Making it longer downloads the
+    extra mail on the next sync. Older mail stays on the server: when a folder has more there
+    than here, a bar under the message list offers **Download older mail** (500 at a time).
+    Mail fetched that way (and server-search hits) isn't kept up to date by sync, but isn't
+    thrown away by it either.
+  - Show in message list: last N days/months/all. Mail is downloaded for the longer of the
+    two periods (headers only; message text comes when you open a message), so "all" really
+    shows everything; a shorter period only hides older mail (nothing is deleted). Folders
+    have no size cap in the list.
   - Data location (applies after restart; existing data is not moved)
   - Body cache size limit, discard cached bodies not opened for N days/months, Clear cache button
 
@@ -218,5 +225,4 @@ waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 3. Events (`Calendars.ReadWrite`), then calendar views.
 4. Attachments and `cid:` images; search across all folders; optional background download of
    bodies so local search covers everything offline.
-5. "Load older mail" beyond the sync window.
-6. Publisher verification of the app registration before sharing with other organizations.
+5. Publisher verification of the app registration before sharing with other organizations.
