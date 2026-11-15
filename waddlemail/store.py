@@ -107,6 +107,49 @@ CREATE TABLE IF NOT EXISTS contact_groups(
     notes TEXT,
     members TEXT                    -- JSON [[name, address, type, key, memberId], ...]
 );
+-- Calendars and their events. Timed events: start/end are UTC ISO times; all-day events:
+-- start/end are dates (end exclusive), which mean the same day everywhere.
+CREATE TABLE IF NOT EXISTS calendars(
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    color TEXT,                     -- #rrggbb
+    is_default INTEGER DEFAULT 0,
+    can_edit INTEGER DEFAULT 1,
+    teams INTEGER DEFAULT 0,        -- Teams meetings can be added
+    owner TEXT,
+    visible INTEGER DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS events(
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    calendar_id TEXT NOT NULL,
+    subject TEXT,
+    start TEXT NOT NULL,
+    end TEXT NOT NULL,
+    all_day INTEGER DEFAULT 0,
+    show_as TEXT,                   -- free / tentative / busy / oof / workingElsewhere
+    categories TEXT,                -- JSON [name, ...]
+    location TEXT,
+    organizer_name TEXT, organizer_addr TEXT,
+    is_organizer INTEGER DEFAULT 0,
+    attendees TEXT,                 -- JSON [[name, address, required/optional, response], ...]
+    online_url TEXT,                -- Teams join link
+    preview TEXT,
+    response TEXT,                  -- your own: organizer / accepted / tentativelyAccepted / ...
+    cancelled INTEGER DEFAULT 0,
+    kind TEXT,                      -- singleInstance / occurrence / exception / seriesMaster
+    series_id TEXT,
+    sensitivity TEXT,
+    reminder INTEGER                -- minutes before; NULL = no reminder
+);
+CREATE INDEX IF NOT EXISTS idx_events_time ON events(calendar_id, start);
+CREATE TABLE IF NOT EXISTS categories(
+    account_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    color TEXT,                     -- #rrggbb
+    PRIMARY KEY(account_id, name)
+);
 -- Contact photos, fetched when first shown. data NULL: the person has no photo (asked at
 -- `fetched`, asked again after a week).
 CREATE TABLE IF NOT EXISTS photos(
@@ -743,6 +786,87 @@ class Store:
             args.extend([f"%{word}%"] * 2)
         sql += " ORDER BY sent + 2 * replied DESC, last_used DESC LIMIT ?"
         return self.conn.execute(sql, (*args, limit)).fetchall()
+
+    # -- calendar ----------------------------------------------------------
+    def replace_calendars(self, account_id: str, rows: list[dict]) -> None:
+        """The account's calendars, keeping which ones you chose to hide."""
+        with self.conn as c:
+            hidden = {r["id"] for r in c.execute(
+                "SELECT id FROM calendars WHERE account_id=? AND visible=0", (account_id,))}
+            gone = {r["id"] for r in c.execute(
+                "SELECT id FROM calendars WHERE account_id=?", (account_id,))} - \
+                {r["id"] for r in rows}
+            for cid in gone:
+                c.execute("DELETE FROM events WHERE calendar_id=?", (cid,))
+            c.execute("DELETE FROM calendars WHERE account_id=?", (account_id,))
+            c.executemany(
+                "INSERT INTO calendars(id, account_id, name, color, is_default, can_edit, teams,"
+                " owner, visible) VALUES(?,?,?,?,?,?,?,?,?)",
+                [(r["id"], account_id, r["name"], r["color"], r["is_default"], r["can_edit"],
+                  r["teams"], r["owner"], 0 if r["id"] in hidden else 1) for r in rows])
+
+    def calendar_rows(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM calendars ORDER BY is_default DESC, name COLLATE NOCASE").fetchall()
+
+    def calendar_row(self, calendar_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM calendars WHERE id=?",
+                                 (calendar_id,)).fetchone()
+
+    def set_calendar_visible(self, calendar_id: str, visible: bool) -> None:
+        with self.conn as c:
+            c.execute("UPDATE calendars SET visible=? WHERE id=?", (int(visible), calendar_id))
+
+    _EVENT_COLUMNS = ("id", "account_id", "calendar_id", "subject", "start", "end", "all_day",
+                      "show_as", "categories", "location", "organizer_name", "organizer_addr",
+                      "is_organizer", "attendees", "online_url", "preview", "response",
+                      "cancelled", "kind", "series_id", "sensitivity", "reminder")
+
+    def replace_events(self, calendar_id: str, start_utc: str, end_utc: str,
+                       first_day: str, last_day: str, rows: list[dict]) -> None:
+        """Make `rows` the calendar's events in a period: timed ones overlapping
+        [start_utc, end_utc), all-day ones overlapping the days [first_day, last_day)."""
+        cols = self._EVENT_COLUMNS
+        with self.conn as c:
+            c.execute("DELETE FROM events WHERE calendar_id=? AND ((all_day=0 AND start<? AND end>?)"
+                      " OR (all_day=1 AND start<? AND end>?))",
+                      (calendar_id, end_utc, start_utc, last_day, first_day))
+            c.executemany(f"INSERT OR REPLACE INTO events({','.join(cols)}) "
+                          f"VALUES({','.join('?' * len(cols))})",
+                          [tuple(r.get(k) for k in cols) for r in rows])
+
+    def upsert_event(self, row: dict) -> None:
+        cols = self._EVENT_COLUMNS
+        with self.conn as c:
+            c.execute(f"INSERT OR REPLACE INTO events({','.join(cols)}) "
+                      f"VALUES({','.join('?' * len(cols))})", tuple(row.get(k) for k in cols))
+
+    def delete_event(self, event_id: str) -> None:
+        with self.conn as c:
+            c.execute("DELETE FROM events WHERE id=?", (event_id,))
+
+    def event_row(self, event_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
+
+    def events_between(self, start_utc: str, end_utc: str, first_day: str,
+                       last_day: str) -> list[sqlite3.Row]:
+        """Events in visible calendars overlapping a period (see replace_events)."""
+        return self.conn.execute(
+            "SELECT e.*, k.color AS calendar_color FROM events e "
+            "JOIN calendars k ON k.id = e.calendar_id WHERE k.visible = 1 AND "
+            "((e.all_day=0 AND e.start<? AND e.end>?) OR (e.all_day=1 AND e.start<? AND e.end>?))"
+            " ORDER BY e.all_day DESC, e.start, e.subject COLLATE NOCASE",
+            (end_utc, start_utc, last_day, first_day)).fetchall()
+
+    def replace_categories(self, account_id: str, rows: list[tuple[str, str]]) -> None:
+        with self.conn as c:
+            c.execute("DELETE FROM categories WHERE account_id=?", (account_id,))
+            c.executemany("INSERT OR REPLACE INTO categories(account_id, name, color)"
+                          " VALUES(?,?,?)", [(account_id, n, col) for n, col in rows])
+
+    def category_colors(self) -> dict[str, str]:
+        return {r["name"]: r["color"] for r in self.conn.execute(
+            "SELECT name, color FROM categories ORDER BY name COLLATE NOCASE")}
 
     def has_body(self, message_id: str) -> bool:
         return self.conn.execute(

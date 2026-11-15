@@ -48,6 +48,14 @@ DIRECTORY_FIELDS = (
     "id,displayName,givenName,surname,mail,userPrincipalName,jobTitle,department,"
     "officeLocation,businessPhones,mobilePhone,companyName"
 )
+EVENT_FIELDS = (
+    "id,subject,start,end,isAllDay,showAs,categories,location,organizer,attendees,"
+    "isOnlineMeeting,onlineMeeting,onlineMeetingProvider,bodyPreview,isCancelled,"
+    "responseStatus,seriesMasterId,type,isOrganizer,sensitivity,reminderMinutesBeforeStart,"
+    "isReminderOn"
+)
+CALENDAR_FIELDS = ("id,name,hexColor,color,isDefaultCalendar,canEdit,"
+                   "allowedOnlineMeetingProviders,owner")
 # MAPI properties Graph has no first-class field for: PidTagLastVerbExecuted (102 replied,
 # 103 replied to all, 104 forwarded) and PidTagMessageSize (bytes).
 PROP_LAST_VERB = "Integer 0x1081"
@@ -220,6 +228,65 @@ class GraphClient:
         """Remove a folder and everything in it (recoverable only by an administrator).
         To delete the way Outlook does, move it to Deleted Items instead."""
         self._request(f"{self._root}/mailFolders/{quote(folder_id, safe='')}", method="DELETE")
+
+    # -- calendar ------------------------------------------------------
+    # Times are read and written in UTC (Prefer outlook.timezone); WaddleMail converts to local.
+    def calendars(self) -> list[dict]:
+        return list(self._paged(f"{self._root}/calendars",
+                                params={"$top": 100, "$select": CALENDAR_FIELDS}))
+
+    def calendar_view(self, calendar_id: str, start: str, end: str) -> list[dict]:
+        """Events (recurring ones expanded into occurrences) overlapping [start, end),
+        given as UTC ISO times."""
+        return list(self._paged(
+            f"{self._root}/calendars/{quote(calendar_id, safe='')}/calendarView",
+            params={"startDateTime": start, "endDateTime": end, "$top": 250,
+                    "$select": EVENT_FIELDS},
+            headers=_prefer('outlook.timezone="UTC"')))
+
+    def event_body(self, event_id: str) -> tuple[str, str]:
+        data = self._request(f"{self._root}/events/{quote(event_id, safe='')}",
+                             params={"$select": "body"}, headers=_prefer())
+        body = data.get("body") or {}
+        return (body.get("contentType") or "text").lower(), body.get("content") or ""
+
+    def save_event(self, fields: dict, event_id: str | None = None,
+                   calendar_id: str | None = None) -> dict:
+        """Create (in `calendar_id`, else the default calendar) or update an event. With
+        attendees, Exchange sends the invitations / updates."""
+        hdrs = _prefer('outlook.timezone="UTC"')
+        if event_id:
+            return self._request(f"{self._root}/events/{quote(event_id, safe='')}",
+                                 method="PATCH", json=fields, headers=hdrs)
+        url = (f"{self._root}/calendars/{quote(calendar_id, safe='')}/events" if calendar_id
+               else f"{self._root}/events")
+        return self._request(url, method="POST", json=fields, headers=hdrs)
+
+    def delete_event(self, event_id: str) -> None:
+        """Delete; for a meeting you organised this also cancels it for the attendees."""
+        self._request(f"{self._root}/events/{quote(event_id, safe='')}", method="DELETE")
+
+    def respond_event(self, event_id: str, response: str, comment: str = "") -> None:
+        """`response`: accept / tentativelyAccept / decline (the organizer is told)."""
+        self._request(f"{self._root}/events/{quote(event_id, safe='')}/{response}",
+                      method="POST", json={"comment": comment, "sendResponse": True})
+
+    def schedule(self, addresses: list[str], start: str, end: str,
+                 interval: int = 30) -> list[dict]:
+        """Free/busy for people (UTC ISO times): one entry per address with scheduleItems
+        (start, end, status) and availabilityView (a digit per `interval` minutes)."""
+        data = self._request(
+            f"{self._root}/calendar/getSchedule", method="POST",
+            json={"schedules": addresses,
+                  "startTime": {"dateTime": start.rstrip("Z"), "timeZone": "UTC"},
+                  "endTime": {"dateTime": end.rstrip("Z"), "timeZone": "UTC"},
+                  "availabilityViewInterval": interval},
+            headers=_prefer('outlook.timezone="UTC"'))
+        return data.get("value") or []
+
+    def categories(self) -> list[dict]:
+        """Your Outlook categories: displayName and color (preset0..preset24 or none)."""
+        return self._request(f"{self._root}/outlook/masterCategories").get("value") or []
 
     # -- contacts ------------------------------------------------------
     def contact_folders(self) -> list[dict]:

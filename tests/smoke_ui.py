@@ -340,6 +340,7 @@ def checks():
     status_checks()
     contacts_checks()
     contact_edit_checks()
+    calendar_checks()
 
     w.close()
     saved = Settings(str(tmp / "settings.ini"))
@@ -627,10 +628,10 @@ def contacts_checks():
     w.refresh_contacts()
     wait(800)
     w.setFocus()
-    QTest.keyClick(w, Qt.Key.Key_2, Qt.KeyboardModifier.ControlModifier)
+    QTest.keyClick(w, Qt.Key.Key_3, Qt.KeyboardModifier.ControlModifier)
     wait(100)
     check(w.pages.currentWidget() is view and w._nav["contacts"].isChecked(),
-          "Ctrl+2 / the rail switch to Contacts")
+          "Ctrl+3 / the rail switch to Contacts")
     sources = [view.sources.topLevelItem(i).text(0)
                for i in range(view.sources.topLevelItemCount())]
     check(sources == ["All contacts", "Contact groups", "Organization", "Recent recipients"]
@@ -801,6 +802,168 @@ def contact_edit_checks():
     check("c1" in server.photos_set and st.photo("c1")[0] == b"\xff\xd8JPEG"
           and st.contact_row("c1")["website"] == "priya.example",
           "contact saved with its new photo")
+    w.show_page("mail")
+
+
+class FakeCalendarServer:
+    def __init__(self):
+        today = dt.date.today()
+        self.monday = today - dt.timedelta(days=today.weekday())
+        at = lambda d, h: utc(dt.datetime.combine(self.monday + dt.timedelta(days=d),  # noqa
+                                                  dt.time(h)).astimezone())
+        self.events = {
+            "standup": {"id": "standup", "subject": "Standup", "isOrganizer": True,
+                        "start": {"dateTime": at(0, 9)}, "end": {"dateTime": at(0, 10)},
+                        "showAs": "busy", "categories": ["Blue category"]},
+            "review": {"id": "review", "subject": "Design review", "isOrganizer": False,
+                       "start": {"dateTime": at(1, 14)}, "end": {"dateTime": at(1, 15)},
+                       "organizer": {"emailAddress": {"name": "Ana Ruiz", "address": "ana@x.com"}},
+                       "attendees": [{"emailAddress": {"name": "Me", "address": "jordan@contoso.com"},
+                                      "type": "required", "status": {"response": "none"}}],
+                       "responseStatus": {"response": "notResponded"},
+                       "isOnlineMeeting": True,
+                       "onlineMeeting": {"joinUrl": "https://teams.microsoft.com/l/meetup-join/x"}},
+        }
+        self.saved, self.responses, self.schedules = [], [], []
+
+    def install(self):
+        G = graph.GraphClient
+        G.calendars = lambda c: [{"id": "cal", "name": "Calendar", "isDefaultCalendar": True,
+                                  "hexColor": "#2f9e44",
+                                  "allowedOnlineMeetingProviders": ["teamsForBusiness"]}]
+        G.categories = lambda c: [{"displayName": "Blue category", "color": "preset7"},
+                                  {"displayName": "Travel", "color": "preset4"}]
+        G.calendar_view = lambda c, cid, start, end: [
+            dict(e, start={"dateTime": e["start"]["dateTime"], "timeZone": "UTC"},
+                 end={"dateTime": e["end"]["dateTime"], "timeZone": "UTC"})
+            for e in self.events.values()
+            if e["start"]["dateTime"] < end and e["end"]["dateTime"] > start]
+        G.save_event = lambda c, fields, eid=None, cid=None: self._save(fields, eid)
+        G.delete_event = lambda c, eid: self.events.pop(eid)
+        G.respond_event = lambda c, eid, resp, comment="": self.responses.append((eid, resp))
+        G.event_body = lambda c, eid: ("text", "Full agenda")
+        G.schedule = lambda c, addresses, start, end, interval=30: self._schedule(addresses)
+
+    def _save(self, fields, eid):
+        self.saved.append(fields)
+        item = dict(self.events.get(eid, {}), **fields, id=eid or f"new{len(self.saved)}",
+                    isOrganizer=True)
+        if fields.get("isOnlineMeeting"):
+            item["onlineMeeting"] = {"joinUrl": "https://teams.microsoft.com/l/meetup-join/new"}
+        self.events[item["id"]] = item
+        return item
+
+    def _schedule(self, addresses):
+        self.schedules.append(addresses)
+        nine = dt.datetime.combine(self.monday + dt.timedelta(days=7), dt.time(9)).astimezone()
+        return [{"scheduleId": a, "scheduleItems": [
+            {"status": "busy", "start": {"dateTime": utc(nine)},
+             "end": {"dateTime": utc(nine + dt.timedelta(hours=2))}}] if a == "ana@x.com"
+            else []} for a in addresses]
+
+
+def utc(t):
+    return t.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def calendar_checks():
+    from PySide6.QtCore import QPointF
+    from waddlemail.ui.calendar_view import MONTH, DAY, WEEK
+    server = FakeCalendarServer()
+    server.install()
+    page = w.calendar_page
+    w.setFocus()
+    QTest.keyClick(w, Qt.Key.Key_2, Qt.KeyboardModifier.ControlModifier)
+    page.go_to(server.monday)
+    page.set_mode(WEEK)
+    w.refresh_calendar(calendars=True)
+    wait(600)
+    check(w.pages.currentWidget() is page and page.cal_list.count() == 1,
+          "Ctrl+2 opens the Calendar with its calendars")
+    check(sorted(e.subject for e in page.grid.events) == ["Design review", "Standup"],
+          "the week's events are shown")
+    standup = next(e for e in page.grid.events if e.id == "standup")
+    check(standup.color.name() == "#4f8cff", "an event takes its category's colour")
+    page.select_event("review")
+    check(page.accept_b.isVisible() and page.join.isVisible()
+          and "Join Teams meeting" in page.details.toHtml(),
+          "an invitation offers Accept / Tentative / Decline and the Teams link")
+    w.respond_event("review", "tentativelyAccept")
+    wait(400)
+    check(server.responses == [("review", "tentativelyAccept")], "responding to an invitation")
+    page.set_mode(MONTH)
+    check(page.stack.currentWidget() is page.month_grid and len(page.days()) == 42,
+          "month view")
+    page.set_mode(DAY)
+    check(page.days() == [server.monday], "day view")
+    page.set_mode(WEEK)
+    wait(400)
+
+    asked = []
+    real_new = w.new_event
+    w.new_event = lambda s=None, e=None, all_day=False: asked.append((s, e, all_day))
+    x = page.grid.GUTTER + page.grid._col_w() * 2.5  # the third day (the week may start Sunday)
+    y = page.grid.HOUR_H * 13 + 5                    # 13:00
+    QTest.mouseClick(page.grid, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                     QPointF(x, y).toPoint())
+    QTest.keyClick(page.grid, Qt.Key.Key_Return)
+    w.new_event = real_new
+    check(asked and asked[0][0].hour == 13 and asked[0][0].date() == page.grid.days[2]
+          and (asked[0][1] - asked[0][0]) == dt.timedelta(minutes=30),
+          "pick a time in the grid, Enter: new event there")
+
+    nine = dt.datetime.combine(server.monday + dt.timedelta(days=7), dt.time(9)).astimezone()
+    dlg = w._event_editor(start=nine, end=nine + dt.timedelta(hours=1))
+    dlg.title.setText("Budget sync")
+    dlg.required.setText("Ana Ruiz <ana@x.com>; ")
+    dlg.teams.setChecked(True)
+    dlg.show_as.setCurrentIndex(dlg.show_as.findData("workingElsewhere"))
+    dlg._category_actions["Travel"].setChecked(True)
+    dlg.tabs.setCurrentIndex(1)
+    wait(1200)  # (the editor waits half a second before asking)
+    check(server.schedules and "ana@x.com" in server.schedules[-1]
+          and "Not free then: Ana Ruiz" in dlg.sched_status.text(),
+          "scheduling: everyone's availability, and who isn't free")
+    dlg.find_free_time()
+    check(dlg._start() == nine + dt.timedelta(hours=2), "find next free time: after Ana's 9-11")
+    check(dlg.save_button.text() == "Send", "with attendees it's a meeting: Send")
+    w._save_event(dlg, None)
+    wait(400)
+    f = server.saved[-1]
+    check(f["subject"] == "Budget sync" and f["isOnlineMeeting"]
+          and f["onlineMeetingProvider"] == "teamsForBusiness"
+          and f["showAs"] == "workingElsewhere" and f["categories"] == ["Travel"]
+          and f["attendees"][0]["emailAddress"]["address"] == "ana@x.com",
+          "meeting saved: attendees, Teams, show as, category")
+    new_id = page.selected
+    row = st.event_row(new_id) if new_id else None
+    check(row is not None and row["online_url"].endswith("/new"),
+          "the new meeting comes back with its Teams link")
+
+    dlg = w._event_editor(start=nine, end=nine)
+    dlg.title.setText("Conference")
+    dlg.all_day.setChecked(True)
+    check(dlg.show_as.currentData() == "free", "all-day events default to Free")
+    w._save_event(dlg, None)
+    wait(400)
+    f = server.saved[-1]
+    day = (server.monday + dt.timedelta(days=7)).isoformat()
+    nxt = (server.monday + dt.timedelta(days=8)).isoformat()
+    check(f["isAllDay"] and f["start"]["dateTime"] == f"{day}T00:00:00"
+          and f["end"]["dateTime"] == f"{nxt}T00:00:00", "all-day event: whole days")
+
+    dlg = w._event_editor(row=st.event_row("standup"))
+    wait(300)
+    check(dlg.notes.toPlainText() == "Full agenda", "editing loads the full notes")
+    dlg.title.setText("Daily standup")
+    w._save_event(dlg, st.event_row("standup"))
+    wait(400)
+    check(server.saved[-1]["subject"] == "Daily standup" and "body" not in server.saved[-1],
+          "editing sends the change (and leaves the notes alone)")
+    w.delete_event("standup")
+    wait(400)
+    check("standup" not in server.events and st.event_row("standup") is None,
+          "delete (a meeting you organised: cancel)")
     w.show_page("mail")
 
 

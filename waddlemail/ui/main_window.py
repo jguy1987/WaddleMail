@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import sys
 
@@ -14,15 +15,19 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__, desktop, graph
+from ..calendars import event_row as calendar_event_row
 from ..contacts import personal_row, removal_payload, suggestions
 from ..graph import NO_SUBFOLDERS
 from ..mailboxes import MailboxManager
 from ..notify import make_notifier
 from ..settings import Settings
 from ..store import Store
+from ..text import body_text as _plain
 from . import iconset
 from .contacts_view import ContactsView
-from .dialogs import ComposeDialog, EventDialog, SharedMailboxDialog
+from .calendar_view import CalendarPage
+from .dialogs import ComposeDialog, SharedMailboxDialog
+from .event_editor import EventEditor
 from .folder_pane import FolderPane
 from .folder_picker import TOP, FolderPicker
 from .message_list import OUTGOING, FilterBar, MessageListView, OlderMailBar
@@ -142,8 +147,23 @@ class MainWindow(QMainWindow):
         self.contacts_view.groupDeleteRequested.connect(self.delete_group)
         self.contacts_view.photoWanted.connect(self.fetch_photo)
         self._photos_pending: set[str] = set()
+        self.calendar_page = CalendarPage(store)
+        cp = self.calendar_page
+        cp.rangeChanged.connect(lambda a, b: self._calendar_fetch_soon.start())
+        cp.newEventRequested.connect(lambda s, e, all_day: self.new_event(s, e, all_day))
+        cp.editRequested.connect(self.edit_event)
+        cp.deleteRequested.connect(self.delete_event)
+        cp.respondRequested.connect(self.respond_event)
+        cp.refreshRequested.connect(lambda: self.refresh_calendar(calendars=True))
+        cp.calendarToggled.connect(self.store.set_calendar_visible)
+        self._calendar_fetch_soon = QTimer(self)  # wait for clicking through weeks to stop
+        self._calendar_fetch_soon.setSingleShot(True)
+        self._calendar_fetch_soon.setInterval(300)
+        self._calendar_fetch_soon.timeout.connect(self.refresh_calendar)
+        self._calendar_busy = False
         self.pages = QStackedWidget()
         self.pages.addWidget(self.outer)
+        self.pages.addWidget(self.calendar_page)
         self.pages.addWidget(self.contacts_view)
         self.setCentralWidget(self.pages)
         self._contacts_busy = False
@@ -184,6 +204,9 @@ class MainWindow(QMainWindow):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.sync_current)
+        self.calendar_timer = QTimer(self)  # meetings arrive and move: every few minutes
+        self.calendar_timer.setInterval(5 * 60_000)
+        self.calendar_timer.timeout.connect(self.refresh_calendar)
         self.contacts_timer = QTimer(self)  # contacts change slowly: hourly is plenty
         self.contacts_timer.setInterval(60 * 60_000)
         self.contacts_timer.timeout.connect(self.refresh_contacts)
@@ -271,6 +294,8 @@ class MainWindow(QMainWindow):
         self._notify_new(new)  # mail that arrived while WaddleMail was closed
         self.contacts_timer.start()
         self.refresh_contacts()
+        self.calendar_timer.start()
+        self.refresh_calendar(calendars=True)
 
     # -- folders ------------------------------------------------------
     def _populate_folders(self):
@@ -694,12 +719,15 @@ class MainWindow(QMainWindow):
 
     # -- contacts -----------------------------------------------------------
     def show_page(self, page: str):
-        """"mail" or "contacts"."""
-        widget = self.contacts_view if page == "contacts" else self.outer
+        """"mail", "calendar" or "contacts"."""
+        widget = {"contacts": self.contacts_view, "calendar": self.calendar_page}.get(
+            page, self.outer)
         self.pages.setCurrentWidget(widget)
         self._nav[page].setChecked(True)
         if page == "contacts":
             self.contacts_view.search.setFocus()
+        elif page == "calendar":
+            self.calendar_page.grid.setFocus()
 
     def refresh_contacts(self):
         """Download contacts, contact groups and the directory for every account, and
@@ -1334,7 +1362,8 @@ class MainWindow(QMainWindow):
         group = QActionGroup(self)
         self._nav: dict[str, QAction] = {}
         for page, label, icon, key in (("mail", "Mail", "mail", "Ctrl+1"),
-                                       ("contacts", "Contacts", "contact", "Ctrl+2")):
+                                       ("calendar", "Calendar", "calendar", "Ctrl+2"),
+                                       ("contacts", "Contacts", "contact", "Ctrl+3")):
             act = self._themed(label, icon, lambda p=page: self.show_page(p), key,
                                tip=f"{label} ({key})")
             act.setCheckable(True)
@@ -1439,6 +1468,7 @@ class MainWindow(QMainWindow):
 
         view_menu = mb.addMenu("&View")
         view_menu.addAction(self._nav["mail"])
+        view_menu.addAction(self._nav["calendar"])
         view_menu.addAction(self._nav["contacts"])
         view_menu.addSeparator()
         pane_menu = view_menu.addMenu("&Reading pane")
@@ -1487,11 +1517,154 @@ class MainWindow(QMainWindow):
             _values = dlg.values()  # TODO: queue in outbox, then POST /me/sendMail
             self.statusBar().showMessage("Sending isn't wired up yet", 5000)
 
-    def new_event(self):
-        dlg = EventDialog(self)
+    # -- calendar ------------------------------------------------------------
+    def _calendar_boxes(self):
+        return [b for b in self.mailboxes.all() if b.calendar is not None]
+
+    def _calendar_box(self, account_id: str | None = None):
+        boxes = self._calendar_boxes()
+        return next((b for b in boxes if b.account_id == account_id),
+                    boxes[0] if boxes else None)
+
+    def refresh_calendar(self, calendars: bool = False):
+        """Fetch the events of the period the Calendar page shows (and, with `calendars`, the
+        list of calendars and categories first)."""
+        boxes = self._calendar_boxes()
+        if not boxes:
+            return
+        if self._calendar_busy:  # fetch again once this one is done
+            self._calendar_fetch_soon.start()
+            return
+        self._calendar_busy = True
+        first, last = self.calendar_page.period()
+
+        def job():
+            for box in boxes:
+                if calendars or not any(c["account_id"] == box.account_id
+                                        for c in self.store.calendar_rows()):
+                    box.calendar.sync_calendars()
+                box.calendar.fetch(first, last)
+
+        def done(_):
+            self._calendar_busy = False
+            if calendars:
+                self.calendar_page.reload_calendars()
+            self.calendar_page.reload()
+            if self.calendar_page.period() != (first, last):  # moved on meanwhile
+                self._calendar_fetch_soon.start()
+
+        def failed(_msg):
+            self._calendar_busy = False
+
+        self._run(job, done, on_failed=failed, activity="Updating calendar…")
+
+    def _event_editor(self, row=None, **kwargs) -> EventEditor:
+        box = self._calendar_box(row["account_id"] if row else None)
+        me = box.display_name if box else ""
+
+        def schedule(addresses, day, done):
+            if box is None:
+                return
+            start = dt.datetime.combine(day, dt.time()).astimezone()
+            end = start + dt.timedelta(days=1)
+            utc = lambda t: t.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
+            self._run(lambda: box.graph.schedule(addresses, utc(start), utc(end)), done,
+                      activity="Checking availability…")
+
+        dlg = EventEditor(self.store.calendar_rows(), self.store.category_colors(),
+                          suggestions(self.store), schedule, me, row=row, parent=self, **kwargs)
+        if row is not None and box is not None:  # the full notes (the list has a preview)
+            event_id = row["id"]
+            self._run(lambda: box.graph.event_body(event_id),
+                      lambda body: dlg.set_body(_plain(*body)))
+        return dlg
+
+    def new_event(self, start=None, end=None, all_day: bool = False):
+        if not self._calendar_boxes():
+            self.statusBar().showMessage("Sign in first", 4000)
+            return
+        dlg = self._event_editor(start=start, end=end, all_day=all_day)
         if dlg.exec():
-            _values = dlg.values()  # TODO: POST /me/events
-            self.statusBar().showMessage("Saving events isn't wired up yet", 5000)
+            self._save_event(dlg, None)
+
+    def edit_event(self, event_id: str):
+        row = self.store.event_row(event_id)
+        if row is None:
+            return
+        dlg = self._event_editor(row=row)
+        if dlg.exec():
+            self._save_event(dlg, row)
+
+    def _save_event(self, dlg: EventEditor, row):
+        draft, calendar_id = dlg.draft(), (row["calendar_id"] if row else dlg.calendar_id())
+        cal = self.store.calendar_row(calendar_id)
+        box = self._calendar_box(cal["account_id"] if cal else None)
+        if box is None:
+            return
+        fields = draft.fields()
+        meeting = bool(draft.required or draft.optional)
+
+        def job():
+            item = box.graph.save_event(fields, row["id"] if row else None, calendar_id)
+            self.store.upsert_event(calendar_event_row(item, box.account_id, calendar_id))
+            return item["id"]
+
+        def done(event_id: str):
+            self.calendar_page.selected = event_id
+            self.calendar_page.reload()
+            what = "Meeting sent" if meeting and row is None else (
+                "Update sent" if meeting else "Event saved")
+            self.statusBar().showMessage(what, 4000)
+
+        self._run(job, done, activity="Saving event…", on_failed=lambda msg: QMessageBox.warning(
+            self, "Calendar", f"Couldn't save the event.\n\n{msg}"))
+
+    def delete_event(self, event_id: str):
+        row = self.store.event_row(event_id)
+        box = self._calendar_box(row["account_id"] if row else None)
+        if row is None or box is None:
+            return
+        attendees = json.loads(row["attendees"] or "[]")
+        if attendees and row["is_organizer"]:
+            q = (f"Cancel \"{row['subject']}\"?\n\nThe {len(attendees)} attendee(s) are sent "
+                 "a cancellation.")
+        elif attendees:
+            q = (f"Delete \"{row['subject']}\" from your calendar?\n\nThe organizer isn't "
+                 "told; to let them know, use Decline instead.")
+        else:
+            q = f"Delete \"{row['subject']}\"?"
+        if QMessageBox.question(self, "Calendar", q) != QMessageBox.StandardButton.Yes:
+            return
+
+        def job():
+            box.graph.delete_event(event_id)
+            self.store.delete_event(event_id)
+
+        def done(_):
+            self.calendar_page.reload()
+            self.statusBar().showMessage("Deleted", 3000)
+
+        self._run(job, done, activity="Deleting event…", on_failed=lambda msg: QMessageBox.warning(
+            self, "Calendar", f"Couldn't delete the event.\n\n{msg}"))
+
+    def respond_event(self, event_id: str, response: str):
+        row = self.store.event_row(event_id)
+        box = self._calendar_box(row["account_id"] if row else None)
+        if row is None or box is None:
+            return
+        words = {"accept": "Accepted", "tentativelyAccept": "Tentatively accepted",
+                 "decline": "Declined"}
+
+        def job():
+            box.graph.respond_event(event_id, response)
+
+        def done(_):
+            self.statusBar().showMessage(f"{words[response]}: {row['subject']}", 4000)
+            self.refresh_calendar()  # the server may move a declined meeting out
+
+        self._run(job, done, activity="Sending response…",
+                  on_failed=lambda msg: QMessageBox.warning(
+                      self, "Calendar", f"Couldn't send the response.\n\n{msg}"))
 
     # -- preferences ----------------------------------------------------
     def show_preferences(self):

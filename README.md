@@ -70,7 +70,29 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   offline: they go out on the next successful sync). If the server refuses one, for example in a
   shared mailbox you can only read, it is undone locally.
 - Window size, pane layout and splitter positions are remembered.
-- **Contacts** (the rail on the far left, or Ctrl+2; Ctrl+1 back to Mail):
+- **Calendar** (the rail, or Ctrl+2):
+  - Day, Work week, Week and Month views; Today and back/forward; a mini month and your
+    calendars (tick to show/hide) on the left; the selected event's details on the right.
+  - Events are coloured by their first category (your Outlook categories and colours), else
+    by their calendar. The bar on an event's left shows its Show as, as Outlook draws it:
+    solid Busy, hatched Tentative, purple Out of office, dotted Working elsewhere, outline
+    Free. All-day events run across the top; a red line marks the time now.
+  - Drag across empty time to pick a period, then double-click or Enter (or New event) to
+    make an event there; double-click the all-day strip or a month cell for an all-day one.
+    Double-click an event to edit it; Delete removes it.
+  - Event editor: title, attendees (required and optional, completed like To), location,
+    start/end or All day, **Teams meeting** (Graph creates it and its join link; offered when
+    your account can), **Show as** (Free, Working elsewhere, Tentative, Busy, Out of office),
+    categories, reminder, calendar, private, notes. With attendees it is a meeting: Save
+    becomes Send and Exchange sends the invitations; changes send updates.
+  - **Scheduling**: everyone's free/busy for the day (getSchedule) in a grid next to the
+    meeting; click a time to move the meeting there, or **Find next free time** for the
+    first slot (weekdays 8:00-18:00) all attendees are free, optionally avoiding tentative.
+  - Invitations show Accept / Tentative / Decline (the organizer is told) and **Join Teams**.
+    Deleting a meeting you organised cancels it for the attendees.
+  - The period shown is fetched when you go to it, and refreshed every 5 minutes; recurring
+    meetings appear as their occurrences (editing one changes that occurrence).
+- **Contacts** (the rail, or Ctrl+3; Ctrl+1 is Mail):
   - Sources: all personal contacts and each contact folder, **contact groups**, the
     **organization directory**, and **recent recipients** (people you send to, from Sent
     Items, and people whose mail you replied to; most used first).
@@ -170,8 +192,9 @@ In the Entra admin center (entra.microsoft.com) > App registrations > New regist
 3. Under **Authentication**, set "Allow public client flows" to **Yes**.
 4. **API permissions** > Microsoft Graph > Delegated: `Mail.ReadWrite` (mark read, flag, move),
    `Mail.ReadWrite.Shared` (shared mailboxes and folders), `Contacts.ReadWrite` (contacts and
-   contact groups) and `User.ReadBasic.All` (the organization directory; no admin consent
-   needed). Existing users are asked to consent once more after upgrading. Sending and events will
+   contact groups), `User.ReadBasic.All` (the organization directory), `Calendars.ReadWrite`
+   (calendar, meetings, free/busy) and `MailboxSettings.Read` (your categories and colours);
+   none needs admin consent. Existing users are asked to consent once more after upgrading. Sending and events will
    need `Mail.Send` and `Calendars.ReadWrite` (add them to `SCOPES` in `config.py` as well). In your
    own tenant you can click "Grant admin consent" so users never see a prompt.
 5. Copy the **Application (client) ID**.
@@ -218,6 +241,7 @@ waddlemail/text.py         plain text from HTML bodies, for the full-text index
 waddlemail/desktop.py      app icon paths; launcher + icon install for the application menu
 waddlemail/notify.py       desktop notifications and the task manager unread badge
 waddlemail/contacts.py     contacts/directory/contact group sync, To/Cc suggestions
+waddlemail/calendars.py    calendars, events, categories, free/busy, layout and free-time search
 waddlemail/resources/      app icon (SVG + PNG sizes), tray icons, launcher template
 waddlemail/settings.py     Preferences (QSettings) and their defaults
 waddlemail/ui/             main window + menus/toolbar, preferences, new mail/event dialogs, safe rendering
@@ -229,6 +253,8 @@ waddlemail/ui/dnd.py       drag-and-drop data format and drag image
 waddlemail/ui/splash.py    splash screen
 waddlemail/ui/tray.py      system tray icon
 waddlemail/ui/status_indicator.py  connection dot and activity in the status bar
+waddlemail/ui/calendar_view.py  the Calendar page: day/week/month views and event details
+waddlemail/ui/event_editor.py  the event/meeting editor and the scheduling assistant
 waddlemail/ui/contacts_view.py  the Contacts page
 waddlemail/ui/contact_dialogs.py  contact editor (with photo), contact group editor, avatars
 waddlemail/ui/recipients.py  To/Cc field with name completion
@@ -261,7 +287,8 @@ waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 1. Real sending (`Mail.Send`) through an outbox, and deleting messages through the change
    queue (`pending` table) that read/flag/move already use.
 2. Removing a contact's photo (Graph has no call for it); photos in lists and autocomplete.
-3. Events (`Calendars.ReadWrite`), then calendar views.
+3. Calendar: recurring events (create/edit a series), reminders as notifications, shared
+   calendars of other people, room booking.
 4. Attachments and `cid:` images; search across all folders; optional background download of
    bodies so local search covers everything offline.
 5. Publisher verification of the app registration before sharing with other organizations.
