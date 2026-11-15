@@ -76,8 +76,18 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
     Items, and people whose mail you replied to; most used first).
   - Search by name, address, company, title or department; a details card with avatar,
     addresses (click to write), phones and notes; "Email everyone in this group".
-  - Personal contacts can be created, edited and deleted; directory people and recent
-    recipients can be added to your contacts. The directory and groups are read-only here.
+  - Personal contacts can be created, edited and deleted: names, up to three addresses,
+    company/title/department, phones, work and home postal addresses, nickname, birthday,
+    website, notes and a **photo** (any image; scaled down and saved as JPEG). Directory
+    people and recent recipients can be added to your contacts.
+  - **Contact groups** can be created, renamed, annotated and deleted, and members added or
+    removed in the group editor (typing completes names like the To field). "Add to group"
+    adds whoever is selected in any list, or starts a new group with them. Your contacts join
+    a group as contacts, directory people as mailboxes, other addresses as plain addresses (if
+    the server refuses a typed member, everyone in that batch is added as plain addresses).
+  - **Photos** of your contacts and directory people show in the details card. Each is
+    downloaded the first time that person is shown and then kept; people without one are
+    checked again after a week.
   - Refreshed at start-up, hourly and with Refresh. A source that can't be loaded (no
     directory for personal Microsoft accounts; contact groups if the preview API is missing)
     is named in a note instead of breaking the rest.
@@ -219,7 +229,8 @@ waddlemail/ui/dnd.py       drag-and-drop data format and drag image
 waddlemail/ui/splash.py    splash screen
 waddlemail/ui/tray.py      system tray icon
 waddlemail/ui/status_indicator.py  connection dot and activity in the status bar
-waddlemail/ui/contacts_view.py  the Contacts page and the contact editor
+waddlemail/ui/contacts_view.py  the Contacts page
+waddlemail/ui/contact_dialogs.py  contact editor (with photo), contact group editor, avatars
 waddlemail/ui/recipients.py  To/Cc field with name completion
 waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 ```
@@ -249,7 +260,7 @@ waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 
 1. Real sending (`Mail.Send`) through an outbox, and deleting messages through the change
    queue (`pending` table) that read/flag/move already use.
-2. Editing contact groups (the beta API has addMembers/deleteMembers); contact photos.
+2. Removing a contact's photo (Graph has no call for it); photos in lists and autocomplete.
 3. Events (`Calendars.ReadWrite`), then calendar views.
 4. Attachments and `cid:` images; search across all folders; optional background download of
    bodies so local search covers everything offline.

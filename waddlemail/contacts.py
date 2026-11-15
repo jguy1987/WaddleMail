@@ -28,6 +28,27 @@ def _phones(item: dict) -> list[list[str]]:
     return out
 
 
+ADDRESS_PARTS = ("street", "city", "state", "postalCode", "countryOrRegion")
+
+
+def _addresses(item: dict) -> list:
+    """[[label, {street, city, state, postalCode, countryOrRegion}], ...] for non-empty ones."""
+    out = []
+    for label, key in (("Work", "businessAddress"), ("Home", "homeAddress")):
+        a = item.get(key) or {}
+        parts = {k: a.get(k) or "" for k in ADDRESS_PARTS}
+        if any(parts.values()):
+            out.append([label, parts])
+    return out
+
+
+def format_postal(parts: dict) -> str:
+    """Street on its own line(s), then "City, State Postcode", then the country."""
+    line2 = " ".join(x for x in (", ".join(x for x in (parts.get("city"), parts.get("state"))
+                                           if x), parts.get("postalCode")) if x)
+    return "\n".join(x for x in (parts.get("street"), line2, parts.get("countryOrRegion")) if x)
+
+
 def personal_row(item: dict, account_id: str, folder_id: str, folder_name: str) -> dict:
     name = item.get("displayName") or " ".join(
         x for x in (item.get("givenName"), item.get("surname")) if x)
@@ -42,6 +63,10 @@ def personal_row(item: dict, account_id: str, folder_id: str, folder_name: str) 
         "department": item.get("department"), "office": item.get("officeLocation"),
         "emails": json.dumps(emails), "phones": json.dumps(_phones(item)),
         "notes": item.get("personalNotes"),
+        "addresses": json.dumps(_addresses(item)),
+        "birthday": (item.get("birthday") or "")[:10] or None,
+        "website": item.get("businessHomePage"),
+        "nickname": item.get("nickName"),
     }
 
 
@@ -62,8 +87,9 @@ def directory_row(user: dict, account_id: str) -> dict | None:
 
 
 def group_members(raw: list[dict], personal: dict[str, list]) -> list[list[str]]:
-    """[name, address, type] per member. The member's id is its address for mailbox and
-    one-off members; contact members carry (or point to) a contact with addresses."""
+    """[name, address, type, key, memberId] per member. The member's id (its key) is its
+    address for mailbox and one-off members; contact members carry (or point to) a contact
+    with addresses. key/memberId are what removing the member needs."""
     out = []
     for m in raw:
         kind = m.get("type") or m.get("recipientType") or ""
@@ -78,7 +104,25 @@ def group_members(raw: list[dict], personal: dict[str, list]) -> list[list[str]]
         if not address and m.get("memberId") in personal:
             emails = personal[m["memberId"]]
             address = emails[0][1] if emails else ""
-        out.append([name or address, address, kind])
+        out.append([name or address, address, kind, key, m.get("memberId") or ""])
+    return out
+
+
+def member_payload(name: str, address: str, source: str) -> dict:
+    """How to add someone to a contact group: one of your contacts, a directory mailbox, or
+    just an address."""
+    kind = {PERSONAL: "contact", DIRECTORY: "mailbox"}.get(source, "oneOff")
+    return {"displayName": name or address, "key": address, "type": kind}
+
+
+def removal_payload(member: list) -> dict:
+    """Identify a stored member ([name, address, type, key, memberId]) for deleteMembers."""
+    address = member[1]
+    kind = (member[2] if len(member) > 2 else "") or "oneOff"  # (older records lack fields)
+    key = member[3] if len(member) > 3 and member[3] else address
+    out = {"type": kind, "key": key}
+    if len(member) > 4 and member[4]:
+        out["memberId"] = member[4]
     return out
 
 
@@ -130,6 +174,12 @@ class ContactSync:
         self.store.replace_contacts(self.account_id, DIRECTORY, rows)
         return len(rows)
 
+    def photo(self, contact_id: str, folder_id: str | None = None) -> bytes | None:
+        """Fetch a photo and cache it (also "no photo", so it isn't asked again soon)."""
+        data = self.graph.photo(contact_id, folder_id)
+        self.store.set_photo(contact_id, data)
+        return data
+
     def sync_groups(self) -> int:
         personal = {r["id"]: json.loads(r["emails"] or "[]")
                     for r in self.store.contacts(PERSONAL)}
@@ -176,8 +226,8 @@ def suggestions(store: Store) -> list[Suggestion]:
     for source in (PERSONAL, "group", DIRECTORY):
         if source == "group":
             for g in store.groups():
-                members = [format_address(n, a) for n, a, _ in json.loads(g["members"] or "[]")
-                           if a]
+                members = [format_address(m[0], m[1]) for m in json.loads(g["members"] or "[]")
+                           if m[1]]
                 if members:
                     out.append(Suggestion(f"{g['name']} (group, {len(members)})", members,
                                           "group", g["name"].lower()))

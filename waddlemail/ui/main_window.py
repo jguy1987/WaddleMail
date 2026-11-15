@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__, desktop, graph
-from ..contacts import personal_row, suggestions
+from ..contacts import personal_row, removal_payload, suggestions
 from ..graph import NO_SUBFOLDERS
 from ..mailboxes import MailboxManager
 from ..notify import make_notifier
@@ -133,11 +133,15 @@ class MainWindow(QMainWindow):
         self.outer.setStretchFactor(1, 1)  # resizing the window grows the mail, not the folders
         self.outer.setSizes([240, 960])
         # Mail and Contacts are pages of one window, switched with the rail on the left.
-        self.contacts_view = ContactsView(store)
+        self.contacts_view = ContactsView(store, lambda: suggestions(self.store))
         self.contacts_view.composeRequested.connect(lambda to: self.new_mail(to))
         self.contacts_view.refreshRequested.connect(self.refresh_contacts)
         self.contacts_view.saveRequested.connect(self.save_contact)
         self.contacts_view.deleteRequested.connect(self.delete_contact)
+        self.contacts_view.groupSaveRequested.connect(self.save_group)
+        self.contacts_view.groupDeleteRequested.connect(self.delete_group)
+        self.contacts_view.photoWanted.connect(self.fetch_photo)
+        self._photos_pending: set[str] = set()
         self.pages = QStackedWidget()
         self.pages.addWidget(self.outer)
         self.pages.addWidget(self.contacts_view)
@@ -738,7 +742,8 @@ class MainWindow(QMainWindow):
         own = [b for b in self.mailboxes.all() if b.contacts is not None]
         return next((b for b in own if b.account_id == account_id), own[0] if own else None)
 
-    def save_contact(self, fields: dict, contact_id: str, folder_id: str, folder_name: str):
+    def save_contact(self, fields: dict, contact_id: str, folder_id: str, folder_name: str,
+                     photo: bytes | None = None):
         row = self.store.contact_row(contact_id) if contact_id else None
         box = self._contacts_box(row["account_id"] if row else None)
         if box is None:
@@ -747,6 +752,9 @@ class MainWindow(QMainWindow):
         def job():
             item = box.graph.save_contact(fields, contact_id or None, folder_id or None)
             self.store.upsert_contact(personal_row(item, box.account_id, folder_id, folder_name))
+            if photo:
+                box.graph.set_contact_photo(item["id"], photo, folder_id or None)
+                self.store.set_photo(item["id"], photo)
             return item["id"]
 
         def done(new_id: str):
@@ -778,6 +786,79 @@ class MainWindow(QMainWindow):
         self._run(job, done, activity="Deleting contact…",
                   on_failed=lambda msg: QMessageBox.warning(
                       self, "Contacts", f"Couldn't delete the contact.\n\n{msg}"))
+
+    def fetch_photo(self, contact_id: str, folder_id: str):
+        """Download a contact's (or directory person's) photo once; the view redraws."""
+        row = self.store.contact_row(contact_id)
+        box = self._contacts_box(row["account_id"] if row else None)
+        if box is None or contact_id in self._photos_pending:
+            return
+        self._photos_pending.add(contact_id)
+
+        def done(_):
+            self._photos_pending.discard(contact_id)
+            self.contacts_view.photo_arrived(contact_id)
+
+        def failed(_msg):
+            self._photos_pending.discard(contact_id)
+
+        self._run(lambda: box.contacts.photo(contact_id, folder_id or None), done,
+                  on_failed=failed)
+
+    def save_group(self, group_id: str, name: str, notes: str, add: list, remove: list):
+        """Create a contact group (no `group_id`) or change one: name, notes, members to add
+        (addMembers payloads) and stored members to remove."""
+        g = self.store.group_row(group_id) if group_id else None
+        box = self._contacts_box(g["account_id"] if g else None)
+        if box is None:
+            return
+
+        def job():
+            gid = group_id
+            if not gid:
+                gid = box.graph.create_group(name, notes)["id"]
+            elif (name, notes) != (g["name"], g["notes"] or ""):
+                box.graph.update_group(gid, name, notes)
+            box.graph.remove_group_members(gid, [removal_payload(m) for m in remove])
+            box.graph.add_group_members(gid, add)
+            box.contacts.sync_groups()  # read back members as the server now has them
+            return gid
+
+        def done(gid: str):
+            self.contacts_view.reload()
+            self.contacts_view.show_source("groups")
+            self.contacts_view.select_key(("group", gid))
+            self.statusBar().showMessage(f"Saved group {name}", 3000)
+
+        self._run(job, done, activity="Saving contact group…",
+                  on_failed=lambda msg: self._group_failed(f"Couldn't save {name}.\n\n{msg}"))
+
+    def delete_group(self, group_id: str):
+        g = self.store.group_row(group_id)
+        box = self._contacts_box(g["account_id"] if g else None)
+        if g is None or box is None:
+            return
+        if QMessageBox.question(self, "Delete contact group",
+                                f"Delete the group {g['name']}?\n\nThe people in it stay in "
+                                "your contacts.") != QMessageBox.StandardButton.Yes:
+            return
+
+        def job():
+            box.graph.delete_group(group_id)
+            self.store.delete_group(group_id)
+
+        def done(_):
+            self.contacts_view.reload()
+            self.statusBar().showMessage(f"Deleted group {g['name']}", 3000)
+
+        self._run(job, done, activity="Deleting contact group…",
+                  on_failed=lambda msg: self._group_failed(
+                      f"Couldn't delete {g['name']}.\n\n{msg}"))
+
+    def _group_failed(self, text: str):
+        self.contacts_view.reload()
+        QMessageBox.warning(self, "Contact groups",
+                            text + "\n\n(Contact groups use Microsoft's preview API.)")
 
     # -- move / copy --------------------------------------------------------
     def _pick_folder(self, mailbox_id: str, title: str, prompt: str, parent=None,

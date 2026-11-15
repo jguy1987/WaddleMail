@@ -41,7 +41,8 @@ MESSAGE_FIELDS = (
 )
 CONTACT_FIELDS = (
     "id,displayName,givenName,surname,emailAddresses,businessPhones,mobilePhone,homePhones,"
-    "companyName,jobTitle,department,officeLocation,personalNotes,parentFolderId"
+    "companyName,jobTitle,department,officeLocation,personalNotes,parentFolderId,"
+    "businessAddress,homeAddress,birthday,businessHomePage,nickName"
 )
 DIRECTORY_FIELDS = (
     "id,displayName,givenName,surname,mail,userPrincipalName,jobTitle,department,"
@@ -101,14 +102,16 @@ class GraphClient:
         return url if url.startswith("http") else self._base + url
 
     def _request(self, url: str, params: dict | None = None, headers: dict | None = None,
-                 retries: int = 5, method: str = "GET", json: dict | None = None) -> dict:
+                 retries: int = 5, method: str = "GET", json: dict | None = None,
+                 data: bytes | None = None, raw: bool = False):
+        """JSON in and out; or `data` bytes in and, with `raw`, the response bytes out."""
         full = self._url(url)
         refreshed = False
         for attempt in range(retries):
             try:
                 hdrs = {"Authorization": f"Bearer {self._token()}", **(headers or {})}
                 r = self._s.request(method, full, params=params, headers=hdrs, json=json,
-                                    timeout=30)
+                                    data=data, timeout=30)
             except AuthError as exc:
                 _report(SIGNIN, str(exc))
                 raise
@@ -128,6 +131,8 @@ class GraphClient:
                 raise DeltaResetError("sync state expired", 410)
             if not r.ok:
                 raise GraphError(f"Graph {r.status_code}: {r.text[:300]}", r.status_code)
+            if raw:
+                return r.content
             return r.json() if r.text else {}
         raise GraphError("Graph request failed after retries")
 
@@ -258,14 +263,74 @@ class GraphClient:
                 break
         return out
 
+    # -- photos --------------------------------------------------------
+    def _photo_url(self, contact_id: str, folder_id: str | None = None) -> str:
+        if contact_id.startswith("dir:"):  # a directory person
+            return f"/users/{quote(contact_id[4:], safe='')}/photo/$value"
+        if folder_id:
+            return (f"{self._root}/contactFolders/{quote(folder_id, safe='')}/contacts/"
+                    f"{quote(contact_id, safe='')}/photo/$value")
+        return f"{self._root}/contacts/{quote(contact_id, safe='')}/photo/$value"
+
+    def photo(self, contact_id: str, folder_id: str | None = None) -> bytes | None:
+        """The photo of a contact or directory person (JPEG/PNG bytes), or None."""
+        try:
+            return self._request(self._photo_url(contact_id, folder_id), raw=True) or None
+        except GraphError as exc:
+            if exc.status in (404, 400):  # no photo
+                return None
+            raise
+
+    def set_contact_photo(self, contact_id: str, image: bytes,
+                          folder_id: str | None = None) -> None:
+        self._request(self._photo_url(contact_id, folder_id), method="PUT", data=image,
+                      headers={"Content-Type": "image/jpeg"})
+
+    # -- contact groups (beta) -------------------------------------------
+    def _groups_url(self, group_id: str | None = None) -> str:
+        beta = self._base.rsplit("/", 1)[0] + "/beta"
+        url = f"{beta}{self._root}/distributionLists"
+        return url + f"/{quote(group_id, safe='')}" if group_id else url
+
+    def create_group(self, name: str, notes: str = "") -> dict:
+        return self._request(self._groups_url(), method="POST",
+                             json={"displayName": name, "notes": notes}, headers=_prefer())
+
+    def update_group(self, group_id: str, name: str, notes: str) -> dict:
+        return self._request(self._groups_url(group_id), method="PATCH",
+                             json={"displayName": name, "notes": notes}, headers=_prefer())
+
+    def delete_group(self, group_id: str) -> None:
+        self._request(self._groups_url(group_id), method="DELETE")
+
+    def add_group_members(self, group_id: str, members: list[dict]) -> None:
+        """`members`: {"displayName", "key" (address), "type"}. If the server won't take a
+        member as a contact or mailbox, add everyone as plain addresses (oneOff) instead."""
+        if not members:
+            return
+        url = self._groups_url(group_id) + "/addMembers"
+        try:
+            self._request(url, method="POST", json={"members": members})
+        except GraphError as exc:
+            if exc.status != 400 or all(m["type"] == "oneOff" for m in members):
+                raise
+            log.info("addMembers refused typed members (%s); adding as addresses", exc)
+            plain = [{**m, "type": "oneOff"} for m in members]
+            plain = [{k: v for k, v in m.items() if k != "memberId"} for m in plain]
+            self._request(url, method="POST", json={"members": plain})
+
+    def remove_group_members(self, group_id: str, members: list[dict]) -> None:
+        """`members`: {"type", "key" and/or "memberId"} as the group listed them."""
+        if members:
+            self._request(self._groups_url(group_id) + "/deleteMembers", method="POST",
+                          json={"members": members})
+
     def contact_groups(self) -> list[dict]:
         """Personal contact groups with their members. Microsoft Graph only offers these in
         its beta API (distributionLists, since 2026), so this may change or be missing."""
-        beta = self._base.rsplit("/", 1)[0] + "/beta"
-        groups = list(self._paged(f"{beta}{self._root}/distributionLists",
-                                  params={"$top": 100}, headers=_prefer()))
+        groups = list(self._paged(self._groups_url(), params={"$top": 100}, headers=_prefer()))
         for g in groups:
-            url = f"{beta}{self._root}/distributionLists/{quote(g['id'], safe='')}"
+            url = self._groups_url(g["id"])
             try:  # members with their contacts' addresses, if the server can nest that
                 full = self._request(url, params={"$expand": "members($expand=contact)"},
                                      headers=_prefer())

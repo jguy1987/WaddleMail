@@ -10,7 +10,7 @@ class Recorder:
     def __init__(self):
         self.calls = []
 
-    def request(self, method, url, params=None, headers=None, json=None, timeout=None):
+    def request(self, method, url, params=None, headers=None, json=None, timeout=None, data=None):
         self.calls.append((method, url.removeprefix("https://graph.microsoft.com/v1.0"), json))
         if method == "DELETE":
             return FakeResponse(204, "")
@@ -111,7 +111,7 @@ def test_move_is_sent_or_undone(tmp_path):
 
 def test_older_messages_request():
     class Session:
-        def request(self, method, url, params=None, headers=None, json=None, timeout=None):
+        def request(self, method, url, params=None, headers=None, json=None, timeout=None, data=None):
             self.params = params
             return FakeResponse(200, {"value": [{"id": str(i)} for i in range(100)],
                                       "@odata.nextLink": "https://graph.microsoft.com/v1.0/n"})

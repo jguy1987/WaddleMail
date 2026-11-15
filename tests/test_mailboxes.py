@@ -24,7 +24,7 @@ class FakeSession:
     def __init__(self, routes: dict):
         self.routes, self.calls = routes, []
 
-    def request(self, method, url, params=None, headers=None, json=None, timeout=None):
+    def request(self, method, url, params=None, headers=None, json=None, timeout=None, data=None):
         path = url.removeprefix("https://graph.microsoft.com/v1.0")
         self.calls.append((method, path, json))
         status, body = self.routes.get((method, path), (404, {"error": "not found"}))

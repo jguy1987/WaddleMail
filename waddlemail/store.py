@@ -92,7 +92,11 @@ CREATE TABLE IF NOT EXISTS contacts(
     company TEXT, job_title TEXT, department TEXT, office TEXT,
     emails TEXT,                    -- JSON [[name, address], ...]
     phones TEXT,                    -- JSON [[label, number], ...]
-    notes TEXT
+    notes TEXT,
+    addresses TEXT,                 -- JSON [[label, multi-line postal address], ...]
+    birthday TEXT,                  -- YYYY-MM-DD
+    website TEXT,
+    nickname TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_contacts_source ON contacts(source, account_id);
 -- Personal contact groups (Outlook "contact lists").
@@ -101,7 +105,14 @@ CREATE TABLE IF NOT EXISTS contact_groups(
     account_id TEXT NOT NULL,
     name TEXT NOT NULL,
     notes TEXT,
-    members TEXT                    -- JSON [[name, address, type], ...]
+    members TEXT                    -- JSON [[name, address, type, key, memberId], ...]
+);
+-- Contact photos, fetched when first shown. data NULL: the person has no photo (asked at
+-- `fetched`, asked again after a week).
+CREATE TABLE IF NOT EXISTS photos(
+    id TEXT PRIMARY KEY,            -- contact id, or "dir:" + directory user id
+    data BLOB,
+    fetched REAL NOT NULL
 );
 -- People you send to and reply to, for the Recent list and autocomplete.
 CREATE TABLE IF NOT EXISTS recipients(
@@ -245,6 +256,10 @@ class Store:
         for col in ("mailbox_id", "well_known"):
             if col not in cols:
                 self.conn.execute(f"ALTER TABLE folders ADD COLUMN {col} TEXT")
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(contacts)")}
+        for col in ("addresses", "birthday", "website", "nickname"):
+            if col not in cols:
+                self.conn.execute(f"ALTER TABLE contacts ADD COLUMN {col} TEXT")
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(messages)")}
         missing = {c: t for c, t in _NEW_MESSAGE_COLUMNS.items() if c not in cols}
         for col, sqltype in missing.items():
@@ -594,7 +609,8 @@ class Store:
     # -- contacts ----------------------------------------------------------
     _CONTACT_COLUMNS = ("id", "account_id", "source", "folder_id", "folder_name",
                         "display_name", "given_name", "surname", "company", "job_title",
-                        "department", "office", "emails", "phones", "notes")
+                        "department", "office", "emails", "phones", "notes", "addresses",
+                        "birthday", "website", "nickname")
 
     def replace_contacts(self, account_id: str, source: str, rows: list[dict]) -> None:
         """Make `rows` the account's whole set of contacts from `source`."""
@@ -615,6 +631,19 @@ class Store:
     def delete_contact(self, contact_id: str) -> None:
         with self.conn as c:
             c.execute("DELETE FROM contacts WHERE id=?", (contact_id,))
+            c.execute("DELETE FROM photos WHERE id=?", (contact_id,))
+
+    # -- photos ------------------------------------------------------------
+    def photo(self, contact_id: str) -> tuple[bytes | None, float] | None:
+        """(image bytes or None for "has no photo", when asked), or None if never asked."""
+        row = self.conn.execute("SELECT data, fetched FROM photos WHERE id=?",
+                                (contact_id,)).fetchone()
+        return (row["data"], row["fetched"]) if row else None
+
+    def set_photo(self, contact_id: str, data: bytes | None) -> None:
+        with self.conn as c:
+            c.execute("INSERT OR REPLACE INTO photos(id, data, fetched) VALUES(?,?,?)",
+                      (contact_id, data, time.time()))
 
     def contact_row(self, contact_id: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM contacts WHERE id=?", (contact_id,)).fetchone()
@@ -657,6 +686,16 @@ class Store:
             sql += " AND (name LIKE ? OR members LIKE ?)"
             args.extend([f"%{word}%"] * 2)
         return self.conn.execute(sql + " ORDER BY name COLLATE NOCASE", args).fetchall()
+
+    def upsert_group(self, account_id: str, group: dict) -> None:
+        with self.conn as c:
+            c.execute("INSERT OR REPLACE INTO contact_groups(id, account_id, name, notes, members)"
+                      " VALUES(?,?,?,?,?)", (group["id"], account_id, group["name"],
+                                             group.get("notes"), json.dumps(group["members"])))
+
+    def delete_group(self, group_id: str) -> None:
+        with self.conn as c:
+            c.execute("DELETE FROM contact_groups WHERE id=?", (group_id,))
 
     def group_row(self, group_id: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM contact_groups WHERE id=?",

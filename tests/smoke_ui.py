@@ -66,7 +66,7 @@ graph.GraphClient.save_contact = _save_contact
 graph.GraphClient.delete_contact = lambda self, cid: None
 
 
-def offline(self, url, params=None, headers=None, retries=5, method="GET", json=None):
+def offline(self, url, params=None, headers=None, retries=5, method="GET", json=None, **kw):
     raise graph.GraphError("offline", 503)
 
 
@@ -339,6 +339,7 @@ def checks():
     older_mail_checks()
     status_checks()
     contacts_checks()
+    contact_edit_checks()
 
     w.close()
     saved = Settings(str(tmp / "settings.ini"))
@@ -677,6 +678,129 @@ def contacts_checks():
           "choosing a group inserts all its members after what was typed")
     comp.setCompletionPrefix("contoso")
     check(comp.completionCount() >= 1, "a company name finds its people")
+    w.show_page("mail")
+
+
+class FakeGroupServer:
+    """Contact groups and photos as the server would keep them."""
+
+    def __init__(self):
+        self.groups = [{"id": g["id"], "displayName": g["displayName"], "notes": "",
+                        "members": list(g["members"])} for g in _fake_contacts.contact_groups()]
+        self.photos_set = []
+
+    def install(self):
+        G = graph.GraphClient
+        G.contact_groups = lambda c: [dict(g) for g in self.groups]
+        G.create_group = lambda c, name, notes="": self._create(name, notes)
+        G.update_group = lambda c, gid, name, notes: self._group(gid).update(
+            displayName=name, notes=notes)
+        G.delete_group = lambda c, gid: self.groups.remove(self._group(gid))
+        G.add_group_members = lambda c, gid, ms: self._group(gid)["members"].extend(
+            {"id": m["key"], "displayName": m["displayName"], "type": m["type"]} for m in ms)
+        G.remove_group_members = lambda c, gid, ms: self._group(gid).update(members=[
+            m for m in self._group(gid)["members"]
+            if m["id"] not in {x.get("key") for x in ms}])
+        G.photo = lambda c, cid, folder=None: self._photo(cid)
+        G.set_contact_photo = lambda c, cid, data, folder=None: self.photos_set.append(cid)
+
+    def _create(self, name, notes):
+        g = {"id": f"g{len(self.groups) + 1}x", "displayName": name, "notes": notes,
+             "members": []}
+        self.groups.append(g)
+        return {"id": g["id"]}
+
+    def _group(self, gid):
+        return next(g for g in self.groups if g["id"] == gid)
+
+    @staticmethod
+    def _photo(cid):
+        if cid != "c1":
+            return None
+        from PySide6.QtCore import QBuffer, QByteArray, QIODevice
+        from PySide6.QtGui import QColor, QImage
+        img = QImage(40, 40, QImage.Format.Format_RGB32)
+        img.fill(QColor("#336699"))
+        data = QByteArray()
+        buf = QBuffer(data)
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        img.save(buf, "PNG")
+        return bytes(data)
+
+
+def contact_edit_checks():
+    import json as _json
+    from waddlemail.contacts import suggestions
+    from waddlemail.ui.contact_dialogs import ContactDialog, GroupDialog
+    server = FakeGroupServer()
+    server.install()
+    view = w.contacts_view
+    w.show_page("contacts")
+    view.show_source("all")
+    view.select_contact("c1")
+    wait(500)
+    check(st.photo("c1") and st.photo("c1")[0], "a contact's photo is fetched and cached")
+    view.show_source("directory")
+    wait(500)
+    check(st.photo("dir:u1") is not None and st.photo("dir:u1")[0] is None,
+          "no photo is remembered too (not asked again for a week)")
+
+    w.save_group("", "Book club", "Monthly", [
+        {"displayName": "Bo Chan", "key": "bo@y.org", "type": "contact"}], [])
+    wait(400)
+    club = next((g for g in st.groups() if g["name"] == "Book club"), None)
+    check(club is not None and "bo@y.org" in club["members"]
+          and view.selected_keys() == [("group", club["id"])],
+          "new contact group created with a member, and shown")
+
+    dlg = GroupDialog(suggestions(st), group=club)
+    dlg.add_edit.setText("ana@x.com; Mom Lee <mom@home.net>")
+    dlg._add_typed()
+    dlg.members.item(0).setSelected(True)  # Bo
+    dlg._remove_selected()
+    added, removed = dlg.changes()
+    check([m[1] for m in added] == ["ana@x.com", "mom@home.net"]
+          and [m[1] for m in removed] == ["bo@y.org"]
+          and added[0][2] == "directory" and added[1][2] == "personal",
+          "group editor: typed members added (knowing where they came from), one removed")
+    from waddlemail.contacts import member_payload
+    w.save_group(club["id"], "Book club", "Monthly",
+                 [member_payload(m[0], m[1], m[2]) for m in added], removed)
+    wait(400)
+    members = [m[1] for m in _json.loads(st.group_row(club["id"])["members"])]
+    check(sorted(members) == ["ana@x.com", "mom@home.net"], "group members changed on the server")
+
+    view.add_to_group(club["id"], [("Priya Shah", "priya@x.com", "personal"),
+                                    ("Ana Ruiz", "ana@x.com", "directory")])  # Ana: already in
+    wait(400)
+    members = [m[1] for m in _json.loads(st.group_row(club["id"])["members"])]
+    check(sorted(members) == ["ana@x.com", "mom@home.net", "priya@x.com"],
+          "Add to group adds only who isn't in it yet")
+
+    w.save_group(club["id"], "Readers", "", [], [])
+    wait(400)
+    check(st.group_row(club["id"])["name"] == "Readers", "group renamed")
+    w.delete_group(club["id"])
+    wait(400)
+    check(st.group_row(club["id"]) is None and all(g["id"] != club["id"] for g in server.groups),
+          "group deleted")
+
+    row = st.contact_row("c1")
+    dlg = ContactDialog([("", "Contacts")], row=row)
+    dlg.has_birthday.setChecked(True)
+    from PySide6.QtCore import QDate
+    dlg.birthday.setDate(QDate(1985, 7, 4))
+    dlg.home_address.city.setText("Springfield")
+    dlg.website.setText("priya.example")
+    v = dlg.values()
+    check(v["birthday"] == "1985-07-04T11:59:00Z" and v["homeAddress"]["city"] == "Springfield"
+          and v["businessHomePage"] == "priya.example" and v["mobilePhone"] == "+1 555 0199",
+          "contact editor: birthday, address, website (and existing fields kept)")
+    w.save_contact(v, "c1", "", "Contacts", b"\xff\xd8JPEG")
+    wait(400)
+    check("c1" in server.photos_set and st.photo("c1")[0] == b"\xff\xd8JPEG"
+          and st.contact_row("c1")["website"] == "priya.example",
+          "contact saved with its new photo")
     w.show_page("mail")
 
 

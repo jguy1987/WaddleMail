@@ -149,3 +149,95 @@ def test_split_addresses():
     from waddlemail.ui.recipients import split_addresses
     assert split_addresses('Ann <a@x>; "Lee, Bo" <b@x>, c@x; ') == [
         "Ann <a@x>", '"Lee, Bo" <b@x>', "c@x"]
+
+
+def test_more_contact_fields():
+    from waddlemail.contacts import format_postal
+    r = personal_row({"id": "c", "displayName": "A", "birthday": "1990-04-02T11:59:00Z",
+                      "businessHomePage": "x.com", "nickName": "Al",
+                      "homeAddress": {"street": "1 Main St", "city": "Springfield",
+                                      "state": "IL", "postalCode": "62701"}}, "a", "", "C")
+    assert (r["birthday"], r["website"], r["nickname"]) == ("1990-04-02", "x.com", "Al")
+    [[label, parts]] = json.loads(r["addresses"])
+    assert label == "Home" and format_postal(parts) == "1 Main St\nSpringfield, IL 62701"
+
+
+def test_member_identity_round_trip():
+    from waddlemail.contacts import member_payload, removal_payload
+    [ana, priya, _] = group_members(FakeGraph().contact_groups()[0]["members"],
+                                    {"c1": [["Priya", "priya@x.com"]]})
+    assert removal_payload(ana) == {"type": "mailbox", "key": "ana@x.com"}
+    assert removal_payload(priya) == {"type": "contact", "key": "k1", "memberId": "c1"}
+    assert removal_payload(["Old", "o@x"]) == {"type": "oneOff", "key": "o@x"}  # older format
+    assert member_payload("Bo", "bo@y.org", "personal")["type"] == "contact"
+    assert member_payload("Ana", "ana@x.com", "directory")["type"] == "mailbox"
+    assert member_payload("", "z@z", "recent") == {"displayName": "z@z", "key": "z@z",
+                                                   "type": "oneOff"}
+
+
+class Recorder:
+    def __init__(self, fail=None):
+        self.calls, self.fail = [], fail or {}
+
+    def request(self, method, url, params=None, headers=None, json=None, data=None, **kw):
+        path = url.split("graph.microsoft.com")[1]
+        self.calls.append((method, path, json, data, (headers or {}).get("Content-Type")))
+        status = self.fail.pop((method, path), None)
+        if status:
+            return FakeResponse(status, {"error": "no"})
+        if path.endswith("/photo/$value") and method == "GET":
+            resp = FakeResponse(200, {})
+            resp.content, resp.text = b"\x89PNG", "x"
+            return resp
+        return FakeResponse(200, {"id": "G1"} if method != "DELETE" else "")
+
+
+def test_group_and_photo_requests():
+    s = Recorder({("POST", "/beta/me/distributionLists/G1/addMembers"): 400,
+                  ("GET", "/v1.0/users/u9/photo/$value"): 404})
+    g = GraphClient(lambda: "t", session=s)
+    assert g.create_group("Team", "n")["id"] == "G1"
+    g.update_group("G1", "Team 2", "")
+    g.add_group_members("G1", [{"displayName": "Bo", "key": "bo@y", "type": "contact"}])
+    g.remove_group_members("G1", [{"type": "mailbox", "key": "a@x"}])
+    g.delete_group("G1")
+    assert g.photo("dir:u9") is None                 # no photo: not an error
+    assert g.photo("c1", "fam") == b"\x89PNG"
+    g.set_contact_photo("c1", b"JPEG")
+    calls = [(m, p) for m, p, *_ in s.calls]
+    assert calls == [
+        ("POST", "/beta/me/distributionLists"),
+        ("PATCH", "/beta/me/distributionLists/G1"),
+        ("POST", "/beta/me/distributionLists/G1/addMembers"),   # refused as "contact"...
+        ("POST", "/beta/me/distributionLists/G1/addMembers"),   # ...so again as an address
+        ("POST", "/beta/me/distributionLists/G1/deleteMembers"),
+        ("DELETE", "/beta/me/distributionLists/G1"),
+        ("GET", "/v1.0/users/u9/photo/$value"),
+        ("GET", "/v1.0/me/contactFolders/fam/contacts/c1/photo/$value"),
+        ("PUT", "/v1.0/me/contacts/c1/photo/$value"),
+    ]
+    assert s.calls[3][2]["members"][0]["type"] == "oneOff"
+    assert s.calls[-1][3:] == (b"JPEG", "image/jpeg")
+
+
+def test_photo_cache_and_contacts_upgrade(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    c = sqlite3.connect(path)  # a contacts table from before the extra columns
+    c.execute("CREATE TABLE contacts(id TEXT PRIMARY KEY, account_id TEXT NOT NULL, source TEXT"
+              " NOT NULL, folder_id TEXT, folder_name TEXT, display_name TEXT NOT NULL,"
+              " given_name TEXT, surname TEXT, company TEXT, job_title TEXT, department TEXT,"
+              " office TEXT, emails TEXT, phones TEXT, notes TEXT)")
+    c.commit()
+    c.close()
+    st = Store(path)
+    st.upsert_contact(personal_row({"id": "c", "displayName": "A", "nickName": "Al"},
+                                   "a", "", "C"))
+    assert st.contact_row("c")["nickname"] == "Al"
+    assert st.photo("c") is None
+    st.set_photo("c", None)            # asked; has none
+    assert st.photo("c")[0] is None
+    st.set_photo("c", b"img")
+    assert st.photo("c")[0] == b"img"
+    st.delete_contact("c")
+    assert st.photo("c") is None
