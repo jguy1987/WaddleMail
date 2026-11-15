@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <title>WaddleMail - badge</title>
+  <circle cx="64" cy="64" r="60" fill="#27346b"/>
+  <ellipse cx="64" cy="86" rx="30" ry="34" fill="#f2f4ff"/>
+  <circle cx="51" cy="46" r="7.5" fill="#f2f4ff"/>
+  <circle cx="77" cy="46" r="7.5" fill="#f2f4ff"/>
+  <circle cx="52.5" cy="47" r="3.6" fill="#1b2450"/>
+  <circle cx="75.5" cy="47" r="3.6" fill="#1b2450"/>
+  <path d="M56 55Q64 50 72 55Q64 68 56 55Z" fill="#ff8a5b"/>
+  <rect x="43" y="80" width="42" height="28" rx="4" fill="#4f8cff"/>
+  <path d="M44.5 83.5L64 99L83.5 83.5" fill="none" stroke="#fff" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="64" cy="64" r="58" fill="none" stroke="#4f8cff" stroke-width="4"/>
+</svg>

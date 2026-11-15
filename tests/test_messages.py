@@ -149,3 +149,19 @@ def test_one_stuck_change_does_not_block_the_rest(tmp_path):
         pass
     assert G.sent == ["m2"]
     assert [c["message_id"] for c in st.pending_changes("a")] == ["m1"]
+
+
+def test_new_messages_are_reported_only_on_incremental_sync(tmp_path):
+    st = make_store(tmp_path, msg("m1"))
+
+    class G:
+        def __init__(self, pages):
+            self.pages = pages
+
+        def messages_delta(self, folder_id, link, since):
+            yield from self.pages
+
+    eng = SyncEngine(st, G([([msg("m2"), msg("m3")], "L1")]), "a")
+    assert eng.sync_folder("F").new_ids == []  # first sync: everything is "new"
+    eng.graph = G([([msg("m3", subject="edited"), msg("m4")], "L2")])
+    assert eng.sync_folder("F").new_ids == ["m4"]  # m3 was only updated

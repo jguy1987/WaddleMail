@@ -28,6 +28,25 @@ from waddlemail.settings import Settings  # noqa: E402
 from waddlemail.store import Store  # noqa: E402
 from waddlemail.ui.main_window import MainWindow  # noqa: E402
 from waddlemail.ui.message_list import COL, NODE_ROLE  # noqa: E402
+from waddlemail.notify import Notifier  # noqa: E402
+import waddlemail.ui.main_window as main_window_module  # noqa: E402
+
+
+class RecordingNotifier(Notifier):
+    """Stands in for desktop notifications, so the test doesn't pop any up."""
+
+    def __init__(self):
+        super().__init__()
+        self.sent, self.badges = [], []
+
+    def notify(self, summary, body, key, origin=""):
+        self.sent.append((summary, body, key, origin))
+
+    def set_badge(self, count):
+        self.badges.append(count)
+
+
+main_window_module.make_notifier = lambda tray: RecordingNotifier()
 
 
 def offline(self, url, params=None, headers=None, retries=5, method="GET", json=None):
@@ -296,6 +315,7 @@ def checks():
 
     folder_checks()
     move_checks()
+    integration_checks()
 
     w.close()
     saved = Settings(str(tmp / "settings.ini"))
@@ -461,6 +481,68 @@ def move_checks():
     win.act_move.trigger()
     wait(200)
     check(st.message_row("m5")["folder_id"] == travel, "message window: Move to folder")
+
+
+def integration_checks():
+    from waddlemail.ui.splash import Splash
+    n = w.notifier
+    recent = lambda m: (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=m)).strftime(  # noqa: E731
+        "%Y-%m-%dT%H:%M:%SZ")
+    st.apply_message_changes("in", [
+        {"id": "n1", "subject": "Lunch?", "isRead": False, "receivedDateTime": recent(1),
+         "bodyPreview": "Are you free at noon?",
+         "from": {"emailAddress": {"name": "Sam Ortiz", "address": "sam@x.com"}}},
+        {"id": "n2", "subject": "Report", "isRead": False, "receivedDateTime": recent(2),
+         "from": {"emailAddress": {"name": "Kim Lee", "address": "kim@x.com"}}},
+        {"id": "old", "subject": "Ancient", "isRead": False,
+         "receivedDateTime": "2020-01-01T00:00:00Z"},
+    ])
+    n.sent.clear()
+    w._notify_new(["n1"])
+    check(n.sent and n.sent[-1][0] == "Sam Ortiz" and "Lunch?" in n.sent[-1][1]
+          and n.sent[-1][2] == "in|n1" and n.sent[-1][3] == "jordan@contoso.com",
+          "one new message: sender, subject + preview, mailbox")
+    w._notify_new(["n1", "n2", "old"])
+    check(n.sent[-1][0] == "2 new messages" and "Kim Lee: Report" in n.sent[-1][1],
+          "several: one summary (old mail left out)")
+    w.settings.set("notify/new_mail", False)
+    before = len(n.sent)
+    w._notify_new(["n1"])
+    check(len(n.sent) == before, "notifications can be turned off")
+    w.settings.set("notify/new_mail", True)
+
+    w.folder_tree.select_folder(travel_id())
+    wait(200)
+    n.activated.emit("in|n1")
+    wait(200)
+    check(w._current_folder == "in" and view.current_id() == "n1",
+          "clicking a notification opens its message")
+
+    st.conn.execute("UPDATE folders SET unread = 7 WHERE id = 'in'")
+    st.conn.commit()
+    w._populate_folders()
+    check(n.badges[-1] == 7 and "7 unread" in w.tray.toolTip(),
+          "unread count on the task manager badge and tray")
+
+    w.settings.set("tray/close_to_tray", True)
+    w.tray.isVisible = lambda: True  # the offscreen platform has no tray
+    w.close()
+    wait(100)
+    check(w.isHidden() and not w._quitting, "close-to-tray hides instead of quitting")
+    w.tray.show_window()
+    wait(100)
+    check(w.isVisible(), "the tray brings it back")
+    w.settings.set("tray/close_to_tray", False)
+
+    sp = Splash()
+    sp.status("Opening your mail…")
+    img = sp.pixmap().toImage()
+    check(not img.isNull() and img.width() >= 440, "splash screen renders")
+    sp.close()
+
+
+def travel_id():
+    return folder_named("Travel")["id"]
 
 
 QTimer.singleShot(1200, run)

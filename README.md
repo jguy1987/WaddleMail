@@ -70,6 +70,24 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   offline: they go out on the next successful sync). If the server refuses one, for example in a
   shared mailbox you can only read, it is undone locally.
 - Window size, pane layout and splitter positions are remembered.
+- **Desktop integration**
+  - App icon (the courier penguin, `waddlemail/resources/`) for the window, task manager and
+    application menu; a splash screen while starting (Preferences > General to turn it off).
+  - **Help > Add to application menu** (or `waddlemail --install-desktop`) puts a launcher and
+    the icons in `~/.local/share` for this user; Help > Remove from application menu (or
+    `--uninstall-desktop`) takes them out. The launcher remembers the `WADDLEMAIL_CLIENT_ID` /
+    `WADDLEMAIL_TENANT` you started with, since a menu launch has no shell environment.
+  - **Notifications** for new mail in each signed-in account's Inbox (not shared mailboxes):
+    one per message, or a summary when several arrive together; mail older than a day (a
+    catch-up after being offline) is left out, as is mail in the Inbox you're looking at.
+    Clicking one opens the message. On Linux they go through the freedesktop notification
+    service (KDE, GNOME, ...) with the app icon, a sound and, on KDE, the mailbox name; on
+    Windows/macOS through the tray icon. Every account's Inbox is checked on each sync.
+  - **Tray icon**: the penguin in the panel's colour, with a red dot while there is unread
+    Inbox mail; left-click shows or hides the window; menu: Open, Check for new mail, Quit.
+    Optionally keep running in the tray when the window is closed (Preferences > General).
+  - **Unread badge** on the task manager icon (KDE Plasma, and docks that support the Unity
+    LauncherEntry API).
 - **Hybrid reader**: headers and previews are synced; a message body is fetched from the server the
   first time you open it, then cached (LRU). Nothing has to be downloaded up front.
 - Sandboxed reader: JavaScript off, HTML sanitized (nh3), a Content-Security-Policy blocks remote
@@ -130,6 +148,10 @@ Do not run `waddlemail/__main__.py` directly as a script: it uses package-relati
 PyCharm use a run configuration with **Module name** `waddlemail`, or use **Script path** `run.py`;
 set `WADDLEMAIL_CLIENT_ID` under Environment variables.
 
+To get WaddleMail in your application menu (Linux), run `waddlemail --install-desktop` once
+(or use Help > Add to application menu). GNOME shows tray icons only with the AppIndicator
+extension; notifications work without it.
+
 The first launch opens your browser to sign in. Mail data lives in `~/.local/share/waddlemail/`
 unless you change the data location in Preferences.
 
@@ -152,6 +174,9 @@ waddlemail/store.py        SQLite: folders, messages, body cache (LRU), delta cu
 waddlemail/sync.py         Delta sync; first sync only pulls the last N days
 waddlemail/bodies.py       Cache-first body access (the hybrid mode)
 waddlemail/text.py         plain text from HTML bodies, for the full-text index
+waddlemail/desktop.py      app icon paths; launcher + icon install for the application menu
+waddlemail/notify.py       desktop notifications and the task manager unread badge
+waddlemail/resources/      app icon (SVG + PNG sizes), tray icons, launcher template
 waddlemail/settings.py     Preferences (QSettings) and their defaults
 waddlemail/ui/             main window + menus/toolbar, preferences, new mail/event dialogs, safe rendering
 waddlemail/ui/folder_pane.py  folder tree: mailbox headings, folder order, icons, unread counts
@@ -159,6 +184,8 @@ waddlemail/ui/message_list.py  message model/view (columns, sorting, compact row
 waddlemail/ui/message_view.py  message header + sandboxed body; the separate message window
 waddlemail/ui/folder_picker.py  "choose a folder" dialog for Move/Copy to folder and Move folder
 waddlemail/ui/dnd.py       drag-and-drop data format and drag image
+waddlemail/ui/splash.py    splash screen
+waddlemail/ui/tray.py      system tray icon
 waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 ```
 

@@ -66,3 +66,14 @@ def load_colored(name: str, color: str) -> QIcon:
         icon.addPixmap(_pixmap(svg, QColor(color), size), QIcon.Mode.Normal)
         icon.addPixmap(_pixmap(svg, selected, size), QIcon.Mode.Selected)  # readable on blue
     return icon
+
+
+def load_svg_file(path, color: QColor | None = None) -> QIcon:
+    """An icon from any SVG file, its `currentColor` parts tinted (default: the text colour)."""
+    svg = Path(path).read_text(encoding="utf-8")
+    color = color or QApplication.palette().color(QPalette.ColorGroup.Active,
+                                                  QPalette.ColorRole.WindowText)
+    icon = QIcon()
+    for size in _SIZES:
+        icon.addPixmap(_pixmap(svg, color, size), QIcon.Mode.Normal)
+    return icon

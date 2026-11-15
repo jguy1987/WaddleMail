@@ -18,6 +18,10 @@ DEFAULTS = {
     "list/threads": True,          # group messages into conversations
     "list/date_groups": True,      # Today / Yesterday / ... headings when sorted by date
     "search/server": True,         # quick filter also searches the server
+    "notify/new_mail": True,       # desktop notification when mail arrives in an Inbox
+    "tray/show": True,             # icon in the system tray / status area
+    "tray/close_to_tray": False,   # closing the window keeps WaddleMail running in the tray
+    "view/splash": True,           # splash screen while starting
     # Window layout, saved on exit (not shown in Preferences).
     "window/geometry": QByteArray(),
     "window/folder_split": QByteArray(),

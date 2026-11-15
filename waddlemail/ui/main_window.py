@@ -3,18 +3,20 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import sys
 
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWebEngineCore import QWebEnginePage
 from PySide6.QtWidgets import (
     QApplication, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QSplitter,
-    QTextEdit, QToolBar, QToolButton, QVBoxLayout, QWidget,
+    QSystemTrayIcon, QTextEdit, QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
-from .. import __version__
+from .. import __version__, desktop
 from ..graph import NO_SUBFOLDERS
 from ..mailboxes import MailboxManager
+from ..notify import make_notifier
 from ..settings import Settings
 from ..store import Store
 from . import iconset
@@ -25,6 +27,7 @@ from .message_list import OUTGOING, FilterBar, MessageListView
 from .message_view import MessageView, MessageWindow
 from .preferences import PreferencesDialog
 from .render import placeholder
+from .tray import Tray
 
 log = logging.getLogger(__name__)
 
@@ -144,6 +147,12 @@ class MainWindow(QMainWindow):
         self._search_timer.setInterval(600)  # after typing pauses
         self._search_timer.timeout.connect(self._search_server)
 
+        # System integration: tray icon, desktop notifications, task manager badge.
+        self._quitting = False
+        self.tray = Tray(self, self.sync_current, self.quit_app)
+        self.notifier = make_notifier(self.tray)
+        self.notifier.activated.connect(self._open_from_notification)
+
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.sync_current)
         self._apply_settings()
@@ -184,14 +193,14 @@ class MainWindow(QMainWindow):
             self._sync_all_folders()
             first = mailboxes.all()[0]
             inbox = self.store.well_known_folder(first.id, "inbox")
-            error = None
+            error, new = None, []
             if inbox:
                 try:
-                    first.sync.sync_folder(inbox)
+                    new = first.sync.sync_folder(inbox).new_ids
                 except Exception as exc:  # offline: still show what's stored locally
                     log.warning("inbox sync failed: %s", exc)
                     error = str(exc)
-            return inbox, error
+            return inbox, error, new
 
         self._syncing = True
         self._run(job, self._initial_sync_done, on_failed=self._sync_failed)
@@ -211,7 +220,7 @@ class MainWindow(QMainWindow):
                 log.warning("folder sync failed for %s: %s", box.display_name, exc)
 
     def _initial_sync_done(self, payload):
-        inbox_id, error = payload
+        inbox_id, error, new = payload
         self._populate_folders()
         if inbox_id:
             self.folder_tree.select_folder(inbox_id)  # the sync this starts is skipped below
@@ -221,10 +230,12 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Up to date", 3000)
         self.timer.start()
+        self._notify_new(new)  # mail that arrived while WaddleMail was closed
 
     # -- folders ------------------------------------------------------
     def _populate_folders(self):
         self.folder_tree.populate()
+        self._update_unread_indicators()
         self._update_title()
 
     def _on_folder_selected(self, fid: str):
@@ -514,16 +525,27 @@ class MainWindow(QMainWindow):
 
         def job():
             res = box.sync.sync_folder(fid)
+            new = list(res.new_ids)
+            # Every account's Inbox too, so new mail is noticed (and announced) wherever
+            # you are. Shared mailboxes only get their counts refreshed.
+            for other in self.mailboxes.all():
+                inbox = None if other.shared else self.store.well_known_folder(other.id, "inbox")
+                if inbox and inbox != fid:
+                    try:
+                        new += other.sync.sync_folder(inbox).new_ids
+                    except Exception as exc:
+                        log.warning("inbox sync failed for %s: %s", other.display_name, exc)
             self._sync_all_folders()  # refresh unread counts / new folders everywhere
             if max_age_days:
                 self.store.purge_bodies_older_than(max_age_days)
-            return fid, res
+            return fid, res, new
 
         self._run(job, self._sync_done, on_failed=self._sync_failed)
 
     def _sync_done(self, payload):
         self._syncing = False
-        fid, res = payload
+        fid, res, new = payload
+        self._notify_new(new)
         if res.upserted or res.removed:  # new mail may match a search: ask the server again
             self._server_hits = {k: v for k, v in self._server_hits.items() if k[0] != fid}
         self._populate_folders()
@@ -635,7 +657,7 @@ class MainWindow(QMainWindow):
                 box.sync.sync_folders()
 
             def done(_):
-                self.folder_tree.refresh_counts()
+                self._counts_changed()
                 if dest == self._current_folder:
                     self._refresh_messages()
                 self.statusBar().showMessage(f"Copied {what} to {name}", 4000)
@@ -652,7 +674,7 @@ class MainWindow(QMainWindow):
             self._refresh_messages()
             if selected & set(moved) and follow:
                 self.msg_list.select_id(follow)
-        self.folder_tree.refresh_counts()
+        self._counts_changed()
         self._send_timer.start()
         self.statusBar().showMessage(f"Moved {what} to {name}", 4000)
 
@@ -735,7 +757,7 @@ class MainWindow(QMainWindow):
         if not changed:
             return
         self.msg_list.model_.update_rows([self.store.message_row(i) for i in changed])
-        self.folder_tree.refresh_counts()
+        self._counts_changed()
         self._send_timer.start()
 
     def _send_changes(self):
@@ -758,7 +780,93 @@ class MainWindow(QMainWindow):
         self._syncing = False
         # A change the server refused was undone in the store; show that.
         self._refresh_messages()
+        self._counts_changed()
+
+    # -- tray, notifications, badge ---------------------------------------
+    def _counts_changed(self):
         self.folder_tree.refresh_counts()
+        self._update_unread_indicators()
+
+    def _own_inboxes(self) -> list[tuple[str, str]]:
+        """(mailbox display name, inbox folder id) for each signed-in account."""
+        out = []
+        for box in self.mailboxes.all():
+            inbox = None if box.shared else self.store.well_known_folder(box.id, "inbox")
+            if inbox:
+                out.append((box.display_name, inbox))
+        return out
+
+    def _update_unread_indicators(self):
+        """Unread mail in the accounts' Inboxes: the tray's dot and the task manager badge."""
+        total = sum((self.store.folder_row(fid) or {"unread": 0})["unread"] or 0
+                    for _, fid in self._own_inboxes())
+        self.tray.set_unread(total)
+        self.notifier.set_badge(total)
+
+    def _notify_new(self, ids: list[str]):
+        """A notification per account for new, unread Inbox mail from the last day (older
+        "new" mail is a catch-up after a long time offline, not news)."""
+        if not ids or not self.settings.get("notify/new_mail"):
+            return
+        cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        for mailbox, inbox in self._own_inboxes():
+            if inbox == self._current_folder and self.isActiveWindow():
+                continue  # it's in front of you already
+            rows = [r for r in (self.store.message_row(i) for i in ids)
+                    if r and r["folder_id"] == inbox and not r["is_read"]
+                    and (r["received"] or "") >= cutoff]
+            if not rows:
+                continue
+            rows.sort(key=lambda r: r["received"] or "", reverse=True)
+            if len(rows) == 1:
+                r = rows[0]
+                summary = r["sender_name"] or r["sender_addr"] or "New message"
+                body = (r["subject"] or "(no subject)") + (
+                    "\n" + r["preview"][:140] if r["preview"] else "")
+                key = f"{inbox}|{r['id']}"
+            else:
+                summary = f"{len(rows)} new messages"
+                lines = [f"{r['sender_name'] or r['sender_addr']}: {r['subject'] or '(no subject)'}"
+                         for r in rows[:4]]
+                if len(rows) > 4:
+                    lines.append(f"…and {len(rows) - 4} more")
+                body = "\n".join(lines)
+                key = f"{inbox}|"
+            self.notifier.notify(summary, body, key, origin=mailbox)
+
+    def _open_from_notification(self, key: str):
+        self.tray.show_window()
+        folder, _, message = key.partition("|")
+        if folder:
+            self.folder_tree.select_folder(folder)
+        if message:
+            self.msg_list.select_id(message)
+
+    def close_to_tray(self) -> bool:
+        return (self.settings.get("tray/close_to_tray") and self.tray.isVisible())
+
+    def quit_app(self):
+        self._quitting = True
+        self.close()
+        QApplication.quit()
+
+    def _toggle_launcher(self):
+        try:
+            if desktop.is_installed():
+                desktop.uninstall()
+                self.statusBar().showMessage("Removed from the application menu", 4000)
+            else:
+                desktop.install()
+                self.statusBar().showMessage("Added to the application menu", 4000)
+        except OSError as exc:
+            QMessageBox.warning(self, "Application menu", f"That didn't work: {exc}")
+        self.act_launcher.setText(self._launcher_label())
+
+    @staticmethod
+    def _launcher_label() -> str:
+        return ("Remove from &application menu" if desktop.is_installed()
+                else "Add to &application menu")
 
     def _update_message_actions(self, *_):
         any_selected = bool(self.msg_list.selected_ids())
@@ -810,6 +918,11 @@ class MainWindow(QMainWindow):
         self.set_reading_pane(s.get("view/reading_pane"))
 
     def closeEvent(self, event):
+        if not self._quitting and self.close_to_tray():
+            event.ignore()
+            self.hide()  # keeps syncing and notifying; the tray brings it back
+            return
+        self.notifier.close()
         s = self.settings
         if self._pane_mode in ("right", "bottom"):
             self._split_states[self._pane_mode] = self.content.saveState()
@@ -1038,7 +1151,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.act_add_account)
         file_menu.addAction(self.act_add_shared)
         file_menu.addSeparator()
-        file_menu.addAction(self._action("&Quit", self.close, QKeySequence.StandardKey.Quit))
+        file_menu.addAction(self._action("&Quit", self.quit_app, QKeySequence.StandardKey.Quit))
 
         edit_menu = mb.addMenu("&Edit")
         for act in (self.act_cut, self.act_copy, self.act_paste):
@@ -1077,6 +1190,12 @@ class MainWindow(QMainWindow):
         msg_menu.addAction(self.act_copy_to)
 
         help_menu = mb.addMenu("&Help")
+        self.act_launcher = self._action(self._launcher_label(), self._toggle_launcher)
+        self.act_launcher.setToolTip("Puts WaddleMail and its icon in your desktop's "
+                                     "application menu (for this user only)")
+        if sys.platform.startswith("linux"):
+            help_menu.addAction(self.act_launcher)
+            help_menu.addSeparator()
         help_menu.addAction(self._action("&About WaddleMail", self.show_about))
 
     def show_about(self):
@@ -1109,6 +1228,9 @@ class MainWindow(QMainWindow):
         self.mailboxes.configure(s.get("sync/window_days") or 36500,
                                  s.get("cache/max_mb") * 1024 * 1024)
         self.timer.setInterval(s.get("sync/interval_min") * 60_000)
+        self.tray.setVisible(s.get("tray/show") and QSystemTrayIcon.isSystemTrayAvailable())
+        # With close-to-tray, closing the window mustn't end the program.
+        QApplication.instance().setQuitOnLastWindowClosed(not self.close_to_tray())
 
     def _list_cutoff(self) -> str | None:
         days = self.settings.get("list/window_days")

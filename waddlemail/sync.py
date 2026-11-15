@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import config
 from .graph import DeltaResetError, GraphClient, GraphError
@@ -17,6 +17,9 @@ class SyncResult:
     upserted: int = 0
     removed: int = 0
     full: bool = False
+    # Messages that arrived since the last sync (empty on a first or full sync, which
+    # downloads everything and so can't tell what is new).
+    new_ids: list[str] = field(default_factory=list)
 
 
 class SyncEngine:
@@ -85,7 +88,8 @@ class SyncEngine:
         seen: set[str] = set()
         final_link: str | None = None
         for items, delta_link in self.graph.messages_delta(folder_id, link, since):
-            up, rm = self.store.apply_message_changes(folder_id, items)
+            up, rm = self.store.apply_message_changes(
+                folder_id, items, None if full else result.new_ids)
             result.upserted += up
             result.removed += rm
             if full:

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=WaddleMail
+GenericName=Email Client
+Comment=Mail client for Microsoft 365
+Exec=waddlemail
+Icon=waddlemail
+Terminal=false
+Categories=Network;Email;Office;
