@@ -15,6 +15,9 @@ DEFAULTS = {
     "read/mark_delay_sec": 0,      # ...after this many seconds
     "view/reading_pane": "bottom", # right / bottom / off
     "view/filter_bar": True,       # quick filter bar above the message list
+    "list/threads": True,          # group messages into conversations
+    "list/date_groups": True,      # Today / Yesterday / ... headings when sorted by date
+    "search/server": True,         # quick filter also searches the server
     # Window layout, saved on exit (not shown in Preferences).
     "window/geometry": QByteArray(),
     "window/folder_split": QByteArray(),

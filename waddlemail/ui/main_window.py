@@ -61,6 +61,12 @@ class MainWindow(QMainWindow):
         self._current_folder: str | None = None
         self._current_message: str | None = None  # the one selected message, if exactly one
         self._syncing = False  # one sync/send job at a time
+        # Server search for the quick filter: hits per (folder, words), and a generation
+        # number so a slow answer to an older query is ignored.
+        self._server_hits: dict[tuple[str, str], list[str]] = {}
+        self._search_note = ""
+        self._search_gen = 0
+        self._pending_search: tuple[str, str] | None = None
 
         self.setWindowTitle("WaddleMail")
         self.resize(1200, 760)
@@ -123,6 +129,10 @@ class MainWindow(QMainWindow):
         self._send_timer.setSingleShot(True)
         self._send_timer.setInterval(1500)
         self._send_timer.timeout.connect(self._send_changes)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(600)  # after typing pauses
+        self._search_timer.timeout.connect(self._search_server)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.sync_current)
@@ -297,12 +307,57 @@ class MainWindow(QMainWindow):
     def _refresh_messages(self):
         if not self._current_folder:
             return
+        words = self.filter_bar.search_text()
+        hits = self._server_hits.get((self._current_folder, words)) if words else None
         rows = self.store.list_messages(self._current_folder, since=self._list_cutoff(),
-                                        **self.filter_bar.criteria())
+                                        also_ids=hits, **self.filter_bar.criteria())
         folder = self.store.folder_row(self._current_folder)
         self.msg_list.set_messages(rows, bool(folder) and folder["well_known"] in OUTGOING)
-        self.filter_bar.set_count(len(rows))
         self._update_message_actions()
+        if not words:
+            self._search_note = ""
+            self._search_timer.stop()
+        elif hits is None and self.settings.get("search/server"):
+            self._search_note = "searching server…"
+            # restart the wait only for new words, not for every refresh (syncs, read marks)
+            query = (self._current_folder, words)
+            if not self._search_timer.isActive() or self._pending_search != query:
+                self._pending_search = query
+                self._search_timer.start()
+        self.filter_bar.set_count(len(rows), self._search_note if words else "")
+
+    def _search_server(self):
+        """Ask the server for matches in the current folder, including mail whose body was
+        never downloaded or that is older than the sync window. Hits are stored like synced
+        mail, then shown alongside the local matches."""
+        fid, words = self._current_folder, self.filter_bar.search_text()
+        box = self.mailboxes.for_folder(fid) if fid else None
+        if box is None or not words:
+            return
+        self._search_gen += 1
+        gen = self._search_gen
+
+        def job():
+            items = box.graph.search_messages(fid, words.split())
+            self.store.apply_message_changes(fid, items)
+            return gen, fid, words, [i["id"] for i in items]
+
+        def done(payload):
+            gen_, fid_, words_, ids = payload
+            self._server_hits[(fid_, words_)] = ids
+            if gen_ == self._search_gen:
+                self._search_note = f"{len(ids)} on server" if ids else "none on server"
+                self._refresh_messages()
+
+        def failed(msg: str):
+            if gen == self._search_gen:
+                self._search_note = "server search unavailable"
+                self.filter_bar.set_count(len(self._listed_ids()), self._search_note)
+
+        self._run(job, done, on_failed=failed)
+
+    def _listed_ids(self) -> list[str]:
+        return [m["id"] for m in self.msg_list.model_.root.messages()]
 
     def sync_current(self):
         fid = self._current_folder
@@ -326,6 +381,8 @@ class MainWindow(QMainWindow):
     def _sync_done(self, payload):
         self._syncing = False
         fid, res = payload
+        if res.upserted or res.removed:  # new mail may match a search: ask the server again
+            self._server_hits = {k: v for k, v in self._server_hits.items() if k[0] != fid}
         self._populate_folders()
         if fid == self._current_folder:
             self._refresh_messages()
@@ -334,17 +391,19 @@ class MainWindow(QMainWindow):
     def _on_message_selected(self, *_):
         self._update_message_actions()
         self._read_timer.stop()
-        ids = self.msg_list.selected_ids()
-        if len(ids) != 1:
+        # One row (a message, or a conversation: its newest message) shows in the pane.
+        shown = self.msg_list.shown_id()
+        if shown is None:
             self._current_message = None
+            n = len(self.msg_list.selected_ids())
             self.msg_view.show_placeholder(
-                f"{len(ids)} messages selected." if ids else "Select a message.")
+                f"{n} messages selected." if n else "Select a message.")
             return
-        if ids[0] == self._current_message:
+        if shown == self._current_message:
             return
-        self._current_message = ids[0]
+        self._current_message = shown
         if not self.msg_view.isHidden():  # reading pane is on
-            self._show_in_pane(ids[0])
+            self._show_in_pane(shown)
 
     def _show_in_pane(self, mid: str):
         row = self.store.message_row(mid)
@@ -487,6 +546,7 @@ class MainWindow(QMainWindow):
         self._split_states = {"right": s.get("window/split_right"),
                               "bottom": s.get("window/split_bottom")}
         self.msg_list.restore_header(s.get("list/header"))
+        self._apply_list_options()
         self.act_filter_bar.setChecked(s.get("view/filter_bar"))
         self.filter_bar.setVisible(s.get("view/filter_bar"))
         self.set_reading_pane(s.get("view/reading_pane"))
@@ -502,9 +562,14 @@ class MainWindow(QMainWindow):
         s.set("list/header", self.msg_list.header_state())
         s.set("view/reading_pane", self._pane_mode)
         s.set("view/filter_bar", self.act_filter_bar.isChecked())
+        s.set("list/threads", self.act_threads.isChecked())
+        s.set("list/date_groups", self.act_date_groups.isChecked())
         for win in list(self._windows):
             win.close()
         super().closeEvent(event)
+
+    def _apply_list_options(self, *_):
+        self.msg_list.set_options(self.act_threads.isChecked(), self.act_date_groups.isChecked())
 
     def _show_sort_menu(self):
         button = self.filter_bar.sort_button
@@ -597,6 +662,15 @@ class MainWindow(QMainWindow):
                                  self.act_toggle_read, self.act_toggle_flag,
                                  self.act_flag_complete]
 
+        self.act_threads = QAction("Group by &conversation", self)
+        self.act_threads.setCheckable(True)
+        self.act_threads.setChecked(self.settings.get("list/threads"))
+        self.act_date_groups = QAction("Show &date headings", self)
+        self.act_date_groups.setCheckable(True)
+        self.act_date_groups.setChecked(self.settings.get("list/date_groups"))
+        self.act_date_groups.setToolTip("Today, Yesterday, Last week, ... (when sorted by date)")
+        for act in (self.act_threads, self.act_date_groups):
+            act.toggled.connect(self._apply_list_options)
         self.act_filter_bar = QAction("&Quick filter bar", self)
         self.act_filter_bar.setCheckable(True)
         self.act_filter_bar.toggled.connect(self._set_filter_bar)
@@ -713,6 +787,8 @@ class MainWindow(QMainWindow):
         pane_menu = view_menu.addMenu("&Reading pane")
         for mode, _label in READING_PANE_MODES:
             pane_menu.addAction(self._pane_actions[mode])
+        view_menu.addAction(self.act_threads)
+        view_menu.addAction(self.act_date_groups)
         view_menu.addAction(self.act_filter_bar)
         folders = QAction("Show &folder pane", self)
         folders.setCheckable(True)

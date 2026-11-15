@@ -25,9 +25,23 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   - Unread mail is bold. Click the dot (or press **M**) to toggle read, click the flag column
     (or press **S**) to toggle the flag; both work on the whole selection. Message menu and
     right-click menu: Open in new window, Mark as read/unread (Ctrl+U), flag, Mark flag complete.
+  - **Conversations** (View > Group by conversation): messages sharing a conversation fold
+    into one row showing the participants, the subject without `RE:`/`FW:`, the message count
+    and the newest date; it is bold while any message in it is unread. Click its arrow (or
+    double-click, or press Enter / Right) to expand. Selecting it shows the newest message;
+    marking read or flagging it applies to every message in it.
+  - **Date headings** (View > Show date headings): Today, Yesterday, This week, Last week, This
+    month, Last month, Older, while sorted by Received. Click a heading to fold it.
   - **Quick filter bar** (Thunderbird style, Ctrl+Shift+K): Unread / Flagged / Attachment
-    toggles and a search box; every word typed must appear in the sender, recipients, subject or
-    preview. Esc clears. The filter resets when you change folder.
+    toggles and a search box; every word typed must appear in the sender, recipients, subject,
+    preview or **message text**. Esc clears. The filter resets when you change folder.
+    - Mail stored locally is searched at once: metadata by substring, downloaded bodies through
+      a full-text index (word prefixes, accent-insensitive).
+    - A moment after you stop typing, the server is searched too (Graph `$search`, current
+      folder, up to 250 hits). It finds mail whose body was never downloaded and mail older
+      than the sync window; those hits are stored and merged into the list. The count shows
+      how many came from the server.
+    - While searching, the "Show in message list" period is ignored, so old mail is found.
 - **Reading pane** (View > Reading pane): Right, Bottom or Off. On the right the list switches to
   compact two-line rows with a Sort button. The pane shows a header (subject, sender, To/Cc,
   date) above the body. Mail shown there is marked read, immediately or after a delay
@@ -65,9 +79,9 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
 ## Not yet
 
 Sending mail and saving events (the New dialogs open but only collect input), personal contacts,
-calendar views, server-side search (the quick filter only searches mail stored locally, and the
-preview rather than the full body), attachments and inline (`cid:`) images, move/delete,
-conversation threading.
+calendar views, searching all folders at once, attachments and inline (`cid:`) images,
+move/delete. Conversations only group messages within the current folder (your replies in Sent
+Items are not pulled in, as Outlook does).
 
 ## Register the app (one time)
 
@@ -118,6 +132,7 @@ waddlemail/graph.py        Graph client: paging, 429/503 retry, delta, bodies (I
 waddlemail/store.py        SQLite: folders, messages, body cache (LRU), delta cursors
 waddlemail/sync.py         Delta sync; first sync only pulls the last N days
 waddlemail/bodies.py       Cache-first body access (the hybrid mode)
+waddlemail/text.py         plain text from HTML bodies, for the full-text index
 waddlemail/settings.py     Preferences (QSettings) and their defaults
 waddlemail/ui/             main window + menus/toolbar, preferences, new mail/event dialogs, safe rendering
 waddlemail/ui/folder_pane.py  folder tree: mailbox headings, folder order, icons, unread counts
@@ -143,6 +158,9 @@ waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
   existing mail gets them on the next sync.
 - A queued read/flag change wins over an older value arriving in a delta page, so the list
   never flickers back to unread while the change is on its way.
+- Search: `body_fts` is an FTS5 table keyed by the `bodies` rowid. `put_body` adds the text and
+  a trigger removes it when a body is evicted, so the index never outgrows the cache. Bodies
+  cached before the index existed are indexed once on upgrade.
 
 ## Next steps
 
@@ -150,6 +168,7 @@ waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
    (`pending` table) that read/flag already use.
 2. Personal contacts (`/me/contacts`) and recipient autocomplete.
 3. Events (`Calendars.ReadWrite`), then calendar views.
-4. FTS5 search over metadata and cached bodies; attachments and `cid:` images.
+4. Attachments and `cid:` images; search across all folders; optional background download of
+   bodies so local search covers everything offline.
 5. "Load older mail" beyond the sync window.
 6. Publisher verification of the app registration before sharing with other organizations.

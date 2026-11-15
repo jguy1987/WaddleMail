@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from .graph import PROP_LAST_VERB, PROP_SIZE
+from .text import body_text
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS mailboxes(
@@ -71,6 +72,14 @@ CREATE TABLE IF NOT EXISTS pending(
     old TEXT,
     UNIQUE(message_id, field)
 );
+-- Full-text index of cached bodies; rowid = bodies.rowid. Rows follow the bodies table
+-- (put_body inserts, the trigger deletes), so evicted bodies leave the index too.
+CREATE VIRTUAL TABLE IF NOT EXISTS body_fts USING fts5(
+    message_id UNINDEXED, text, tokenize = 'unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER IF NOT EXISTS bodies_fts_delete AFTER DELETE ON bodies BEGIN
+    DELETE FROM body_fts WHERE rowid = old.rowid;
+END;
 """
 
 # Message columns added after the first release; adding them resets the delta cursors so
@@ -181,8 +190,20 @@ class Store:
         self._local = threading.local()
         with self.conn:
             self.conn.execute("PRAGMA journal_mode=WAL")
+            had_fts = self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='body_fts'").fetchone()
             self.conn.executescript(SCHEMA)
             self._migrate()
+            if not had_fts:  # bodies cached before the index existed
+                self._index_bodies()
+
+    def _index_bodies(self) -> None:
+        rows = self.conn.execute(
+            "SELECT rowid, message_id, content_type, content FROM bodies").fetchall()
+        self.conn.executemany(
+            "INSERT INTO body_fts(rowid, message_id, text) VALUES(?,?,?)",
+            ((r["rowid"], r["message_id"], body_text(r["content_type"], r["content"]))
+             for r in rows))
 
     def _migrate(self) -> None:
         # Databases from before multi-mailbox support lack these folder columns; their
@@ -326,24 +347,40 @@ class Store:
 
     def list_messages(self, folder_id: str, limit: int = 5000, offset: int = 0,
                       since: str | None = None, search: str = "", unread: bool = False,
-                      flagged: bool = False, attachments: bool = False) -> list[sqlite3.Row]:
+                      flagged: bool = False, attachments: bool = False,
+                      also_ids: list[str] | None = None) -> list[sqlite3.Row]:
         """Newest first. `since` (ISO timestamp) hides older mail without deleting it.
 
-        `search` keeps messages where every word appears in the sender, recipients, subject
-        or preview (case-insensitive); the flags narrow the list further.
+        `search` keeps messages where every word appears in the sender, recipients, subject or
+        preview (anywhere in the text), or starts a word in the cached body. While searching,
+        `since` is ignored (a search should find old mail too), and `also_ids` (server search
+        hits) are kept as well. The flags narrow the list further.
         """
         sql = ("SELECT m.*, (b.message_id IS NOT NULL) AS has_body "
                "FROM messages m LEFT JOIN bodies b ON b.message_id = m.id "
                "WHERE m.folder_id=?")
         args: list = [folder_id]
-        if since:
+        words = search.split()
+        if since and not words:
             sql += " AND m.received >= ?"
             args.append(since)
-        for word in search.split():
-            like = "%" + word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-            sql += " AND (" + " OR ".join(
-                f"m.{col} LIKE ? ESCAPE '\\'" for col in _SEARCH_COLUMNS) + ")"
-            args.extend([like] * len(_SEARCH_COLUMNS))
+        if words:
+            local, local_args = [], []
+            for word in words:
+                like = "%" + word.replace("\\", "\\\\").replace("%", "\\%").replace(
+                    "_", "\\_") + "%"
+                alts = [f"m.{col} LIKE ? ESCAPE '\\'" for col in _SEARCH_COLUMNS]
+                local_args.extend([like] * len(_SEARCH_COLUMNS))
+                if any(ch.isalnum() for ch in word):  # FTS can't match pure punctuation
+                    alts.append("m.id IN (SELECT message_id FROM body_fts WHERE body_fts MATCH ?)")
+                    local_args.append('"' + word.replace('"', '""') + '"*')
+                local.append("(" + " OR ".join(alts) + ")")
+            clause = " AND ".join(local)
+            if also_ids:
+                clause = f"({clause}) OR m.id IN (SELECT value FROM json_each(?))"
+                local_args.append(json.dumps(also_ids))
+            sql += f" AND ({clause})"
+            args.extend(local_args)
         if unread:
             sql += " AND m.is_read = 0"
         if flagged:
@@ -443,12 +480,17 @@ class Store:
 
     def put_body(self, message_id: str, content_type: str, content: str, max_bytes: int) -> None:
         size = len(content.encode("utf-8"))
+        text = body_text(content_type, content)
         with self.conn as c:
-            c.execute(
-                "INSERT OR REPLACE INTO bodies(message_id, content_type, content, size, last_access)"
+            # DELETE + INSERT rather than REPLACE, so the trigger drops the old index row
+            c.execute("DELETE FROM bodies WHERE message_id=?", (message_id,))
+            cur = c.execute(
+                "INSERT INTO bodies(message_id, content_type, content, size, last_access)"
                 " VALUES(?,?,?,?,?)",
                 (message_id, content_type, content, size, time.time()),
             )
+            c.execute("INSERT INTO body_fts(rowid, message_id, text) VALUES(?,?,?)",
+                      (cur.lastrowid, message_id, text))
             total = c.execute("SELECT COALESCE(SUM(size),0) FROM bodies").fetchone()[0]
             while total > max_bytes:
                 oldest = c.execute(

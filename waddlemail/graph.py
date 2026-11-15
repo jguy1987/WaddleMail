@@ -179,6 +179,26 @@ class GraphClient:
                 return
             url, params = nxt, None
 
+    def search_messages(self, folder_id: str, words: list[str], limit: int = 250) -> list[dict]:
+        """Server-side search of one folder (subject, body, people, attachments' names).
+        Every word must match. Newest first as Exchange ranks them; at most `limit` results."""
+        terms = []
+        for w in words:
+            w = w.replace('"', "").replace("\\", "").strip()
+            if w:  # lower case, so a word like AND/OR/NOT isn't read as an operator
+                terms.append(w.lower() if w.upper() in ("AND", "OR", "NOT") else w)
+        if not terms:
+            return []
+        url = f"{self._root}/mailFolders/{quote(folder_id, safe='')}/messages"
+        params = {"$search": '"' + " AND ".join(terms) + '"', "$select": MESSAGE_FIELDS,
+                  "$top": 50}
+        out: list[dict] = []
+        for item in self._paged(url, params=params, headers=_prefer()):
+            out.append(item)
+            if len(out) >= limit:
+                break
+        return out
+
     def update_message(self, message_id: str, changes: dict) -> None:
         """PATCH writable message properties, e.g. {"isRead": True}."""
         self._request(f"{self._root}/messages/{quote(message_id, safe='')}", method="PATCH",
