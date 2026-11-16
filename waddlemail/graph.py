@@ -86,6 +86,11 @@ class GraphError(Exception):
         self.status = status
 
 
+# A hidden mark on every message we send (a MAPI named property), so a send that may or may not
+# have reached the server can be looked for in Sent Items before trying again.
+SEND_MARK = "String {6f1c3a52-8d2e-4b7a-9c41-5e0f2d7a9b13} Name WaddleMailSendId"
+
+
 class DeltaResetError(GraphError):
     """The stored delta link is no longer valid (HTTP 410); do a full resync."""
 
@@ -111,6 +116,7 @@ class GraphClient:
         self._root = f"/users/{quote(user, safe='@')}" if user else "/me"
 
         self._s = session or requests.Session()
+        self._own_session = session is None  # (a test's session is used for everything)
         self._sleep = sleep
 
     # -- low level -----------------------------------------------------
@@ -119,23 +125,32 @@ class GraphClient:
 
     def _request(self, url: str, params: dict | None = None, headers: dict | None = None,
                  retries: int = 5, method: str = "GET", json: dict | None = None,
-                 data: bytes | None = None, raw: bool = False):
-        """JSON in and out; or `data` bytes in and, with `raw`, the response bytes out."""
+                 data: bytes | None = None, raw: bool = False, once: bool = False):
+        """JSON in and out; or `data` bytes in and, with `raw`, the response bytes out.
+
+        `once`, for sending mail: on a new connection (one kept open from before may have
+        died with the network, and a request written into it can still reach the server much
+        later), and not repeated after a server error (it may have been done): only after
+        429, which says it wasn't."""
         full = self._url(url)
         refreshed = False
         for attempt in range(retries):
+            fresh = requests.Session() if once and self._own_session else None
             try:
                 hdrs = {"Authorization": f"Bearer {self._token()}", **(headers or {})}
-                r = self._s.request(method, full, params=params, headers=hdrs, json=json,
-                                    data=data, timeout=30)
+                r = (fresh or self._s).request(method, full, params=params, headers=hdrs,
+                                               json=json, data=data, timeout=30)
             except AuthError as exc:
                 _report(SIGNIN, str(exc))
                 raise
             except requests.RequestException as exc:  # DNS, refused, timeout, TLS, ...
                 _report(OFFLINE, _network_problem(exc))
                 raise
+            finally:
+                if fresh is not None:
+                    fresh.close()
             _report(ONLINE)
-            if r.status_code in (429, 503, 504):
+            if r.status_code in (429, 503, 504) and not (once and r.status_code != 429):
                 wait = float(r.headers.get("Retry-After", 2 ** attempt))
                 log.info("Graph %s; retrying in %.1fs", r.status_code, wait)
                 self._sleep(min(wait, 60))
@@ -737,7 +752,7 @@ class GraphClient:
     # -- sending ------------------------------------------------------------
     def send_mail(self, message: dict) -> None:
         """Send a new message (a copy is kept in Sent Items)."""
-        self._request(f"{self._root}/sendMail", method="POST",
+        self._request(f"{self._root}/sendMail", method="POST", once=True,
                       json={"message": message, "saveToSentItems": True})
 
     def create_draft(self, message: dict) -> dict:
@@ -755,7 +770,16 @@ class GraphClient:
                              method="POST", headers=_prefer())
 
     def send_draft(self, draft_id: str) -> None:
-        self._request(f"{self._root}/messages/{quote(draft_id, safe='')}/send", method="POST")
+        self._request(f"{self._root}/messages/{quote(draft_id, safe='')}/send", method="POST",
+                      once=True)
+
+    def sent_with_mark(self, mark: str) -> bool:
+        """Whether Sent Items has the message we marked with `mark` (SEND_MARK)."""
+        flt = (f"singleValueExtendedProperties/Any(ep: ep/id eq '{SEND_MARK}' "
+               f"and ep/value eq '{mark}')")
+        data = self._request(f"{self._root}/mailFolders/sentitems/messages",
+                             params={"$filter": flt, "$select": "id", "$top": 1})
+        return bool(data.get("value"))
 
     def get_message_body(self, message_id: str) -> tuple[str, str]:
         """Return (content_type, content); content_type is 'html' or 'text'."""

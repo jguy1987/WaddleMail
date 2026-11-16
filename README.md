@@ -127,6 +127,11 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
     address it won't take) stays there, you're told, and it isn't retried by itself: open it
     (double-click) to fix it, which takes it out of the Outbox, or delete it. A refusal while
     you're sending is shown straight away, with the window kept open.
+  - Never twice: sending uses a fresh connection (a request written into one that died with
+    the network could still reach the server later) and isn't repeated after a server error.
+    Each message carries a hidden mark; a retry first looks for it in Sent Items and stops if
+    it's there. After a send that may have got through (the answer timed out or the
+    connection broke mid-way), the retry waits two minutes so the first copy can show up.
   - Preferences > Compose: write new mail in HTML or plain text; default font, size and
     colour (a font that isn't installed, such as Calibri on Linux, is shown as its stand-in
     but mail keeps naming it).

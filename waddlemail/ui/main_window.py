@@ -31,8 +31,8 @@ from ..inline import cid_refs, resolve_cids
 from ..mailboxes import MailboxManager
 from ..notify import make_notifier
 from ..outbox import (
-    attachments_of, deliver, drop_files, keep_files, make_payload, pictures_of, transient,
-    write_draft,
+    attachments_of, deliver, drop_files, keep_files, make_payload, pictures_of, ready,
+    transient, write_draft,
 )
 from ..settings import Settings
 from ..store import Store
@@ -2087,6 +2087,8 @@ class MainWindow(QMainWindow):
                 if item["mailbox_id"] in offline or self.store.outbox_item(item["id"]) is None:
                     continue  # (taken out to edit meanwhile)
                 p = json.loads(item["payload"])
+                if not ready(p):  # it may have got through: give it time to show up
+                    continue
                 try:
                     deliver(boxes[item["mailbox_id"]].graph, p)
                 except Exception as exc:

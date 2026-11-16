@@ -1200,6 +1200,9 @@ class FakeOutbox:
                                                   {"id": f"resp{len(self.responses)}"})[1]
         G.update_message = lambda c, mid, changes: self.updates.append((mid, changes))
         G.send_draft = lambda c, did: self.sent_drafts.append(did)
+        G.sent_with_mark = lambda c, mark: any(
+            p["value"] == mark for m in self.sent
+            for p in m.get("singleValueExtendedProperties", []))
 
 
 def compose_windows():

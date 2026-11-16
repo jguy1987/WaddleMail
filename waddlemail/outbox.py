@@ -10,12 +10,19 @@ When the server can't be reached (offline, timing out, busy), the message waits 
 (the store's outbox table, with copies of its files) and goes out on a later try. Each try
 records how far it got (the draft's id, the attachments' ids) in the payload, so the next one
 carries on instead of making a second draft or uploading files twice.
+
+Never twice: every message carries a hidden mark (graph.SEND_MARK). A try after the first
+looks for it in Sent Items and stops if it's there. When a send failed in a way that may still
+have reached the server (the answer timed out, the connection broke mid-way, a server error),
+the next try waits SETTLE seconds, so a message that did get through is in Sent Items by then.
 """
 from __future__ import annotations
 
 import base64
 import os
 import shutil
+import time
+import uuid
 from dataclasses import asdict
 
 import requests
@@ -23,10 +30,11 @@ import requests
 from .attachments import Attachment, reconcile, reconcile_inline
 from .auth import AuthError
 from .compose import Outgoing
-from .graph import GraphClient, GraphError
+from .graph import SEND_MARK, GraphClient, GraphError
 from .inline import InlineImage, cid_refs
 
 TRANSIENT = {None, 408, 429, 500, 502, 503, 504}  # worth trying again later
+SETTLE = 120  # seconds to wait after a send that may have got through, before looking for it
 
 
 def transient(exc: BaseException) -> bool:
@@ -37,13 +45,40 @@ def transient(exc: BaseException) -> bool:
     return isinstance(exc, GraphError) and exc.status in TRANSIENT
 
 
+def possibly_sent(exc: BaseException) -> bool:
+    """Whether a failed send may still have reached the server: the answer timed out, the
+    connection broke after the request was written, or the server failed while doing it.
+    (Not when it couldn't connect at all, which is what being offline looks like.)"""
+    if isinstance(exc, requests.ReadTimeout):
+        return True
+    if isinstance(exc, requests.ConnectionError) and not isinstance(exc, requests.ConnectTimeout):
+        seen, cause = set(), exc
+        while cause is not None and id(cause) not in seen:  # (urllib3's reasons, nested)
+            seen.add(id(cause))
+            if type(cause).__name__ == "ProtocolError":  # "Connection aborted."
+                return True
+            cause = getattr(cause, "reason", None) or (cause.args[0] if cause.args and
+                                                       isinstance(cause.args[0], Exception)
+                                                       else None)
+        return False
+    return isinstance(exc, GraphError) and exc.status in (500, 502, 503, 504)
+
+
+def ready(p: dict, now: float | None = None) -> bool:
+    """Whether to try it now (not while a send that may have got through settles)."""
+    return (now or time.time()) - p.get("maybe_sent", 0) >= SETTLE
+
+
 def make_payload(mailbox_id: str, out: Outgoing, kind: str = "new",
                  original_id: str | None = None, draft_id: str | None = None,
                  attachments: list[Attachment] | None = None, originals_known: bool = True,
                  has_had_attachments: bool = False, had_pictures: bool = False) -> dict:
+    mark = uuid.uuid4().hex
+    message = out.graph_message()
+    message["singleValueExtendedProperties"] = [{"id": SEND_MARK, "value": mark}]
     return {
-        "mailbox_id": mailbox_id, "kind": kind, "original_id": original_id,
-        "draft_id": draft_id, "message": out.graph_message(),
+        "mailbox_id": mailbox_id, "kind": kind, "original_id": original_id, "mark": mark,
+        "draft_id": draft_id, "message": message,
         "subject": out.subject, "html": out.html, "body": out.body,
         "to": list(out.to), "cc": list(out.cc), "bcc": list(out.bcc),
         "attachments": [asdict(a) for a in attachments or []],
@@ -91,7 +126,10 @@ def write_draft(graph: GraphClient, p: dict) -> str:
 
 
 def deliver(graph: GraphClient, p: dict) -> None:
-    """Send the message `p`. Raises on failure; transient() says whether to try again."""
+    """Send the message `p`. Raises on failure; transient() says whether to try again, and
+    the payload's "maybe_sent" says when it failed in a way that may have got through."""
+    if p["tried"] and p.get("mark") and graph.sent_with_mark(p["mark"]):
+        return  # an earlier try got through after all
     if p["tried"]:
         # An earlier try may have uploaded files without learning their ids: find them on
         # the draft by name and size rather than uploading them again.
@@ -99,11 +137,20 @@ def deliver(graph: GraphClient, p: dict) -> None:
             if a["path"] and not a["remote_id"]:
                 a["original"] = True
     p["tried"] = True
-    if p["original_id"] is None and p["draft_id"] is None and not p["attachments"] \
-            and not p["inline"]:
-        graph.send_mail(p["message"])  # a plain new message: straight out
-        return
-    graph.send_draft(write_draft(graph, p))
+    sending = False  # (only a failure of the sending request itself may have got through)
+    try:
+        if p["original_id"] is None and p["draft_id"] is None and not p["attachments"] \
+                and not p["inline"]:
+            sending = True
+            graph.send_mail(p["message"])  # a plain new message: straight out
+        else:
+            draft_id = write_draft(graph, p)
+            sending = True
+            graph.send_draft(draft_id)
+    except Exception as exc:
+        if sending and possibly_sent(exc):
+            p["maybe_sent"] = time.time()
+        raise
 
 
 def keep_files(p: dict, folder: str) -> None:
