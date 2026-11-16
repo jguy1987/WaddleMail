@@ -4,16 +4,17 @@ bullets, numbering, indent, alignment, link, picture and clear formatting. It ca
 plain text. Used for composing mail and for signatures.
 
 Pictures (inserted, pasted or dropped) are held in the document as data: URIs; sending turns
-them into inline attachments (inline.extract_inline)."""
+them into inline attachments (inline.extract_inline). Click one to select it, then drag a
+corner to resize it (keeping its proportions); right-click for set sizes."""
 from __future__ import annotations
 
 import mimetypes
 import os
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QSize, Qt, QUrl
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPoint, QRect, QRectF, QSize, Qt, QUrl
 from PySide6.QtGui import (
-    QAction, QColor, QFont, QImage, QPalette, QTextBlockFormat, QTextCharFormat, QTextCursor,
-    QTextImageFormat, QTextListFormat,
+    QAction, QColor, QFont, QImage, QPainter, QPalette, QPen, QTextBlockFormat,
+    QTextCharFormat, QTextCursor, QTextDocument, QTextImageFormat, QTextListFormat,
 )
 from PySide6.QtWidgets import (
     QColorDialog, QComboBox, QFileDialog, QFontComboBox, QInputDialog, QMessageBox, QTextEdit,
@@ -27,6 +28,8 @@ SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48, 72]
 PICTURE_WIDTH = 640                  # wider pictures go in at this width (the file is kept)
 MAX_PICTURE = 10 * 1024 * 1024       # bigger ones should be attached instead
 PICTURE_FILES = "Pictures (*.png *.jpg *.jpeg *.gif *.bmp *.webp)"
+HANDLE = 8                           # the corner handles of a selected picture, in pixels
+MIN_PICTURE = 16
 
 
 def is_picture(path: str) -> bool:
@@ -35,11 +38,222 @@ def is_picture(path: str) -> bool:
 
 
 class _Edit(QTextEdit):
-    """Pasting a picture (or picture files) puts it in the text."""
+    """Pasting a picture (or picture files) puts it in the text. A clicked picture is
+    selected (so Delete, copy and typing over it work as on text) and gets corner handles to
+    resize it by dragging; right-click it for set sizes."""
 
     def __init__(self, owner: "RichEditor"):
         super().__init__()
         self._owner = owner
+        self.picture: int | None = None  # document position of the selected picture
+        self._drag: tuple | None = None  # (corner, press point, w, h, moved) while resizing
+        self.viewport().setMouseTracking(True)
+        self.cursorPositionChanged.connect(self._follow_cursor)
+        self.document().contentsChanged.connect(self._follow_cursor)
+
+    # -- pictures: where they are ------------------------------------------------------------
+    def picture_format(self, pos: int) -> QTextImageFormat | None:
+        if pos < 0 or pos >= self.document().characterCount() - 1:
+            return None
+        c = QTextCursor(self.document())
+        c.setPosition(pos)
+        c.setPosition(pos + 1, QTextCursor.MoveMode.KeepAnchor)
+        fmt = c.charFormat()  # (the character at pos)
+        return fmt.toImageFormat() if fmt.isImageFormat() else None
+
+    def natural_size(self, fmt: QTextImageFormat) -> QSize:
+        """The picture's own size in pixels (empty if it couldn't be loaded)."""
+        res = self.document().resource(QTextDocument.ResourceType.ImageResource,
+                                       QUrl(fmt.name()))
+        return res.size() if hasattr(res, "size") else QSize()
+
+    def picture_size(self, fmt: QTextImageFormat) -> QSize:
+        """As shown: the width/height set on it, the other side in proportion if only one."""
+        own = self.natural_size(fmt)
+        w, h = fmt.width(), fmt.height()
+        if w > 0 and h > 0:
+            return QSize(round(w), round(h))
+        if own.isEmpty():
+            return QSize(round(w), round(h))
+        if w > 0:
+            return QSize(round(w), round(w * own.height() / own.width()))
+        if h > 0:
+            return QSize(round(h * own.width() / own.height()), round(h))
+        return own
+
+    def picture_rect(self, pos: int) -> QRect:
+        """Where the picture at `pos` is, in viewport coordinates (empty if it isn't one)."""
+        fmt = self.picture_format(pos)
+        if fmt is None:
+            return QRect()
+        block = self.document().findBlock(pos)
+        layout = block.layout()
+        rel = pos - block.position()
+        line = layout.lineForTextPosition(rel)
+        if not line.isValid():
+            return QRect()
+        x = line.cursorToX(rel)
+        x = x[0] if isinstance(x, tuple) else x
+        size = self.picture_size(fmt)
+        origin = layout.position()  # pictures sit on the baseline
+        rect = QRectF(origin.x() + x, origin.y() + line.y() + line.ascent() - size.height(),
+                      size.width(), size.height()).toRect()
+        return rect.translated(-self.horizontalScrollBar().value(),
+                               -self.verticalScrollBar().value())
+
+    def picture_at(self, point: QPoint) -> int | None:
+        """The position of the picture under a viewport point."""
+        at = self.cursorForPosition(point).position()
+        for pos in (at - 1, at):  # (the click lands on either side of it)
+            if self.picture_rect(pos).contains(point):
+                return pos
+        return None
+
+    def _corners(self) -> dict[str, QRect]:
+        rect = self.picture_rect(self.picture) if self.picture is not None else QRect()
+        if rect.isEmpty():
+            return {}
+        half = HANDLE // 2
+        return {name: QRect(pt.x() - half, pt.y() - half, HANDLE, HANDLE)
+                for name, pt in (("tl", rect.topLeft()), ("tr", rect.topRight()),
+                                 ("bl", rect.bottomLeft()), ("br", rect.bottomRight()))}
+
+    def _corner_at(self, point: QPoint) -> str | None:
+        return next((name for name, r in self._corners().items()
+                     if r.adjusted(-2, -2, 2, 2).contains(point)), None)
+
+    # -- selecting and resizing ----------------------------------------------------------------
+    def select_picture(self, pos: int | None) -> None:
+        self.picture = pos
+        if pos is not None:
+            c = self.textCursor()
+            c.setPosition(pos)
+            c.setPosition(pos + 1, QTextCursor.MoveMode.KeepAnchor)
+            self.setTextCursor(c)
+            self.picture = pos  # (moving the cursor may have cleared it)
+        self.viewport().update()
+
+    def _follow_cursor(self) -> None:
+        """Forget the selected picture once the selection is something else."""
+        if self.picture is None:
+            return
+        c = self.textCursor()
+        if self.picture_format(self.picture) is None or \
+                (c.selectionStart(), c.selectionEnd()) != (self.picture, self.picture + 1):
+            self.picture = None
+            self.viewport().update()
+
+    def resize_picture(self, pos: int, width: int, join: bool = False) -> None:
+        """Make the picture at `pos` `width` pixels wide, its height in proportion; with
+        `join`, as part of the previous change (one undo for a whole drag)."""
+        fmt = self.picture_format(pos)
+        if fmt is None:
+            return
+        # in the picture's own proportions (the shown size is rounded: steps would drift)
+        ratio = self.natural_size(fmt)
+        if ratio.isEmpty():
+            ratio = self.picture_size(fmt)
+        if ratio.isEmpty():
+            return
+        width = max(MIN_PICTURE, width)
+        fmt.setWidth(width)
+        fmt.setHeight(max(1, round(width * ratio.height() / ratio.width())))
+        c = QTextCursor(self.document())
+        c.setPosition(pos)
+        c.setPosition(pos + 1, QTextCursor.MoveMode.KeepAnchor)
+        if join:
+            c.joinPreviousEditBlock()
+        else:
+            c.beginEditBlock()
+        c.setCharFormat(fmt)
+        c.endEditBlock()
+        self.viewport().update()
+
+    def mousePressEvent(self, event):
+        point = event.position().toPoint()
+        if event.button() == Qt.MouseButton.LeftButton:
+            corner = self._corner_at(point)
+            if corner is not None:
+                size = self.picture_size(self.picture_format(self.picture))
+                self._drag = (corner, point, size.width(), size.height(), False)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+        if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
+            pos = self.picture_at(point)
+            if pos is not None or event.button() == Qt.MouseButton.LeftButton:
+                self.select_picture(pos)
+
+    def mouseMoveEvent(self, event):
+        point = event.position().toPoint()
+        if self._drag is not None:
+            corner, start, w, _h, moved = self._drag
+            dx = point.x() - start.x()
+            self.resize_picture(self.picture, w + (-dx if corner in ("tl", "bl") else dx),
+                                join=moved)
+            self._drag = self._drag[:4] + (True,)
+            event.accept()
+            return
+        corner = self._corner_at(point)
+        if corner is not None:
+            self.viewport().setCursor(Qt.CursorShape.SizeFDiagCursor if corner in ("tl", "br")
+                                      else Qt.CursorShape.SizeBDiagCursor)
+        else:
+            self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._drag is not None:
+            self._drag = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        corners = self._corners()
+        if not corners:
+            return
+        painter = QPainter(self.viewport())
+        color = self.palette().color(QPalette.ColorRole.Highlight)
+        painter.setPen(QPen(color, 1, Qt.PenStyle.DashLine))
+        painter.drawRect(self.picture_rect(self.picture).adjusted(0, 0, -1, -1))
+        painter.setPen(QPen(color.darker(130), 1))
+        for r in corners.values():
+            painter.fillRect(r, QColor("white"))
+            painter.drawRect(r)
+        painter.end()
+
+    def contextMenuEvent(self, event):
+        menu = self.createStandardContextMenu(event.pos())
+        pos = self.picture_at(event.pos())
+        fmt = self.picture_format(pos) if pos is not None else None
+        if fmt is not None:
+            own = self.natural_size(fmt)
+            sizes = menu.addMenu("Picture si&ze")
+            if own.width() > 0:
+                for label, width in (("&Original size", own.width()),
+                                     ("&Three quarters", own.width() * 3 // 4),
+                                     ("&Half", own.width() // 2),
+                                     ("&Quarter", own.width() // 4)):
+                    act = sizes.addAction(f"{label} ({max(width, MIN_PICTURE)} px)")
+                    act.triggered.connect(lambda _=False, w=width: self.resize_picture(pos, w))
+                if own.width() > PICTURE_WIDTH:
+                    sizes.addAction(f"&Fit the page ({PICTURE_WIDTH} px)",
+                                    lambda: self.resize_picture(pos, PICTURE_WIDTH))
+                sizes.addSeparator()
+            sizes.addAction("&Width…", lambda: self._ask_width(pos))
+        menu.exec(event.globalPos())
+
+    def _ask_width(self, pos: int) -> None:
+        fmt = self.picture_format(pos)
+        if fmt is None:
+            return
+        width, ok = QInputDialog.getInt(self, "Picture size", "Width in pixels (the height "
+                                        "follows):", self.picture_size(fmt).width(),
+                                        MIN_PICTURE, 4000)
+        if ok:
+            self.resize_picture(pos, width)
 
     def canInsertFromMimeData(self, source) -> bool:
         if not self._owner.is_plain() and (source.hasImage() or self._pictures(source)):

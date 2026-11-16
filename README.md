@@ -87,7 +87,10 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
     **Plain text** switches the message to text only (formatting is dropped).
   - **Pictures in the body**: Insert picture on the formatting bar, paste one (a screenshot,
     say), or drop picture files on the body (other files dropped there are attached).
-    Pictures wider than 640 px go in at that width; up to 10 MB each. They're sent as inline
+    Pictures wider than 640 px go in at that width; up to 10 MB each. Click a picture to
+    select it (Delete removes it), then drag a corner handle to resize it, keeping its
+    proportions (one undo puts a whole drag back); right-click it for **Picture size**:
+    original, three quarters, half, quarter, fit the page, or a width you type. They're sent as inline
     attachments the body links to, as Outlook does; a quoted message's pictures go along
     with a reply or forward. Signatures can have pictures too.
   - Replies and forwards: RE:/FW: subjects (no stacking), reply all leaves you out, and the
@@ -232,7 +235,7 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
 
 ## Not yet
 
-Resizing a picture in the body after it's inserted, an offline outbox (sending needs a connection), searching all folders at once, deleting messages,
+An offline outbox (sending needs a connection), searching all folders at once, deleting messages,
 moving or copying between mailboxes. Conversations only group messages within the current
 folder (your replies in Sent Items are not pulled in, as Outlook does).
 

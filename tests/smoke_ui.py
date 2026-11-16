@@ -1386,8 +1386,8 @@ def attachment_checks():
 
 
 def picture_checks():
-    from PySide6.QtCore import QMimeData, QPointF, QUrl
-    from PySide6.QtGui import QDropEvent, QImage
+    from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, QUrl
+    from PySide6.QtGui import QDropEvent, QImage, QMouseEvent
     out, atts = FakeOutbox(), FakeAttachments()
     out.install()
     atts.install()
@@ -1411,6 +1411,31 @@ def picture_checks():
                                    Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
     check(win.editor.html().count("data:image/png") == 2 and not win.attachments.items(),
           "a picture dropped on the body goes into the text, not the attachments")
+    # resizing: click the picture, drag its bottom-right corner left
+    e = win.editor.edit
+    pos = next(i for i in range(e.document().characterCount()) if e.picture_format(i))
+    rect = e.picture_rect(pos)
+
+    def mouse(kind, pt, buttons=Qt.MouseButton.LeftButton):
+        QApplication.sendEvent(e.viewport(), QMouseEvent(
+            kind, QPointF(pt), QPointF(e.viewport().mapToGlobal(pt)),
+            Qt.MouseButton.LeftButton if kind != QEvent.Type.MouseMove else
+            Qt.MouseButton.NoButton, buttons, Qt.KeyboardModifier.NoModifier))
+
+    mouse(QEvent.Type.MouseButtonPress, rect.center())
+    mouse(QEvent.Type.MouseButtonRelease, rect.center(), Qt.MouseButton.NoButton)
+    corner = rect.bottomRight()
+    mouse(QEvent.Type.MouseButtonPress, corner)
+    for dx in (-100, -320):
+        mouse(QEvent.Type.MouseMove, QPoint(corner.x() + dx, corner.y()))
+    mouse(QEvent.Type.MouseButtonRelease, QPoint(corner.x() - 320, corner.y()),
+          Qt.MouseButton.NoButton)
+    fmt = e.picture_format(pos)
+    check(e.picture == pos and (fmt.width(), fmt.height()) == (320, 107)
+          and 'width="320" height="107"' in win.editor.html(),
+          "a picture is resized by dragging its corner (proportions kept)")
+    e.undo()
+    check(e.picture_format(pos).width() == 640, "...and one undo puts the whole drag back")
     win.act_send.trigger()
     wait(500)
     patched = out.updates[-1][1]["body"]["content"] if out.updates else ""
