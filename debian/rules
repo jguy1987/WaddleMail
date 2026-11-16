@@ -1,0 +1,13 @@
+#!/usr/bin/make -f
+export PYBUILD_NAME=waddlemail
+export PYBUILD_SYSTEM=pyproject
+
+%:
+	dh $@ --with python3 --buildsystem=pybuild
+
+override_dh_auto_test:
+	# the test suite needs a display and Microsoft credentials; run it upstream
+
+override_dh_auto_install:
+	dh_auto_install
+	packaging/install-data.sh debian/waddlemail

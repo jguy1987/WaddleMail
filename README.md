@@ -1,4 +1,4 @@
-# WaddleMail (prototype)
+# WaddleMail
 
 A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
 

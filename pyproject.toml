@@ -3,6 +3,8 @@ name = "WaddleMail"
 dynamic = ["version"]
 description = "Linux mail client for Microsoft 365 using Microsoft Graph"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "msal>=1.28",
     "requests>=2.31",

@@ -1,0 +1,21 @@
+Source: waddlemail
+Section: mail
+Priority: optional
+Maintainer: jmish <jmish1987@gmail.com>
+Build-Depends: debhelper-compat (= 13), dh-python, pybuild-plugin-pyproject, python3-all, python3-setuptools
+Standards-Version: 4.6.2
+Homepage: https://github.com/jmish1987/WaddleMail
+Rules-Requires-Root: no
+
+Package: waddlemail
+Architecture: all
+Depends: ${python3:Depends}, ${misc:Depends},
+ python3-pyside6.qtcore, python3-pyside6.qtgui, python3-pyside6.qtwidgets,
+ python3-pyside6.qtsvg, python3-pyside6.qtwebenginecore, python3-pyside6.qtwebenginewidgets,
+ python3-msal, python3-requests, python3-keyring, python3-nh3, python3-jeepney,
+ hicolor-icon-theme
+Description: Linux mail client for Microsoft 365
+ WaddleMail is a mail, calendar, contacts and tasks client for Microsoft 365
+ and Outlook.com built on Microsoft Graph. It supports several accounts and
+ shared mailboxes, favorites, folder management, an outbox, and desktop
+ notifications.
