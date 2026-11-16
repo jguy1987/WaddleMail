@@ -4,7 +4,8 @@ From (with several accounts), To, Cc and Bcc (Cc/Bcc shown on demand), Subject, 
 body that can switch to plain text. A reply or forward starts with the cursor at the top,
 then your signature, then a line and Outlook's header block (From / Sent / To / Cc / Subject)
 over the original message. "Insert signature" puts the signature just above the quoted text
-(at the end of a new message).
+(at the end of a new message). Pictures can be inserted, pasted, or dropped on the body;
+other files dropped anywhere are attached.
 
 The window only collects; MainWindow sends and saves drafts (sendRequested / draftRequested)
 and closes it when sending worked.
@@ -24,13 +25,13 @@ from ..compose import (
     reply_subject,
 )
 from ..contacts import format_address
+from ..inline import extract_inline
 from ..text import body_text
 from . import iconset
 from .attachment_bar import AttachmentBar
 from .recipients import RecipientEdit
 from .render import quotable_html
-from .rich_editor import RichEditor
-
+from .rich_editor import RichEditor, is_picture
 
 LARGE_MESSAGE = 35 * 1024 * 1024  # Exchange Online's usual limit for a whole message
 
@@ -54,6 +55,7 @@ class ComposeWindow(QMainWindow):
         self._signature = signature
         self.sent = False
         self.draft_id: str | None = None  # once saved to Drafts
+        self.had_pictures = False  # a saved draft has had inline pictures (see MainWindow)
         self.resize(820, 700)
         me = {a for _, a in accounts}
 
@@ -235,10 +237,10 @@ class ComposeWindow(QMainWindow):
 
     def outgoing(self) -> Outgoing:
         plain = self.editor.is_plain()
-        return Outgoing(subject=self.subject.text().strip(),
-                        body=self.editor.text() if plain else self.editor.html(),
-                        html=not plain, to=self.to.addresses(), cc=self.cc.addresses(),
-                        bcc=self.bcc.addresses())
+        body, inline = (self.editor.text(), []) if plain else extract_inline(self.editor.html())
+        return Outgoing(subject=self.subject.text().strip(), body=body, html=not plain,
+                        to=self.to.addresses(), cc=self.cc.addresses(),
+                        bcc=self.bcc.addresses(), inline=inline)
 
     def is_dirty(self) -> bool:
         return (self.editor.edit.document().isModified() or self._attachments_changed or
@@ -256,11 +258,11 @@ class ComposeWindow(QMainWindow):
                 QMessageBox.StandardButton.Yes:
             self.subject.setFocus()
             return
-        total = self.attachments.total_size()
+        total = self.attachments.total_size() + sum(len(i.data) for i in out.inline)
         if total > LARGE_MESSAGE and QMessageBox.question(
-                self, "Send", f"The attachments add up to {human_size(total)}. Most mail "
-                "servers don't accept messages over about 35 MB, so it may come back. Send "
-                "anyway?") != QMessageBox.StandardButton.Yes:
+                self, "Send", f"Attachments and pictures add up to {human_size(total)}. Most "
+                "mail servers don't accept messages over about 35 MB, so it may come back. "
+                "Send anyway?") != QMessageBox.StandardButton.Yes:
             return
         self.sendRequested.emit(self)
 
@@ -288,13 +290,20 @@ class ComposeWindow(QMainWindow):
         event.acceptProposedAction()
 
     def eventFilter(self, obj, event):
-        # The body would paste a dropped file's path as text: attach it instead.
+        # The body would paste a dropped file's path as text: pictures go into the text where
+        # they're dropped, anything else is attached.
         if event.type() in (QEvent.Type.DragEnter, QEvent.Type.DragMove) and \
                 self._files(event.mimeData()):
             event.acceptProposedAction()
             return True
         if event.type() == QEvent.Type.Drop and self._files(event.mimeData()):
-            self._drop(self._files(event.mimeData()))
+            files = self._files(event.mimeData())
+            if not self.editor.is_plain() and all(is_picture(p) for p in files):
+                cursor = self.editor.edit.cursorForPosition(event.position().toPoint())
+                for path in files:
+                    self.editor.insert_picture_file(path, cursor)
+            else:
+                self._drop(files)
             event.acceptProposedAction()
             return True
         return super().eventFilter(obj, event)

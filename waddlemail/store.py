@@ -80,6 +80,18 @@ CREATE VIRTUAL TABLE IF NOT EXISTS body_fts USING fts5(
 CREATE TRIGGER IF NOT EXISTS bodies_fts_delete AFTER DELETE ON bodies BEGIN
     DELETE FROM body_fts WHERE rowid = old.rowid;
 END;
+-- Pictures a cached body shows with cid: links (its inline attachments), by content id
+-- (cid_key). They count toward the body's size in the cache, and leave with it.
+CREATE TABLE IF NOT EXISTS inline_images(
+    message_id TEXT NOT NULL,
+    content_id TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    data BLOB NOT NULL,
+    PRIMARY KEY(message_id, content_id)
+);
+CREATE TRIGGER IF NOT EXISTS bodies_images_delete AFTER DELETE ON bodies BEGIN
+    DELETE FROM inline_images WHERE message_id = old.message_id;
+END;
 -- People: personal contacts (any contact folder) and the organization directory.
 CREATE TABLE IF NOT EXISTS contacts(
     id TEXT PRIMARY KEY,            -- Graph contact id, or "dir:" + directory user id
@@ -689,16 +701,43 @@ class Store:
             )
             c.execute("INSERT INTO body_fts(rowid, message_id, text) VALUES(?,?,?)",
                       (cur.lastrowid, message_id, text))
-            total = c.execute("SELECT COALESCE(SUM(size),0) FROM bodies").fetchone()[0]
-            while total > max_bytes:
-                oldest = c.execute(
-                    "SELECT message_id, size FROM bodies WHERE message_id != ? "
-                    "ORDER BY last_access ASC LIMIT 1", (message_id,)
-                ).fetchone()
-                if oldest is None:
-                    break
-                c.execute("DELETE FROM bodies WHERE message_id=?", (oldest["message_id"],))
-                total -= oldest["size"]
+            self._evict(c, message_id, max_bytes)
+
+    @staticmethod
+    def _evict(c, keep: str, max_bytes: int) -> None:
+        """Drop the least recently read bodies (and their pictures) until under max_bytes."""
+        total = c.execute("SELECT COALESCE(SUM(size),0) FROM bodies").fetchone()[0]
+        while total > max_bytes:
+            oldest = c.execute(
+                "SELECT message_id, size FROM bodies WHERE message_id != ? "
+                "ORDER BY last_access ASC LIMIT 1", (keep,)
+            ).fetchone()
+            if oldest is None:
+                break
+            c.execute("DELETE FROM bodies WHERE message_id=?", (oldest["message_id"],))
+            total -= oldest["size"]
+
+    def inline_images(self, message_id: str) -> dict[str, tuple[str, bytes]]:
+        rows = self.conn.execute(
+            "SELECT content_id, content_type, data FROM inline_images WHERE message_id=?",
+            (message_id,)).fetchall()
+        return {r["content_id"]: (r["content_type"], bytes(r["data"])) for r in rows}
+
+    def put_inline_images(self, message_id: str, images: dict[str, tuple[str, bytes]],
+                          max_bytes: int) -> None:
+        """Store a cached body's pictures; they add to its size (only while it's cached)."""
+        with self.conn as c:
+            if c.execute("SELECT 1 FROM bodies WHERE message_id=?", (message_id,)).fetchone() \
+                    is None:
+                return
+            added = 0
+            for cid, (ctype, data) in images.items():
+                cur = c.execute("INSERT OR IGNORE INTO inline_images"
+                                "(message_id, content_id, content_type, data) VALUES(?,?,?,?)",
+                                (message_id, cid, ctype, data))
+                added += len(data) if cur.rowcount else 0
+            c.execute("UPDATE bodies SET size = size + ? WHERE message_id=?", (added, message_id))
+            self._evict(c, message_id, max_bytes)
 
     # -- contacts ----------------------------------------------------------
     _CONTACT_COLUMNS = ("id", "account_id", "source", "folder_id", "folder_name",

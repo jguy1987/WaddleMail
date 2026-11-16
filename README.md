@@ -65,6 +65,9 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   temporary folder and open it with the desktop's app; right-click to save it (Save as), the
   selected ones or all of them (into a folder; names already there get " (2)"). An attached
   message saves as `.eml`. Pictures in the body (inline) aren't listed.
+- **Pictures in the body** (inline `cid:` attachments, such as logos in signatures and pasted
+  screenshots) show in the reader even with remote images off: they're fetched once, stored
+  beside the cached body (counting toward the cache size) and work offline.
     - While searching, the "Show in message list" period is ignored, so old mail is found.
 - **Reading pane** (View > Reading pane): Right, Bottom or Off. On the right the list switches to
   compact two-line rows with a Sort button. The pane shows a header (subject, sender, To/Cc,
@@ -82,6 +85,11 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   - A WYSIWYG body on a white page: font, size, bold/italic/underline/strikethrough, colour,
     highlight, bullets and numbering, indent, alignment, link (Ctrl+K), clear formatting.
     **Plain text** switches the message to text only (formatting is dropped).
+  - **Pictures in the body**: Insert picture on the formatting bar, paste one (a screenshot,
+    say), or drop picture files on the body (other files dropped there are attached).
+    Pictures wider than 640 px go in at that width; up to 10 MB each. They're sent as inline
+    attachments the body links to, as Outlook does; a quoted message's pictures go along
+    with a reply or forward. Signatures can have pictures too.
   - Replies and forwards: RE:/FW: subjects (no stacking), reply all leaves you out, and the
     body starts with the cursor at the top, then your signature, then a line and Outlook's
     From / Sent / To / Cc / Subject block over the original.
@@ -224,7 +232,7 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
 
 ## Not yet
 
-Inline (`cid:`) images, an offline outbox (sending needs a connection), searching all folders at once, deleting messages,
+Resizing a picture in the body after it's inserted, an offline outbox (sending needs a connection), searching all folders at once, deleting messages,
 moving or copying between mailboxes. Conversations only group messages within the current
 folder (your replies in Sent Items are not pulled in, as Outlook does).
 
@@ -290,6 +298,7 @@ waddlemail/contacts.py     contacts/directory/contact group sync, To/Cc suggesti
 waddlemail/calendars.py    calendars, events, categories, free/busy, layout and free-time search
 waddlemail/compose.py      replies: recipients, subjects, quoted header; the message to send
 waddlemail/attachments.py  attachments being written (reconcile an item's with the list); safe names to save
+waddlemail/inline.py       pictures in bodies: cid: links to data: URIs and back
 waddlemail/resources/      app icon (SVG + PNG sizes), tray icons, launcher template
 waddlemail/settings.py     Preferences (QSettings) and their defaults
 waddlemail/ui/             main window + menus/toolbar, preferences, new mail/event dialogs, safe rendering
@@ -349,6 +358,6 @@ waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 2. Removing a contact's photo (Graph has no call for it); photos in lists and autocomplete.
 3. Calendar: other people's shared calendars, room booking; reminders dismissed on another
    device aren't noticed here until they'd fire (Graph's reminderView could tell).
-4. `cid:` images (pictures in the body); search across all folders; optional background download of
+4. Search across all folders; optional background download of
    bodies so local search covers everything offline.
 5. Publisher verification of the app registration before sharing with other organizations.

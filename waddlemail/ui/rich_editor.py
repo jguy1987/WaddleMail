@@ -1,22 +1,75 @@
 """A WYSIWYG editor: a white page (as the recipient sees it, whatever the app theme) with a
 formatting bar: font, size, bold, italic, underline, strikethrough, colour, highlight,
-bullets, numbering, indent, alignment, link and clear formatting. It can switch to plain text.
-Used for composing mail and for signatures."""
+bullets, numbering, indent, alignment, link, picture and clear formatting. It can switch to
+plain text. Used for composing mail and for signatures.
+
+Pictures (inserted, pasted or dropped) are held in the document as data: URIs; sending turns
+them into inline attachments (inline.extract_inline)."""
 from __future__ import annotations
 
-from PySide6.QtCore import QSize, Qt, QUrl
+import mimetypes
+import os
+
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QSize, Qt, QUrl
 from PySide6.QtGui import (
-    QAction, QColor, QFont, QPalette, QTextBlockFormat, QTextCharFormat, QTextCursor,
-    QTextListFormat,
+    QAction, QColor, QFont, QImage, QPalette, QTextBlockFormat, QTextCharFormat, QTextCursor,
+    QTextImageFormat, QTextListFormat,
 )
 from PySide6.QtWidgets import (
-    QColorDialog, QComboBox, QFontComboBox, QInputDialog, QTextEdit, QToolBar, QVBoxLayout,
-    QWidget,
+    QColorDialog, QComboBox, QFileDialog, QFontComboBox, QInputDialog, QMessageBox, QTextEdit,
+    QToolBar, QVBoxLayout, QWidget,
 )
 
+from ..inline import data_uri
 from . import iconset
 
 SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48, 72]
+PICTURE_WIDTH = 640                  # wider pictures go in at this width (the file is kept)
+MAX_PICTURE = 10 * 1024 * 1024       # bigger ones should be attached instead
+PICTURE_FILES = "Pictures (*.png *.jpg *.jpeg *.gif *.bmp *.webp)"
+
+
+def is_picture(path: str) -> bool:
+    kind, _ = mimetypes.guess_type(path)
+    return bool(kind) and kind.startswith("image/") and kind != "image/svg+xml"
+
+
+class _Edit(QTextEdit):
+    """Pasting a picture (or picture files) puts it in the text."""
+
+    def __init__(self, owner: "RichEditor"):
+        super().__init__()
+        self._owner = owner
+
+    def canInsertFromMimeData(self, source) -> bool:
+        if not self._owner.is_plain() and (source.hasImage() or self._pictures(source)):
+            return True
+        return super().canInsertFromMimeData(source)
+
+    def insertFromMimeData(self, source) -> None:
+        if not self._owner.is_plain():
+            files = self._pictures(source)
+            if files:
+                for path in files:
+                    self._owner.insert_picture_file(path)
+                return
+            if source.hasImage() and not source.hasHtml():  # (HTML keeps its own pictures)
+                image = QImage(source.imageData())
+                if not image.isNull():
+                    data = QByteArray()
+                    buf = QBuffer(data)
+                    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+                    image.save(buf, "PNG")
+                    self._owner.insert_picture(bytes(data), "image/png")
+                    return
+        super().insertFromMimeData(source)
+
+    @staticmethod
+    def _pictures(source) -> list[str]:
+        if not source.hasUrls():
+            return []
+        paths = [u.toLocalFile() for u in source.urls() if u.isLocalFile()]
+        return paths if paths and all(is_picture(p) for p in paths) else []
 
 
 class RichEditor(QWidget):
@@ -27,7 +80,7 @@ class RichEditor(QWidget):
         lay.setSpacing(0)
         self.bar = QToolBar("Format")
         self.bar.setIconSize(QSize(16, 16))
-        self.edit = QTextEdit()
+        self.edit = _Edit(self)
         self.edit.setAcceptRichText(True)
         self.edit.setTabChangesFocus(False)
         # a white page with black text, like the message will look (dark theme or not)
@@ -95,6 +148,7 @@ class RichEditor(QWidget):
             act.setCheckable(True)
             self._aligns[flag] = act
         self.bar.addSeparator()
+        self.bar.addAction(iconset.load("image"), "Insert picture", self.choose_picture)
         act = self.bar.addAction(iconset.load("link"), "Insert link (Ctrl+K)", self.insert_link)
         act.setShortcut("Ctrl+K")
         act.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -210,6 +264,42 @@ class RichEditor(QWidget):
         fmt.setFontUnderline(True)
         cursor.insertText(text, fmt)
         cursor.setCharFormat(QTextCharFormat())  # typing after the link isn't part of it
+
+    # -- pictures ----------------------------------------------------------------------------
+    def choose_picture(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Insert picture", "", PICTURE_FILES)
+        for path in paths:
+            self.insert_picture_file(path)
+
+    def insert_picture_file(self, path: str, cursor: QTextCursor | None = None) -> bool:
+        try:
+            if os.path.getsize(path) > MAX_PICTURE:
+                QMessageBox.warning(self, "Insert picture", f"{os.path.basename(path)} is over "
+                                    "10 MB: attach it instead.")
+                return False
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            QMessageBox.warning(self, "Insert picture", str(exc))
+            return False
+        kind, _ = mimetypes.guess_type(path)
+        return self.insert_picture(data, kind or "image/png", cursor)
+
+    def insert_picture(self, data: bytes, content_type: str,
+                       cursor: QTextCursor | None = None) -> bool:
+        """Put a picture in the text at the cursor, at most PICTURE_WIDTH wide."""
+        image = QImage.fromData(data)
+        if self._plain or image.isNull():
+            return False
+        fmt = QTextImageFormat()
+        fmt.setName(data_uri(content_type, data))
+        w, h = image.width(), image.height()
+        scale = min(1.0, PICTURE_WIDTH / w) if w else 1.0
+        fmt.setWidth(round(w * scale))
+        fmt.setHeight(round(h * scale))
+        (cursor or self.edit.textCursor()).insertImage(fmt)
+        self.edit.setFocus()
+        return True
 
     def clear_formatting(self):
         cursor = self.edit.textCursor()

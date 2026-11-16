@@ -19,11 +19,12 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__, desktop, graph
-from ..attachments import Attachment, file_name, reconcile, unique_path
+from ..attachments import Attachment, file_name, reconcile, reconcile_inline, unique_path
 from ..calendars import event_row as calendar_event_row
 from ..calendars import event_span
 from ..contacts import personal_row, removal_payload, suggestions
 from ..graph import NO_SUBFOLDERS
+from ..inline import cid_refs
 from ..mailboxes import MailboxManager
 from ..notify import make_notifier
 from ..settings import Settings
@@ -1714,9 +1715,10 @@ class MainWindow(QMainWindow):
         return next((b for b in self.mailboxes.all()
                      if not b.shared and b.account_id == win.account_id()), None)
 
-    def _write_draft(self, box, win: ComposeWindow) -> str:
-        """Create or update the message in Drafts (worker thread); returns its id."""
-        message = win.outgoing().graph_message()
+    def _write_draft(self, box, win: ComposeWindow, out) -> str:
+        """Create or update the message `out` (win.outgoing(), taken on the GUI thread) in
+        Drafts (worker thread); returns its id."""
+        message = out.graph_message()
         draft_id = win.draft_id
         if draft_id is None and win.original is None:
             draft_id = box.graph.create_draft(message)["id"]
@@ -1728,6 +1730,12 @@ class MainWindow(QMainWindow):
         if win.has_had_attachments:
             reconcile(box.graph, box.graph.message_path(draft_id), win.attachments.items(),
                       remove_others=win.originals_known)
+        # pictures in the body: inline attachments its cid: links point to
+        if out.inline or win.had_pictures:
+            ours = {i.content_id.lower() for i in out.inline}
+            reconcile_inline(box.graph, box.graph.message_path(draft_id), out.inline,
+                             keep_others=bool(cid_refs(out.body) - ours))
+            win.had_pictures = True
         return draft_id
 
     def send_message(self, win: ComposeWindow):
@@ -1738,10 +1746,11 @@ class MainWindow(QMainWindow):
         win.act_send.setEnabled(False)
 
         def job():
-            if win.original is None and win.draft_id is None and not win.attachments.items():
+            if win.original is None and win.draft_id is None and not win.attachments.items() \
+                    and not out.inline:
                 box.graph.send_mail(out.graph_message())  # plain new mail: straight out
-            else:  # attachments, replies/forwards (threading) and saved drafts: via a draft
-                box.graph.send_draft(self._write_draft(box, win))
+            else:  # attachments, pictures, replies/forwards (threading), saved drafts: a draft
+                box.graph.send_draft(self._write_draft(box, win, out))
 
         original = win.original["id"] if win.original is not None else None
         verb = {"reply": 102, "replyAll": 103, "forward": 104}.get(win.kind)
@@ -1777,7 +1786,8 @@ class MainWindow(QMainWindow):
             win.sent = False
             QMessageBox.warning(win, "Save draft", f"The draft wasn't saved.\n\n{msg}")
 
-        self._run(lambda: self._write_draft(box, win), done, on_failed=failed,
+        out = win.outgoing()
+        self._run(lambda: self._write_draft(box, win, out), done, on_failed=failed,
                   activity="Saving draft…")
 
     # -- calendar ------------------------------------------------------------

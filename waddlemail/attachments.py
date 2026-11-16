@@ -9,6 +9,7 @@ import os
 from dataclasses import dataclass, field
 
 from .graph import GraphClient
+from .inline import InlineImage
 
 
 @dataclass
@@ -103,4 +104,26 @@ def reconcile(graph: GraphClient, item: str, wanted: list[Attachment],
             if att.remote_id:
                 known.add(att.remote_id)
             result.uploaded.append(att.name)
+    return result
+
+
+def reconcile_inline(graph: GraphClient, item: str, images: list[InlineImage],
+                     keep_others: bool = False) -> ReconcileResult:
+    """Make the inline pictures of `item` the body's `images`: upload the ones not there yet
+    (found by name, which follows the content) and remove the rest: earlier versions', and
+    the copies Exchange puts on a reply or forward of the original's (the body has its own
+    copies of those). `keep_others` keeps the rest: the body still links to some of them."""
+    result = ReconcileResult()
+    remote = [a for a in graph.attachments(item) if a.get("isInline")]
+    have = {r.get("name") for r in remote}
+    wanted = {i.name for i in images}
+    for r in remote if not keep_others else []:
+        if r.get("name") not in wanted:
+            graph.delete_attachment(item, r["id"])
+            result.removed.append(r.get("name") or r["id"])
+    for img in images:
+        if img.name not in have:
+            graph.add_attachment(item, img.name, img.data, img.content_type,
+                                 content_id=img.content_id)
+            result.uploaded.append(img.name)
     return result

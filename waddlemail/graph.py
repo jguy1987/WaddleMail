@@ -12,6 +12,7 @@ import requests
 
 from . import config
 from .auth import AuthError
+from .inline import MAX_INLINE_IMAGE, cid_key, image_type
 
 log = logging.getLogger(__name__)
 
@@ -576,23 +577,52 @@ class GraphClient:
         return self._request(f"{item}/attachments/{quote(attachment_id, safe='')}/$value",
                              raw=True)
 
+    def inline_images(self, message_id: str, wanted: set[str]) -> dict[str, tuple[str, bytes]]:
+        """The pictures a body links to with cid: (`wanted`, as cid_key()s): {content id:
+        (type, bytes)}. Inline attachments are tried first, then other pictures (some senders
+        don't mark them inline); each is fetched whole, the very large skipped."""
+        item = self.message_path(message_id)
+        listed = self.attachments(item)
+        candidates = [a for a in listed if a.get("isInline")] + [
+            a for a in listed if not a.get("isInline")
+            and (a.get("contentType") or "").startswith("image/")]
+        found: dict[str, tuple[str, bytes]] = {}
+        for att in candidates:
+            if not wanted - found.keys():
+                break
+            if int(att.get("size") or 0) > MAX_INLINE_IMAGE:
+                continue
+            full = self._request(f"{item}/attachments/{quote(att['id'], safe='')}")
+            if not full.get("contentBytes"):
+                continue  # (an attached message or a link: not a picture)
+            picture = (image_type(full.get("contentType"), full.get("name")),
+                       base64.b64decode(full["contentBytes"]))
+            for key in (full.get("contentId"), full.get("name")):
+                if key and cid_key(key) in wanted:
+                    found[cid_key(key)] = picture
+        return found
+
     def delete_attachment(self, item: str, attachment_id: str) -> None:
         self._request(f"{item}/attachments/{quote(attachment_id, safe='')}", method="DELETE")
 
     def add_attachment(self, item: str, name: str, data: bytes,
-                       content_type: str = "application/octet-stream") -> str | None:
-        """Attach a file; returns the attachment's id (None if the server didn't say)."""
+                       content_type: str = "application/octet-stream",
+                       content_id: str | None = None) -> str | None:
+        """Attach a file; returns the attachment's id (None if the server didn't say). With
+        `content_id` it's an inline picture, which the body shows with a cid: link."""
+        inline = {"isInline": True, "contentId": content_id} if content_id else {}
         if len(data) > self.MAX_ATTACHMENT:
             raise GraphError(f"{name} is larger than 150 MB, the most an attachment can be")
         if len(data) < self.SMALL_ATTACHMENT:
             made = self._request(f"{item}/attachments", method="POST", json={
                 "@odata.type": "#microsoft.graph.fileAttachment", "name": name,
                 "contentType": content_type,
-                "contentBytes": base64.b64encode(data).decode("ascii")})
+                "contentBytes": base64.b64encode(data).decode("ascii"), **inline})
             return made.get("id")
         session = self._request(f"{item}/attachments/createUploadSession", method="POST",
                                 json={"AttachmentItem": {"attachmentType": "file",
-                                                         "name": name, "size": len(data)}})
+                                                         "name": name, "size": len(data),
+                                                         **inline}})
         return self._upload(session["uploadUrl"], data)
 
     def _upload(self, url: str, data: bytes) -> str | None:

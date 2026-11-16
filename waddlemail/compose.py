@@ -104,6 +104,7 @@ class Outgoing:
     to: list = field(default_factory=list)   # "Name <address>" strings
     cc: list = field(default_factory=list)
     bcc: list = field(default_factory=list)
+    inline: list = field(default_factory=list)  # InlineImage: the body's pictures (cid:)
 
     @staticmethod
     def _recips(items: list) -> list[dict]:

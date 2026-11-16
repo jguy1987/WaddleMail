@@ -355,6 +355,7 @@ def checks():
     new_button_checks()
     compose_checks()
     attachment_checks()
+    picture_checks()
 
     w.close()
     saved = Settings(str(tmp / "settings.ini"))
@@ -1247,15 +1248,18 @@ class FakeAttachments:
     def install(self):
         G = graph.GraphClient
         G.attachments = lambda c, item: list(self.items.get(item, []))
-        G.add_attachment = lambda c, item, name, data, ctype="": self._add(item, name, data)
+        G.add_attachment = lambda c, item, name, data, ctype="", content_id=None: self._add(
+            item, name, data, content_id)
         G.delete_attachment = lambda c, item, aid: self._delete(item, aid)
         G.attachment_content = lambda c, item, aid: f"content of {aid}".encode()
 
-    def _add(self, item, name, data):
+    def _add(self, item, name, data, content_id=None):
         self.n += 1
         self.items.setdefault(item, []).append({"id": f"att{self.n}", "name": name,
-                                                "size": len(data)})
+                                                "size": len(data),
+                                                "isInline": content_id is not None})
         self.added.append((item, name))
+        self.inline = getattr(self, "inline", []) + ([(name, content_id)] if content_id else [])
         return f"att{self.n}"
 
     def _delete(self, item, aid):
@@ -1379,6 +1383,62 @@ def attachment_checks():
     w._save_event(dlg, st.event_row(eid))
     wait(500)
     check(atts.items.get(f"/me/events/{eid}") == [], "...and one can be removed")
+
+
+def picture_checks():
+    from PySide6.QtCore import QMimeData, QPointF, QUrl
+    from PySide6.QtGui import QDropEvent, QImage
+    out, atts = FakeOutbox(), FakeAttachments()
+    out.install()
+    atts.install()
+    pic = tmp / "files" / "chart.png"
+    img = QImage(900, 300, QImage.Format.Format_RGB32)
+    img.fill(0x3366CC)
+    img.save(str(pic))
+
+    w.new_mail(to=["Ana Ruiz <ana@x.com>"])
+    wait(200)
+    win = compose_windows()[-1]
+    win.subject.setText("Chart")
+    win.editor.insert_picture_file(str(pic))
+    html = win.editor.html()
+    check("data:image/png;base64," in html and 'width="640"' in html,
+          "insert picture: in the body, scaled to fit")
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(pic))])
+    vp = win.editor.edit.viewport()
+    win.eventFilter(vp, QDropEvent(QPointF(10, 10), Qt.DropAction.CopyAction, mime,
+                                   Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+    check(win.editor.html().count("data:image/png") == 2 and not win.attachments.items(),
+          "a picture dropped on the body goes into the text, not the attachments")
+    win.act_send.trigger()
+    wait(500)
+    patched = out.updates[-1][1]["body"]["content"] if out.updates else ""
+    created = out.drafts[-1]["body"]["content"] if out.drafts else ""
+    content_id = atts.inline[-1][1] if getattr(atts, "inline", None) else "?"
+    check(not any(m.get("subject") == "Chart" for m in out.sent)
+          and len(atts.inline) == 1 and f"cid:{content_id}" in created + patched
+          and "data:image" not in created + patched,
+          "sent as an inline attachment the body links to (one, though it's in twice)")
+
+    # a received message's pictures (cid:) show in the reader and in a reply
+    st.put_body("m2", "html", '<p>See <img src="cid:logo@x"></p>', 10 ** 9)
+    graph.GraphClient.inline_images = lambda c, mid, wanted: {"logo@x": ("image/png",
+                                                                         pic.read_bytes())}
+    w._current_message = None
+    w._show_in_pane("m2")
+    wait(400)
+    check(w.msg_view._body and "data:image/png;base64," in w.msg_view._body[1]
+          and "cid:" not in w.msg_view._body[1], "a received message's pictures show")
+    w.respond("reply", "m2")
+    wait(500)
+    win = compose_windows()[-1]
+    check("data:image/png" in win.editor.html(), "...and in the quote of a reply")
+    before = len(atts.inline)
+    win.act_send.trigger()
+    wait(500)
+    check(len(atts.inline) == before + 1 and "cid:" in out.updates[-1][1]["body"]["content"],
+          "...which sends it along as an inline picture")
 
 
 def travel_id():
