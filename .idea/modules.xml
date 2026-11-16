@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/TetherMail.iml" filepath="$PROJECT_DIR$/.idea/TetherMail.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/WaddleMail.iml" filepath="$PROJECT_DIR$/.idea/WaddleMail.iml" />
     </modules>
   </component>
 </project>
