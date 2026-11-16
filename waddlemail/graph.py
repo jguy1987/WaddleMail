@@ -237,6 +237,46 @@ class GraphClient:
         To delete the way Outlook does, move it to Deleted Items instead."""
         self._request(f"{self._root}/mailFolders/{quote(folder_id, safe='')}", method="DELETE")
 
+    # -- tasks (Microsoft To Do) -----------------------------------------
+    def todo_lists(self) -> list[dict]:
+        return list(self._paged(f"{self._root}/todo/lists"))
+
+    def _tasks_url(self, list_id: str, task_id: str | None = None) -> str:
+        url = f"{self._root}/todo/lists/{quote(list_id, safe='')}/tasks"
+        return f"{url}/{quote(task_id, safe='')}" if task_id else url
+
+    def tasks_delta(self, list_id: str, delta_link: str | None = None
+                    ) -> tuple[list[dict], str | None]:
+        """A list's tasks changed since `delta_link` (all of them without one), removed ones
+        marked "@removed"; and the link for next time."""
+        url = delta_link or f"{self._tasks_url(list_id)}/delta"
+        items: list[dict] = []
+        while url:
+            data = self._request(url, headers=_prefer('outlook.timezone="UTC"'))
+            items += data.get("value", [])
+            url = data.get("@odata.nextLink")
+            if data.get("@odata.deltaLink"):
+                return items, data["@odata.deltaLink"]
+        return items, None
+
+    def save_task(self, list_id: str, fields: dict, task_id: str | None = None) -> dict:
+        """Create (in list `list_id`) or change a task; returns it."""
+        return self._request(self._tasks_url(list_id, task_id),
+                             method="PATCH" if task_id else "POST", json=fields,
+                             headers=_prefer('outlook.timezone="UTC"'))
+
+    def delete_task(self, list_id: str, task_id: str) -> None:
+        self._request(self._tasks_url(list_id, task_id), method="DELETE")
+
+    def task_links(self, list_id: str, task_id: str) -> list[dict]:
+        """A task's linkedResources (for one made from an email: that email)."""
+        return list(self._paged(f"{self._tasks_url(list_id, task_id)}/linkedResources"))
+
+    def message_link(self, message_id: str) -> str:
+        """The message's Outlook on the web address."""
+        return self._request(f"{self._root}/messages/{quote(message_id, safe='')}",
+                             params={"$select": "webLink"}, headers=_prefer()).get("webLink", "")
+
     # -- calendar ------------------------------------------------------
     # Times are read and written in UTC (Prefer outlook.timezone); WaddleMail converts to local.
     def calendars(self) -> list[dict]:

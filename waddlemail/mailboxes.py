@@ -15,6 +15,7 @@ from .contacts import ContactSync
 from .graph import GraphClient
 from .store import Store
 from .sync import SyncEngine
+from .tasks import TaskSync
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ class Mailbox:
     bodies: BodyService
     contacts: ContactSync | None = None  # an account's own mailbox only
     calendar: CalendarSync | None = None   # likewise
+    tasks: TaskSync | None = None          # likewise
 
     @property
     def shared(self) -> bool:
@@ -70,8 +72,9 @@ class MailboxManager:
         own = not r["address"]
         contacts = ContactSync(self.store, graph, account_id) if own else None
         calendar = CalendarSync(self.store, graph, account_id) if own else None
+        tasks = TaskSync(self.store, graph, account_id) if own else None
         return Mailbox(r["id"], account_id, r["address"], r["display_name"], graph, sync, bodies,
-                       contacts, calendar)
+                       contacts, calendar, tasks)
 
     def all(self) -> list[Mailbox]:
         return list(self._boxes.values())

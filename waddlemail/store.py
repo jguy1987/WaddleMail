@@ -83,6 +83,32 @@ CREATE VIRTUAL TABLE IF NOT EXISTS body_fts USING fts5(
 CREATE TRIGGER IF NOT EXISTS bodies_fts_delete AFTER DELETE ON bodies BEGIN
     DELETE FROM body_fts WHERE rowid = old.rowid;
 END;
+-- Tasks (Microsoft To Do): each account's lists and their tasks (tasks.py).
+CREATE TABLE IF NOT EXISTS task_lists(
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    well_known TEXT,                -- defaultList / flaggedEmails / none
+    shared INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS tasks(
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    list_id TEXT NOT NULL,
+    title TEXT,
+    status TEXT,                    -- notStarted / inProgress / waitingOnOthers / deferred / completed
+    importance TEXT,                -- low / normal / high
+    due TEXT,                       -- YYYY-MM-DD
+    start TEXT,                     -- YYYY-MM-DD
+    reminder TEXT,                  -- UTC ISO; NULL = no reminder
+    completed TEXT,                 -- UTC ISO
+    body TEXT, body_type TEXT,
+    categories TEXT,                -- JSON [name, ...]
+    created TEXT, modified TEXT,
+    links TEXT,                     -- JSON [[name, web url, external id, app], ...]; NULL = not fetched
+    recurrence TEXT                 -- JSON patternedRecurrence
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_list ON tasks(list_id);
 -- Messages waiting to be sent (outbox.py): the server couldn't be reached when you sent them.
 CREATE TABLE IF NOT EXISTS outbox(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1054,6 +1080,97 @@ class Store:
         """Local changes and messages not yet sent, all mailboxes."""
         return self.conn.execute("SELECT (SELECT COUNT(*) FROM pending)"
                                  " + (SELECT COUNT(*) FROM outbox)").fetchone()[0]
+
+    # -- tasks -----------------------------------------------------------
+    _TASK_COLUMNS = ("id", "account_id", "list_id", "title", "status", "importance", "due",
+                     "start", "reminder", "completed", "body", "body_type", "categories",
+                     "created", "modified", "recurrence")
+
+    def replace_task_lists(self, account_id: str, rows: list[dict]) -> None:
+        """Make `rows` the account's lists; tasks of lists that are gone go too."""
+        keep = [r["id"] for r in rows]
+        with self.conn as c:
+            gone = [r[0] for r in c.execute("SELECT id FROM task_lists WHERE account_id=?",
+                                            (account_id,)) if r[0] not in keep]
+            for lid in gone:
+                c.execute("DELETE FROM tasks WHERE list_id=?", (lid,))
+                c.execute("DELETE FROM task_lists WHERE id=?", (lid,))
+                c.execute("DELETE FROM sync_state WHERE key=?", (f"todo:{lid}",))
+            c.executemany("INSERT OR REPLACE INTO task_lists(id, account_id, name, well_known,"
+                          " shared) VALUES(:id, :account_id, :name, :well_known, :shared)", rows)
+
+    def task_lists(self, account_id: str | None = None) -> list[sqlite3.Row]:
+        """Tasks first, Flagged email next, then the rest by name."""
+        sql, args = "SELECT * FROM task_lists", ()
+        if account_id is not None:
+            sql, args = sql + " WHERE account_id=?", (account_id,)
+        return self.conn.execute(
+            sql + " ORDER BY account_id, CASE well_known WHEN 'defaultList' THEN 0"
+            " WHEN 'flaggedEmails' THEN 1 ELSE 2 END, name COLLATE NOCASE", args).fetchall()
+
+    def task_list(self, list_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM task_lists WHERE id=?", (list_id,)).fetchone()
+
+    def upsert_task(self, row: dict) -> None:
+        """Insert or update a task; its links stay unless `row` has them."""
+        cols = self._TASK_COLUMNS + (("links",) if "links" in row else ())
+        with self.conn as c:
+            c.execute(f"INSERT INTO tasks({','.join(cols)}) VALUES({','.join('?' * len(cols))})"
+                      f" ON CONFLICT(id) DO UPDATE SET "
+                      + ", ".join(f"{k}=excluded.{k}" for k in cols if k != "id"),
+                      tuple(row.get(k) for k in cols))
+
+    def apply_task_changes(self, rows: list[dict], removed: list[str]) -> None:
+        for row in rows:
+            self.upsert_task(row)
+        with self.conn as c:
+            c.executemany("DELETE FROM tasks WHERE id=?", [(i,) for i in removed])
+
+    def clear_task_list(self, list_id: str) -> None:
+        with self.conn as c:
+            c.execute("DELETE FROM tasks WHERE list_id=?", (list_id,))
+
+    def task(self, task_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+
+    def tasks(self, list_ids: list[str] | None = None, completed: bool = True,
+              search: str = "") -> list[sqlite3.Row]:
+        sql, args = "SELECT * FROM tasks WHERE 1", []
+        if list_ids is not None:
+            sql += f" AND list_id IN ({','.join('?' * len(list_ids))})"
+            args += list_ids
+        if not completed:
+            sql += " AND status != 'completed'"
+        for word in search.split():
+            sql += " AND (title LIKE ? OR body LIKE ? OR categories LIKE ?)"
+            args += [f"%{word}%"] * 3
+        return self.conn.execute(sql + " ORDER BY due IS NULL, due, importance = 'high' DESC,"
+                                 " title COLLATE NOCASE", args).fetchall()
+
+    def tasks_with_reminders(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM tasks WHERE reminder IS NOT NULL"
+                                 " AND status != 'completed'").fetchall()
+
+    def task_counts(self, today: str) -> dict[str, tuple[int, int]]:
+        """Per list: (open tasks, overdue ones)."""
+        return {r[0]: (r[1], r[2]) for r in self.conn.execute(
+            "SELECT list_id, COUNT(*), SUM(due IS NOT NULL AND due < ?) FROM tasks"
+            " WHERE status != 'completed' GROUP BY list_id", (today,))}
+
+    def update_task(self, task_id: str, **fields) -> None:
+        """Change some of a task's columns here (before the server has it)."""
+        cols = [k for k in fields if k in self._TASK_COLUMNS and k != "id"]
+        with self.conn as c:
+            c.execute(f"UPDATE tasks SET {', '.join(f'{k}=?' for k in cols)} WHERE id=?",
+                      (*[fields[k] for k in cols], task_id))
+
+    def set_task_links(self, task_id: str, links: list) -> None:
+        with self.conn as c:
+            c.execute("UPDATE tasks SET links=? WHERE id=?", (json.dumps(links), task_id))
+
+    def delete_task(self, task_id: str) -> None:
+        with self.conn as c:
+            c.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
     # -- the Outbox ------------------------------------------------------
     def outbox_add(self, mailbox_id: str, payload: dict, error: str | None = None) -> int:

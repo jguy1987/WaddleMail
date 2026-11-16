@@ -36,6 +36,8 @@ from ..outbox import (
 )
 from ..settings import Settings
 from ..store import Store
+from ..text import body_text
+from ..tasks import TaskDraft, quick_due
 from . import iconset
 from .contacts_view import ContactsView
 from .calendar_view import CalendarPage
@@ -50,6 +52,9 @@ from .message_view import MessageView, MessageWindow
 from .preferences import PreferencesDialog
 from .render import placeholder
 from .status_indicator import StatusIndicator
+from .task_editor import TaskEditor
+from .tasks_view import ALL as ALL_TASKS
+from .tasks_view import TasksPage
 from .tray import Tray
 
 log = logging.getLogger(__name__)
@@ -186,16 +191,28 @@ class MainWindow(QMainWindow):
         self._calendar_fetch_soon.setInterval(300)
         self._calendar_fetch_soon.timeout.connect(self.refresh_calendar)
         self._calendar_busy = False
+        self.tasks_page = TasksPage(store)
+        tp = self.tasks_page
+        tp.newRequested.connect(lambda lid: self.new_task(list_id=lid or None))
+        tp.quickAddRequested.connect(self.quick_add_task)
+        tp.editRequested.connect(self.edit_task)
+        tp.completeRequested.connect(self.complete_tasks)
+        tp.dueRequested.connect(self.set_task_due)
+        tp.deleteRequested.connect(self.delete_tasks)
+        tp.openEmailRequested.connect(self.open_task_email)
+        tp.refreshRequested.connect(self.refresh_tasks)
+        self._tasks_busy = False
         self.reminder_window = ReminderWindow(self)
         rw = self.reminder_window
         rw.dismissRequested.connect(self.dismiss_reminders)
         rw.snoozeRequested.connect(self.snooze_reminders)
-        rw.openRequested.connect(self._open_event)
+        rw.openRequested.connect(self._open_reminder)
         rw.joinRequested.connect(lambda url: QDesktopServices.openUrl(QUrl(url)))
         self.pages = QStackedWidget()
         self.pages.addWidget(self.outer)
         self.pages.addWidget(self.calendar_page)
         self.pages.addWidget(self.contacts_view)
+        self.pages.addWidget(self.tasks_page)
         self.setCentralWidget(self.pages)
         self._contacts_busy = False
 
@@ -240,6 +257,9 @@ class MainWindow(QMainWindow):
         self.calendar_timer = QTimer(self)  # meetings arrive and move: every few minutes
         self.calendar_timer.setInterval(5 * 60_000)
         self.calendar_timer.timeout.connect(self.refresh_calendar)
+        self.tasks_timer = QTimer(self)  # tasks change now and then: every ten minutes
+        self.tasks_timer.setInterval(10 * 60_000)
+        self.tasks_timer.timeout.connect(self.refresh_tasks)
         self.contacts_timer = QTimer(self)  # contacts change slowly: hourly is plenty
         self.contacts_timer.setInterval(60 * 60_000)
         self.contacts_timer.timeout.connect(self.refresh_contacts)
@@ -330,6 +350,8 @@ class MainWindow(QMainWindow):
         self.refresh_contacts()
         self.calendar_timer.start()
         self.refresh_calendar(calendars=True)
+        self.tasks_timer.start()
+        self.refresh_tasks()
         self.reminders.start()
 
     # -- folders ------------------------------------------------------
@@ -744,10 +766,14 @@ class MainWindow(QMainWindow):
         delete = QAction(iconset.load("trash-2"), "Delete")
         delete.setShortcut(QKeySequence.StandardKey.Delete)
         delete.setToolTip("Delete: to Deleted Items (Del)")
-        win = MessageWindow(row, self.images_action.isChecked(), [delete],
+        task = QAction(iconset.load("square-check-big"), "Task")
+        task.setToolTip("Create a task from this message")
+        task.triggered.connect(lambda: self.task_from_message(mid))
+        win = MessageWindow(row, self.images_action.isChecked(), [task, delete],
                             lambda copy: self.move_messages([mid], copy=copy, parent=win), self,
                             respond=lambda kind: self.respond(kind, mid))
         delete.setParent(win)
+        task.setParent(win)
         delete.triggered.connect(lambda: self.delete_messages([mid], parent=win) and win.close())
         self._windows.add(win)
         win.destroyed.connect(lambda *_: self._windows.discard(win))
@@ -873,7 +899,8 @@ class MainWindow(QMainWindow):
     # -- contacts -----------------------------------------------------------
     _NEW = {"mail": ("New Mail", "mail-plus", "New mail message (Ctrl+N)"),
             "calendar": ("New Event", "calendar-plus", "New event (Ctrl+Shift+E)"),
-            "contacts": ("New Contact", "user-plus", "New contact (Ctrl+Shift+C)")}
+            "contacts": ("New Contact", "user-plus", "New contact (Ctrl+Shift+C)"),
+            "tasks": ("New Task", "square-check-big", "New task (Ctrl+Shift+T)")}
 
     def _update_new_button(self, page: str):
         text, icon, tip = self._NEW[page]
@@ -883,16 +910,17 @@ class MainWindow(QMainWindow):
         self._new_page = page
 
     def _new_for_page(self):
-        {"calendar": self.new_event, "contacts": self.new_contact}.get(
+        {"calendar": self.new_event, "contacts": self.new_contact,
+         "tasks": lambda: self.new_task(list_id=self.tasks_page.current_list() or None)}.get(
             self._new_page, self.new_mail)()
 
     def new_contact(self):
         self.contacts_view.new_contact()
 
     def show_page(self, page: str):
-        """"mail", "calendar" or "contacts"."""
-        widget = {"contacts": self.contacts_view, "calendar": self.calendar_page}.get(
-            page, self.outer)
+        """"mail", "calendar", "contacts" or "tasks"."""
+        widget = {"contacts": self.contacts_view, "calendar": self.calendar_page,
+                  "tasks": self.tasks_page}.get(page, self.outer)
         self.pages.setCurrentWidget(widget)
         self._nav[page].setChecked(True)
         self._update_new_button(page)
@@ -900,6 +928,9 @@ class MainWindow(QMainWindow):
             self.contacts_view.search.setFocus()
         elif page == "calendar":
             self.calendar_page.grid.setFocus()
+        elif page == "tasks":
+            self.tasks_page.reload()
+            self.tasks_page.tree.setFocus()
 
     def refresh_contacts(self):
         """Download contacts, contact groups and the directory for every account, and
@@ -1424,6 +1455,10 @@ class MainWindow(QMainWindow):
             self.notifier.notify(summary, body, key, origin=mailbox)
 
     def _open_from_notification(self, key: str):
+        if key == "tasks|":  # the day's task summary
+            self.tray.show_window()
+            self.show_page("tasks")
+            return
         if key.startswith("event|"):  # a reminder: show the reminders
             self.reminder_window.show()
             self.reminder_window.raise_()
@@ -1588,6 +1623,8 @@ class MainWindow(QMainWindow):
             "&Event", "calendar-plus", self.new_event, "Ctrl+Shift+E"))
         self.new_menu.addAction(self._themed(
             "&Contact…", "user-plus", self.new_contact, "Ctrl+Shift+C"))
+        self.new_menu.addAction(self._themed(
+            "&Task…", "square-check-big", lambda: self.new_task(), "Ctrl+Shift+T"))
         self.new_menu.addSeparator()
         self.new_menu.addAction(self._themed("&Folder…", "folder-plus", self.new_folder))
 
@@ -1637,6 +1674,10 @@ class MainWindow(QMainWindow):
             icon="folder-input")
         self.act_copy_to = self._list_action(
             "Cop&y to folder…", lambda: self.move_messages(sel(), copy=True), icon="copy")
+        self.act_task = self._list_action(
+            "Create &task from message…", lambda: self.task_from_message(),
+            icon="square-check-big")
+        self.act_task.setToolTip("A task to follow this message up, linked to it")
         self.msg_list.addAction(self._separator())
         self.act_delete = self._list_action(
             "&Delete", lambda: self.delete_messages(sel()), QKeySequence.StandardKey.Delete,
@@ -1648,7 +1689,7 @@ class MainWindow(QMainWindow):
         self._message_actions = [self.act_open, self.act_mark_read, self.act_mark_unread,
                                  self.act_toggle_read, self.act_toggle_flag,
                                  self.act_flag_complete, self.act_move, self.act_copy_to,
-                                 self.act_delete, self.act_delete_forever]
+                                 self.act_task, self.act_delete, self.act_delete_forever]
 
         self.act_threads = QAction("Group by &conversation", self)
         self.act_threads.setCheckable(True)
@@ -1679,7 +1720,7 @@ class MainWindow(QMainWindow):
         return act
 
     def _build_nav(self):
-        """The rail on the far left: Mail / Contacts (Ctrl+1 / Ctrl+2)."""
+        """The rail on the far left: Mail / Calendar / Contacts / Tasks (Ctrl+1 to 4)."""
         rail = QToolBar("Navigation", self)
         rail.setObjectName("nav-rail")
         rail.setMovable(False)
@@ -1690,7 +1731,8 @@ class MainWindow(QMainWindow):
         self._nav: dict[str, QAction] = {}
         for page, label, icon, key in (("mail", "Mail", "mail", "Ctrl+1"),
                                        ("calendar", "Calendar", "calendar", "Ctrl+2"),
-                                       ("contacts", "Contacts", "contact", "Ctrl+3")):
+                                       ("contacts", "Contacts", "contact", "Ctrl+3"),
+                                       ("tasks", "Tasks", "square-check-big", "Ctrl+4")):
             act = self._themed(label, icon, lambda p=page: self.show_page(p), key,
                                tip=f"{label} ({key})")
             act.setCheckable(True)
@@ -1825,6 +1867,8 @@ class MainWindow(QMainWindow):
         msg_menu.addSeparator()
         msg_menu.addAction(self.act_move)
         msg_menu.addAction(self.act_copy_to)
+        msg_menu.addSeparator()
+        msg_menu.addAction(self.act_task)
         msg_menu.addSeparator()
         msg_menu.addAction(self.act_delete)
         msg_menu.addAction(self.act_delete_forever)
@@ -2258,6 +2302,253 @@ class MainWindow(QMainWindow):
                   on_failed=lambda msg: QMessageBox.warning(
                       self, "Calendar", f"Couldn't open the series.\n\n{msg}"))
 
+    # -- tasks ---------------------------------------------------------------
+    def _task_boxes(self):
+        return [b for b in self.mailboxes.all() if b.tasks is not None]
+
+    def _task_box(self, account_id: str | None):
+        boxes = self._task_boxes()
+        return next((b for b in boxes if b.account_id == account_id), boxes[0] if boxes else None)
+
+    def _default_task_list(self, account_id: str | None = None) -> str | None:
+        rows = self.store.task_lists(account_id) or self.store.task_lists()
+        return next((r["id"] for r in rows if r["well_known"] == "defaultList"),
+                    rows[0]["id"] if rows else None)
+
+    def refresh_tasks(self):
+        """Get every account's To Do lists and their changes."""
+        boxes = self._task_boxes()
+        if self._tasks_busy or not boxes:
+            return
+        self._tasks_busy = True
+
+        def job():
+            problems = []
+            for box in boxes:
+                try:
+                    box.tasks.sync()
+                except Exception as exc:
+                    log.warning("tasks not synced for %s: %s", box.display_name, exc)
+                    problems.append(f"{box.display_name}: {exc}")
+            return problems
+
+        def done(problems):
+            self._tasks_busy = False
+            self._tasks_changed()
+            if problems:
+                self.statusBar().showMessage("Couldn't get tasks: " + "; ".join(problems),
+                                             10_000)
+
+        def failed(_msg):
+            self._tasks_busy = False
+
+        self._run(job, done, on_failed=failed, activity="Syncing tasks…")
+
+    def _tasks_changed(self):
+        self.tasks_page.reload()
+        n = self.tasks_page.overdue_count()
+        act = self._nav["tasks"]
+        act.setText(f"Tasks ({n})" if n else "Tasks")
+        act.setIcon(iconset.load_colored("square-check-big", "#c42b1c") if n
+                    else iconset.load("square-check-big"))
+        act.setToolTip(f"Tasks (Ctrl+4): {n} overdue" if n else "Tasks (Ctrl+4)")
+        self.reminders.check()
+
+    def new_task(self, list_id: str | None = None, title: str = "", body: str = "",
+                 due: dt.date | None = None, links: list | None = None,
+                 account_id: str | None = None):
+        """A new task (Ctrl+Shift+T), in `list_id` or the default list."""
+        lists = self.store.task_lists()
+        if not lists:
+            QMessageBox.information(self, "Tasks", "Your task lists haven't arrived yet. "
+                                    "They're being fetched: try again in a moment.")
+            self.refresh_tasks()
+            return
+        dlg = self._task_editor(list_id=list_id or self._default_task_list(account_id),
+                                title=title, body=body, due=due, links=links)
+        if dlg.exec():
+            self._save_task(dlg, None)
+
+    def _task_editor(self, row=None, **kwargs) -> TaskEditor:
+        """The editor for a task (`row`) or a new one; for an email's task, which email."""
+        dlg = TaskEditor(self.store.task_lists(), self.store.category_colors(), row=row,
+                         parent=self, **kwargs)
+        dlg.openEmailRequested.connect(self.open_task_email)
+        if row is None:
+            return dlg
+        lst = self.store.task_list(row["list_id"])
+        box = self._task_box(row["account_id"])
+        if row["links"] is None and box is not None and lst is not None \
+                and lst["well_known"] == "flaggedEmails":  # which email: ask the server
+            self._run(lambda: box.tasks.links(row["list_id"], row["id"]),
+                      lambda links: dlg.show_links([(n, u, e) for n, u, e, _ in links]))
+        return dlg
+
+    def edit_task(self, task_id: str):
+        row = self.store.task(task_id)
+        if row is None:
+            return
+        dlg = self._task_editor(row)
+        if dlg.exec():
+            self._save_task(dlg, row)
+
+    def _save_task(self, dlg: TaskEditor, row):
+        draft, list_id = dlg.draft(self._time_zone()), dlg.list_id()
+        lst = self.store.task_list(list_id)
+        box = self._task_box(lst["account_id"] if lst else None)
+        old_box = self._task_box(row["account_id"]) if row is not None else None
+        if box is None:
+            return
+
+        def job():
+            if row is None:
+                return box.tasks.save(list_id, draft)
+            if row["list_id"] == list_id:
+                return box.tasks.save(list_id, draft, row["id"])
+            if old_box is box:
+                return box.tasks.move(row["id"], list_id, draft)
+            made = box.tasks.save(list_id, draft)  # (to another account's list)
+            old_box.tasks.delete(row["list_id"], row["id"])
+            return made
+
+        self._run(job, lambda _: (self._tasks_changed(),
+                                  self.statusBar().showMessage("Task saved", 3000)),
+                  activity="Saving task…", on_failed=lambda msg: QMessageBox.warning(
+                      self, "Tasks", f"The task wasn't saved.\n\n{msg}"))
+
+    def quick_add_task(self, list_id: str, title: str):
+        """From the box on the Tasks page: due today, like Outlook's To-Do Bar."""
+        list_id = list_id if list_id != ALL_TASKS else self._default_task_list()
+        lst = self.store.task_list(list_id) if list_id else None
+        box = self._task_box(lst["account_id"] if lst else None)
+        if box is None or lst is None:
+            self.refresh_tasks()
+            return
+        draft = TaskDraft(title, due=dt.date.today(), tz=self._time_zone())
+        self._run(lambda: box.tasks.save(list_id, draft), lambda _: self._tasks_changed(),
+                  activity="Saving task…", on_failed=lambda msg: QMessageBox.warning(
+                      self, "Tasks", f"The task wasn't added.\n\n{msg}"))
+
+    def _task_changes(self, ids: list[str], fields: dict, local: dict):
+        """Change some tasks: here at once, then on the server (put back if it fails)."""
+        rows = [r for r in map(self.store.task, ids) if r is not None]
+        for r in rows:
+            self.store.update_task(r["id"], **local)
+        self._tasks_changed()
+        work = [(self._task_box(r["account_id"]), r) for r in rows]
+
+        def job():
+            for box, r in work:
+                if box is not None:
+                    box.tasks.update(r["list_id"], r["id"], fields)
+
+        def failed(msg):
+            QMessageBox.warning(self, "Tasks", f"The change didn't reach the server.\n\n{msg}")
+            self.refresh_tasks()  # (back as the server has it)
+
+        self._run(job, lambda _: self._tasks_changed(), on_failed=failed,
+                  activity="Saving tasks…")
+
+    def complete_tasks(self, ids: list[str], done: bool):
+        now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        status = "completed" if done else "notStarted"
+        self._task_changes(ids, {"status": status},
+                           {"status": status, "completed": now if done else None})
+        self.statusBar().showMessage("Marked complete" if done else "Marked not complete",
+                                     3000)
+
+    def set_task_due(self, ids: list[str], choice: str):
+        """Outlook's follow-up dates: Today, Tomorrow, This week, Next week, No date."""
+        day = quick_due(choice, dt.date.today())
+        due = {"dateTime": f"{day.isoformat()}T00:00:00", "timeZone": self._time_zone()} \
+            if day else None
+        self._task_changes(ids, {"dueDateTime": due},
+                           {"due": day.isoformat() if day else None})
+
+    def delete_tasks(self, ids: list[str]):
+        rows = [r for r in map(self.store.task, ids) if r is not None]
+        if not rows:
+            return
+        what = f"\"{rows[0]['title']}\"" if len(rows) == 1 else f"these {len(rows)} tasks"
+        if QMessageBox.question(self, "Delete task", f"Delete {what}?") != \
+                QMessageBox.StandardButton.Yes:
+            return
+        work = [(self._task_box(r["account_id"]), r) for r in rows]
+
+        def job():
+            for box, r in work:
+                if box is not None:
+                    box.tasks.delete(r["list_id"], r["id"])
+
+        self._run(job, lambda _: (self._tasks_changed(),
+                                  self.statusBar().showMessage("Deleted", 3000)),
+                  activity="Deleting tasks…", on_failed=lambda msg: QMessageBox.warning(
+                      self, "Tasks", f"Not everything was deleted.\n\n{msg}"))
+
+    def open_task_email(self, task_id: str):
+        """The email a task came from: here if it's stored, else in Outlook on the web."""
+        row = self.store.task(task_id)
+        box = self._task_box(row["account_id"]) if row is not None else None
+        if row is None:
+            return
+        if row["links"] is None and box is not None:
+            self._run(lambda: box.tasks.links(row["list_id"], task_id),
+                      lambda _: self._open_links(task_id))
+        else:
+            self._open_links(task_id)
+
+    def _open_links(self, task_id: str):
+        row = self.store.task(task_id)
+        links = json.loads(row["links"]) if row is not None and row["links"] else []
+        for _name, url, external, *_ in links:
+            msg = self.store.message_row(external) if external else None
+            if msg is not None and msg["folder_id"]:
+                self.tray.show_window()
+                self.show_page("mail")
+                self.folder_tree.select_folder(msg["folder_id"])
+                self.msg_list.select_id(external)
+                self.open_message(external)
+                return
+        url = next((u for _, u, *_ in links if u), "")
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
+        else:
+            self.statusBar().showMessage("This task doesn't say which email it came from", 5000)
+
+    def task_from_message(self, mid: str | None = None):
+        """Create a task from a message (as dragging it to Tasks did in Outlook): its subject,
+        its text as notes, due today, and a link back to it."""
+        mid = mid or self.msg_list.current_id() or self._current_message
+        row = self.store.message_row(mid) if mid else None
+        box = self.mailboxes.for_folder(row["folder_id"]) if row else None
+        if row is None or box is None:
+            return
+        account = box.account_id
+
+        def job():
+            try:
+                body = box.bodies.get(mid)
+                text = body_text(body.content_type, body.content)
+            except Exception as exc:
+                log.info("message text not fetched for a task: %s", exc)
+                text = row["preview"] or ""
+            try:
+                url = box.graph.message_link(mid)
+            except Exception as exc:
+                log.info("message link not fetched: %s", exc)
+                url = ""
+            return text, url
+
+        def done(result):
+            text, url = result
+            sender = row["sender_name"] or row["sender_addr"] or ""
+            head = f"From: {sender}\nReceived: {row['received'] or ''}\n\n"
+            subject = row["subject"] or "(no subject)"
+            self.new_task(title=subject, body=head + text[:8000], due=dt.date.today(),
+                          links=[(subject, url, mid)], account_id=account)
+
+        self._run(job, done, activity="Reading message…")
+
     def _open_event(self, event_id: str):
         """From a reminder: show the event in the Calendar and open it."""
         row = self.store.event_row(event_id)
@@ -2269,17 +2560,34 @@ class MainWindow(QMainWindow):
         self.calendar_page.select_event(event_id)
         self.edit_event(event_id)
 
+    def _open_reminder(self, key: str):
+        if key.startswith("task:"):
+            self.tray.show_window()
+            self.show_page("tasks")
+            self.edit_task(key[5:])
+        else:
+            self._open_event(key)
+
     def dismiss_reminders(self, keys: list):
+        tasks = [k[5:] for k, _ in keys if k.startswith("task:")]
+        keys = [k for k in keys if not k[0].startswith("task:")]
         for event_id, start in keys:
             self.store.set_reminder_state(event_id, start, dismissed=True)
+        if tasks:  # a task's reminder is just turned off
+            self._task_changes(tasks, {"isReminderOn": False}, {"reminder": None})
         self.reminders.check()
         self._reminder_calls([(eid, None) for eid, _ in keys])
 
     def snooze_reminders(self, keys: list, minutes: int):
         until = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=minutes)).strftime(
             "%Y-%m-%dT%H:%M:%SZ")
+        tasks = [k[5:] for k, _ in keys if k.startswith("task:")]
+        keys = [k for k in keys if not k[0].startswith("task:")]
         for event_id, start in keys:
             self.store.set_reminder_state(event_id, start, snoozed_until=until)
+        if tasks:  # a task's reminder moves on
+            self._task_changes(tasks, {"isReminderOn": True, "reminderDateTime": {
+                "dateTime": until.rstrip("Z"), "timeZone": "UTC"}}, {"reminder": until})
         self.reminders.check()
         self._reminder_calls([(eid, until) for eid, _ in keys])
 

@@ -361,6 +361,7 @@ def checks():
     attachment_checks()
     picture_checks()
     outbox_checks()
+    tasks_checks()
 
     w.close()
     saved = Settings(str(tmp / "settings.ini"))
@@ -1643,6 +1644,152 @@ def outbox_checks():
     check(len(waiting) == 1 and w.delete_messages(waiting) and not st.outbox_items(),
           "an Outbox message can be deleted")
     graph.GraphClient.send_mail = real_send
+
+
+class FakeToDo:
+    """Microsoft To Do: two lists, a few tasks; records what's sent."""
+
+    def __init__(self):
+        day = lambda n: {"dateTime": f"{dt.date.today() + dt.timedelta(days=n)}T00:00:00",  # noqa: E731
+                         "timeZone": "UTC"}
+        self.lists = [{"id": "L1", "displayName": "Tasks", "wellknownListName": "defaultList"},
+                      {"id": "L2", "displayName": "Flagged email",
+                       "wellknownListName": "flaggedEmails"}]
+        self.tasks = {
+            "t1": {"id": "t1", "title": "Pay the invoice", "status": "notStarted",
+                   "importance": "high", "dueDateTime": day(-2), "_list": "L1"},
+            "t2": {"id": "t2", "title": "Book the venue", "status": "notStarted",
+                   "dueDateTime": day(3), "_list": "L1"},
+            "t3": {"id": "t3", "title": "Q4 budget review", "status": "notStarted",
+                   "_list": "L2"},
+        }
+        self.sent, self.n = [], 0
+
+    def install(self):
+        G = graph.GraphClient
+        G.todo_lists = lambda c: [dict(x) for x in self.lists]
+        G.tasks_delta = lambda c, lid, link=None: (
+            [dict(t) for t in self.tasks.values() if t["_list"] == lid], f"d-{lid}")
+        G.save_task = lambda c, lid, fields, tid=None: self._save(lid, fields, tid)
+        G.delete_task = lambda c, lid, tid: (self.sent.append(("delete", tid)),
+                                             self.tasks.pop(tid, None))
+        G.task_links = lambda c, lid, tid: [{"displayName": "Q4 budget review",
+                                             "webUrl": "https://outlook/m1",
+                                             "externalId": "m1", "applicationName": "Outlook"}]
+        G.message_link = lambda c, mid: f"https://outlook/{mid}"
+
+    def _save(self, lid, fields, tid):
+        self.sent.append((tid or "new", fields))
+        if tid is None:
+            self.n += 1
+            tid = f"n{self.n}"
+            self.tasks[tid] = {"id": tid, "_list": lid}
+        t = self.tasks[tid]
+        t.update({k: v for k, v in fields.items() if k != "linkedResources"})
+        return dict(t)
+
+
+def tasks_checks():
+    from waddlemail.ui.task_editor import TaskEditor
+    todo = FakeToDo()
+    todo.install()
+    w.refresh_tasks()
+    wait(800)
+    w.show_page("tasks")
+    wait(200)
+    page = w.tasks_page
+    heads = [page.tree.topLevelItem(i).data(0, Qt.ItemDataRole.UserRole + 1)
+             for i in range(page.tree.topLevelItemCount())]
+    check(heads == ["Overdue", "This week", "No date"] or heads == ["Overdue", "Next week",
+                                                                    "No date"],
+          "Tasks page: grouped by when they're due")
+    late = page.tree.topLevelItem(0).child(0)
+    check(late.text(2) == "Pay the invoice" and late.foreground(2).color().name() == "#c42b1c"
+          and late.text(1) == "!", "an overdue task is red (and high priority marked)")
+    check(w._nav["tasks"].text() == "Tasks (1)", "the rail shows how many are overdue")
+
+    page.quick_add.setText("Call the plumber")
+    page._quick_add()
+    wait(500)
+    made = todo.sent[-1][1]
+    check(made["title"] == "Call the plumber"
+          and made["dueDateTime"]["dateTime"].startswith(dt.date.today().isoformat()),
+          "quick add: a task due today")
+
+    page.reload_tasks()
+    item = next(i for i in page._task_items() if i.text(2) == "Pay the invoice")
+    item.setCheckState(0, Qt.CheckState.Checked)
+    wait(500)
+    check(("t1", {"status": "completed"}) in todo.sent and st.task("t1")["status"] == "completed"
+          and "Pay the invoice" not in [i.text(2) for i in page._task_items()],
+          "ticking a task completes it (and it leaves the list)")
+    check(w._nav["tasks"].text() == "Tasks", "...nothing overdue now")
+
+    w.set_task_due(["t2"], "tomorrow")
+    wait(500)
+    sent = todo.sent[-1]
+    tomorrow = (dt.date.today() + dt.timedelta(days=1)).isoformat()
+    check(sent[0] == "t2" and sent[1]["dueDateTime"]["dateTime"].startswith(tomorrow)
+          and st.task("t2")["due"] == tomorrow, "Follow up > Tomorrow sets the due date")
+
+    # the editor: a new task with a reminder
+    dlg = w._task_editor(list_id="L1", title="Renew passport")
+    dlg.set_due(dt.date.today() + dt.timedelta(days=7))
+    dlg.has_reminder.setChecked(True)
+    check(dlg.remind_day.date().toPython() == dt.date.today() + dt.timedelta(days=7),
+          "editor: a reminder starts at 8:00 on the due date")
+    dlg.importance.setCurrentIndex(2)
+    w._save_task(dlg, None)
+    wait(500)
+    f = todo.sent[-1][1]
+    check(f["title"] == "Renew passport" and f["isReminderOn"] and f["importance"] == "high",
+          "editor: new task saved with its reminder and priority")
+
+    # from an email
+    opened = []
+    real_exec = TaskEditor.exec
+    TaskEditor.exec = lambda self: (opened.append(self), 0)[1]
+    w.task_from_message("m1")
+    wait(500)
+    TaskEditor.exec = real_exec
+    dlg = opened[-1] if opened else None
+    check(dlg is not None and dlg.title.text() == "Q4 budget review"
+          and "Final numbers attached" in dlg.notes.toPlainText()
+          and dlg.links and dlg.links[0][2] == "m1" and dlg.has_due.isChecked(),
+          "Create task from message: subject, text, due today, linked to the email")
+    w._save_task(dlg, None)
+    wait(500)
+    check(todo.sent[-1][1]["linkedResources"][0]["externalId"] == "m1",
+          "...and the task keeps the link")
+
+    # a reminder goes off; dismissing turns it off
+    past = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=1)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    st.update_task("t2", reminder=past)
+    w.settings.set("reminders/enabled", True)
+    w.reminders.check()
+    rw = w.reminder_window
+    keys = rw.all_keys()
+    check(("task:t2", past) in keys and rw.isVisible(), "a task's reminder shows with the rest")
+    rw.dismissRequested.emit([k for k in keys if k[0] == "task:t2"])
+    wait(500)
+    check(st.task("t2")["reminder"] is None and ("t2", {"isReminderOn": False}) in todo.sent,
+          "...and Dismiss turns it off in To Do")
+    rw.dismissRequested.emit(rw.all_keys())
+    rw.hide()
+
+    # the flagged-email task opens its email
+    page.reload()
+    windows = len(w._windows)
+    w.open_task_email("t3")
+    wait(500)
+    check(len(w._windows) == windows + 1, "a flagged-email task opens its email")
+    for x in list(w._windows):
+        x.close()
+    w.delete_tasks(["t2"])
+    wait(400)
+    check(st.task("t2") is None and ("delete", "t2") in todo.sent, "a task can be deleted")
+    w.show_page("mail")
 
 
 def travel_id():

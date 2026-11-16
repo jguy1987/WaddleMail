@@ -168,6 +168,28 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
     sent to Exchange too, so Outlook elsewhere agrees. The coming week is kept cached, so
     reminders also work offline. Preferences > General can turn them off.
   - The period shown is fetched when you go to it, and refreshed every 5 minutes.
+- **Tasks** (the rail, or Ctrl+4): your **Microsoft To Do** lists and tasks, the same ones
+  Outlook and the To Do app show, laid out like Outlook 2010's To-Do List.
+  - Lists on the left with how many tasks are open (and overdue), "To-Do List" for all of
+    them; mail flagged in Outlook appears in To Do's **Flagged email** list. Tasks are grouped
+    Overdue, Today, Tomorrow, This week, Next week, Later, No date (Completed when shown).
+    **Overdue tasks are red**, and the rail shows how many there are. Search, Show completed.
+  - Type a task in the box at the top and press Enter: it's added due today. Tick one to
+    complete it. Right-click: Follow up (Today, Tomorrow, This week, Next week, No date),
+    Mark complete, Open email, Delete (Del). Double-click or Enter opens it.
+  - The task editor (New > Task, Ctrl+Shift+T): subject, list (moving it to another list
+    works), start and due dates (with the Follow up dates), status (Not started, In progress,
+    Waiting on someone else, Deferred, Completed), priority, **reminder** (8:00 on the due
+    date by default), categories, notes.
+  - **Create task from message** (Message menu, right-click, the message window's Task
+    button): the subject, the message's text as notes, due today, and a link back to the
+    email; the task's Open email shows it here (or in Outlook on the web if it isn't kept
+    here). Flagged-email tasks open their email the same way.
+  - **Reminders** show in the reminder window with events (Snooze moves the reminder on in To
+    Do, Dismiss turns it off), with one notification when they go off. Once a day (after 8:00)
+    a notification says how many tasks are overdue and due today, if any.
+  - Kept in step with delta queries every 10 minutes (and when you click refresh); changes
+    show at once and go to the server, and are put back if it refuses.
 - **Contacts** (the rail, or Ctrl+3; Ctrl+1 is Mail):
   - Sources: all personal contacts and each contact folder, **contact groups**, the
     **organization directory**, and **recent recipients** (people you send to, from Sent
@@ -271,7 +293,8 @@ In the Entra admin center (entra.microsoft.com) > App registrations > New regist
 4. **API permissions** > Microsoft Graph > Delegated: `Mail.ReadWrite` (mark read, flag, move),
    `Mail.ReadWrite.Shared` (shared mailboxes and folders), `Mail.Send` (sending), `Contacts.ReadWrite` (contacts and
    contact groups), `User.ReadBasic.All` (the organization directory), `Calendars.ReadWrite`
-   (calendar, meetings, free/busy) and `MailboxSettings.Read` (your categories and colours);
+   (calendar, meetings, free/busy), `MailboxSettings.Read` (your categories and colours) and
+   `Tasks.ReadWrite` (Microsoft To Do);
    none needs admin consent. Existing users are asked to consent once more after upgrading. Sending and events will
    need `Mail.Send` and `Calendars.ReadWrite` (add them to `SCOPES` in `config.py` as well). In your
    own tenant you can click "Grant admin consent" so users never see a prompt.
@@ -319,6 +342,7 @@ waddlemail/text.py         plain text from HTML bodies, for the full-text index
 waddlemail/desktop.py      app icon paths; launcher + icon install for the application menu
 waddlemail/notify.py       desktop notifications and the task manager unread badge
 waddlemail/contacts.py     contacts/directory/contact group sync, To/Cc suggestions
+waddlemail/tasks.py        Microsoft To Do: lists and tasks, due groups, follow-up dates, sync
 waddlemail/calendars.py    calendars, events, categories, free/busy, layout and free-time search
 waddlemail/compose.py      replies: recipients, subjects, quoted header; the message to send
 waddlemail/outbox.py       sending (directly or through a draft), and the Outbox
@@ -343,6 +367,8 @@ waddlemail/ui/compose_window.py  the compose window (new, reply, forward)
 waddlemail/ui/rich_editor.py  WYSIWYG editor with formatting bar (mail and signatures)
 waddlemail/ui/attachment_bar.py  the attachments strip (compose window, event editor)
 waddlemail/ui/contacts_view.py  the Contacts page
+waddlemail/ui/tasks_view.py  the Tasks page (To-Do List)
+waddlemail/ui/task_editor.py  the task editor
 waddlemail/ui/contact_dialogs.py  contact editor (with photo), contact group editor, avatars
 waddlemail/ui/recipients.py  To/Cc field with name completion
 waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
@@ -383,4 +409,6 @@ waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
    device aren't noticed here until they'd fire (Graph's reminderView could tell).
 3. Search across all folders; optional background download of
    bodies so local search covers everything offline.
-4. Publisher verification of the app registration before sharing with other organizations.
+4. Tasks: repeating tasks (To Do has them; the editor doesn't set them yet), checklist steps,
+   and a To-Do Bar / daily task list beside the calendar.
+5. Publisher verification of the app registration before sharing with other organizations.
