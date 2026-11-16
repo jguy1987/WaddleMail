@@ -34,6 +34,15 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   - A move shows at once (the next message is selected, counts update) and goes through the
     same change queue as read/flag, so it also works offline and is undone if the server
     refuses it. A copy needs the server, which creates the new message.
+- **Deleting mail**: Delete (Del; toolbar, Message menu, right-click, and the message window)
+  moves messages to Deleted Items, as Outlook does, with no question; the next message is
+  selected. In Deleted Items (or a folder in it), or with **Delete permanently** (Shift+Del),
+  they're deleted for good after asking; Outlook's "Recover deleted items" can still bring them
+  back for a while. Both go through the change queue, so they show at once and work offline;
+  one the server refuses (a read-only shared mailbox) comes back.
+  - **Empty Deleted Items**: right-click Deleted Items, or File > Empty Deleted Items…. After
+    asking, it deletes every message in it on the server (not only those kept here), 20 per
+    request with progress in the status bar, and the folders in it.
   - Moves and copies work within one mailbox; Graph can't move mail between mailboxes.
 - Message list served from a local SQLite store, kept current with Graph **delta queries** (one
   cursor per folder). If the first sync fails (offline), the stored mail is still shown.
@@ -213,7 +222,7 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   offers Mail message (Ctrl+N), Event (Ctrl+Shift+E), Contact (Ctrl+Shift+C) and Folder from
   anywhere.
   The toolbar also has **Send/Receive**, **Cut / Copy /
-  Paste**, and Reply / Reply all / Forward / Delete (disabled placeholders until implemented).
+  Paste**, and Reply / Reply all / Forward / Delete.
   Toolbar and menus share the same actions. Cut/Copy/Paste act on whichever field has focus (the
   reader is read-only, so Copy/Select all work there and Cut/Paste enable once compose is a window
   of its own). Icons are bundled [Lucide](https://lucide.dev) SVGs (ISC licence, copy in
@@ -239,8 +248,8 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
 
 ## Not yet
 
-An offline outbox (sending needs a connection), searching all folders at once, deleting messages,
-moving or copying between mailboxes. Conversations only group messages within the current
+An offline outbox (sending needs a connection), searching all folders at once, emptying Junk
+Email, moving or copying between mailboxes. Conversations only group messages within the current
 folder (your replies in Sent Items are not pulled in, as Outlook does).
 
 ## Register the app (one time)
@@ -360,8 +369,7 @@ waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 
 ## Next steps
 
-1. An offline outbox, and deleting messages through the change
-   queue (`pending` table) that read/flag/move already use.
+1. An offline outbox (sending through the change queue, like read/flag/move/delete).
 2. Removing a contact's photo (Graph has no call for it); photos in lists and autocomplete.
 3. Calendar: other people's shared calendars, room booking; reminders dismissed on another
    device aren't noticed here until they'd fire (Graph's reminderView could tell).

@@ -158,6 +158,7 @@ class FolderPane(QTreeWidget):
     createFolderRequested = Signal(str, str, str)  # mailbox id, parent folder id ("" = top), name
     renameFolderRequested = Signal(str, str)       # folder id, new name
     deleteFolderRequested = Signal(str)            # folder id
+    emptyFolderRequested = Signal(str)             # folder id (Deleted Items)
     moveFolderRequested = Signal(str, str)         # folder id, new parent ("" = top)
     pickMoveFolderRequested = Signal(str)          # folder id: ask where to
     messagesDropped = Signal(list, str, bool)      # message ids, folder id, copy?
@@ -536,6 +537,10 @@ class FolderPane(QTreeWidget):
                 act = menu.addAction(iconset.load("trash-2"), "&Delete\tDel",
                                      lambda: self.request_delete(item))
                 act.setEnabled(changeable)
+                if item.data(0, WELL_KNOWN_ROLE) == "deleteditems":
+                    menu.addAction(iconset.load("trash-2"), "&Empty Deleted Items…",
+                                   lambda: self.emptyFolderRequested.emit(
+                                       item.data(0, ID_ROLE)))
             menu.addSeparator()
         root = self._mailbox_of(item) if item is not None else None
         if root is not None:

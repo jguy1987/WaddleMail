@@ -341,9 +341,13 @@ def checks():
     double_click("m3")
     wait(300)
     check(len(w._windows) == 1 and "m3" not in unread(), "double-click opens and marks read")
+    for x in list(w._windows):  # (offscreen it would stay the active window, and its
+        x.close()               # shortcuts, Del included, would catch keys sent elsewhere)
+    wait(200)
 
     folder_checks()
     move_checks()
+    delete_checks()
     integration_checks()
     older_mail_checks()
     status_checks()
@@ -521,6 +525,67 @@ def move_checks():
     win.act_move.trigger()
     wait(200)
     check(st.message_row("m5")["folder_id"] == travel, "message window: Move to folder")
+
+
+def delete_checks():
+    pane = w.folder_tree
+    w._sync_all_folders()
+    w._populate_folders()
+    deletes, batch = [], []
+    graph.GraphClient.delete_message = lambda c, mid: deletes.append(mid)
+    pane.select_folder("in")
+    wait(300)
+    click("m3")
+    asked = []
+    QMessageBox.question = staticmethod(
+        lambda *a, **k: asked.append(a[2]) or QMessageBox.StandardButton.Yes)
+    w.act_delete.trigger()
+    check(st.message_row("m3")["folder_id"] == "del" and "m3" not in ids() and not asked,
+          "Delete moves the message to Deleted Items (no question)")
+    check(view.current_id() not in (None, "m3"), "...and the next message is selected")
+    wait(2000)
+    check(("m3", "del") in server_moves, "...through the change queue")
+
+    pane.select_folder("del")
+    wait(300)
+    click("m3")
+    w.act_delete.trigger()
+    check(asked and "Permanently delete 1 message" in asked[-1]
+          and st.message_row("m3")["folder_id"] == "" and "m3" not in ids(),
+          "in Deleted Items, Delete deletes for good (after asking)")
+    wait(2000)
+    check(deletes == ["m3"] and st.message_row("m3") is None,
+          "...sent to the server, then forgotten here")
+
+    st.apply_message_changes("in", [m("m7", "Lunch?", "Sam Lee", 2)])
+    pane.select_folder("in")
+    wait(300)
+    click("m7")
+    w.act_delete_forever.trigger()
+    check(len(asked) == 2 and st.message_row("m7")["folder_id"] == "",
+          "Shift+Del deletes for good from any folder")
+    wait(2000)
+
+    # Empty Deleted Items: everything on the server, and its folders
+    old = server.create(None, "Old stuff", "del")["id"]
+    w._sync_all_folders()
+    w._populate_folders()
+    st.apply_message_changes("del", [m("d1", "Spam", "Someone", 5),
+                                     m("d2", "More", "Someone", 6, read=True)])
+    st.apply_message_changes(old, [m("d3", "Ancient", "Someone", 900)])
+    graph.GraphClient.folder_message_ids = lambda c, fid: ["d1", "d2", "d9"]  # (d9: not here)
+    graph.GraphClient.delete_messages = lambda c, mids, progress=None: (
+        batch.extend(mids), progress and progress(len(mids), len(mids)), [])[2]
+    pane.select_folder(old)
+    wait(300)
+    w.empty_deleted_items("del")
+    wait(1500)
+    check(batch == ["d1", "d2", "d9"] and old not in server.folders
+          and all(st.message_row(i) is None for i in ("d1", "d2", "d3"))
+          and st.folder_row(old) is None,
+          "Empty Deleted Items deletes all its messages (even ones not kept here) and folders")
+    check(w._current_folder == "del", "...and moves out of a folder that's gone")
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
 
 
 def integration_checks():

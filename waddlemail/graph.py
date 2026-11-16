@@ -549,6 +549,46 @@ class GraphClient:
                              method="POST", json={"destinationId": destination_id},
                              headers=_prefer())
 
+    def delete_message(self, message_id: str) -> None:
+        """Delete for good, as Outlook's Shift+Delete or deleting in Deleted Items does: the
+        message goes to Recoverable Items, where Outlook's "Recover deleted items" (or an
+        administrator) can still get it back for a while."""
+        self._request(f"{self._root}/messages/{quote(message_id, safe='')}", method="DELETE")
+
+    def folder_message_ids(self, folder_id: str) -> list[str]:
+        """The ids of every message in a folder on the server (not only the synced ones)."""
+        return [m["id"] for m in self._paged(
+            f"{self._root}/mailFolders/{quote(folder_id, safe='')}/messages",
+            params={"$select": "id", "$top": 1000})]
+
+    def delete_messages(self, message_ids: list[str], progress=None) -> list[str]:
+        """Delete many messages for good, 20 per $batch; `progress(done, total)` after each.
+        Returns the ids the server refused (gone already counts as deleted)."""
+        refused: list[str] = []
+        for i in range(0, len(message_ids), 20):
+            chunk = message_ids[i:i + 20]
+            for attempt in range(4):  # throttled or failed ones are tried again
+                reqs = [{"id": str(n), "method": "DELETE",
+                         "url": f"{self._root}/messages/{quote(mid, safe='')}"}
+                        for n, mid in enumerate(chunk)]
+                data = self._request("/$batch", method="POST", json={"requests": reqs})
+                again, wait = [], 0.0
+                for r in data.get("responses", []):
+                    status, mid = r.get("status", 500), chunk[int(r["id"])]
+                    if status in (429, 500, 502, 503, 504) and attempt < 3:
+                        again.append(mid)
+                        wait = max(wait, float((r.get("headers") or {}).get("Retry-After",
+                                                                             2 ** attempt)))
+                    elif status >= 300 and status != 404:
+                        refused.append(mid)
+                if not again:
+                    break
+                self._sleep(min(wait, 60))
+                chunk = again
+            if progress is not None:
+                progress(min(i + 20, len(message_ids)), len(message_ids))
+        return refused
+
     def copy_message(self, message_id: str, destination_id: str) -> dict:
         """Copy within this mailbox; returns the new message (with a new id)."""
         return self._request(f"{self._root}/messages/{quote(message_id, safe='')}/copy",

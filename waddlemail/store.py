@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS pending(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     mailbox_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
-    field TEXT NOT NULL,            -- isRead / flag / move (value: destination folder)
+    field TEXT NOT NULL,            -- isRead / flag / move (value: destination folder) /
+                                    -- delete (deleted for good; the message is hidden until sent)
     value TEXT NOT NULL,
     old TEXT,
     UNIQUE(message_id, field)
@@ -628,6 +629,35 @@ class Store:
                 changed.append(mid)
         return changed
 
+    def delete_messages(self, mailbox_id: str, message_ids: list[str]) -> list[str]:
+        """Delete messages for good: hidden at once (folder_id "", counts updated), removed
+        once the server has done it, put back if it refuses."""
+        changed = []
+        with self.conn as c:
+            for mid in message_ids:
+                row = c.execute("SELECT folder_id, is_read FROM messages WHERE id=?",
+                                (mid,)).fetchone()
+                if row is None or not row["folder_id"]:
+                    continue
+                c.execute("UPDATE messages SET folder_id='' WHERE id=?", (mid,))
+                c.execute("UPDATE folders SET total = MAX(total - 1, 0),"
+                          " unread = MAX(unread - ?, 0) WHERE id=?",
+                          (0 if row["is_read"] else 1, row["folder_id"]))
+                self._queue(c, mailbox_id, mid, "delete", "1", row["folder_id"])
+                changed.append(mid)
+        return changed
+
+    def clear_folders(self, folder_ids: list[str]) -> None:
+        """Forget the messages of folders that were emptied on the server."""
+        with self.conn as c:
+            for fid in folder_ids:
+                ids = [r[0] for r in c.execute("SELECT id FROM messages WHERE folder_id=?",
+                                               (fid,))]
+                c.executemany("DELETE FROM bodies WHERE message_id=?", [(i,) for i in ids])
+                c.executemany("DELETE FROM pending WHERE message_id=?", [(i,) for i in ids])
+                c.execute("DELETE FROM messages WHERE folder_id=?", (fid,))
+                c.execute("UPDATE folders SET total=0, unread=0 WHERE id=?", (fid,))
+
     @staticmethod
     def _queue(c, mailbox_id, message_id, field, value, old):
         prev = c.execute("SELECT old FROM pending WHERE message_id=? AND field=?",
@@ -647,7 +677,13 @@ class Store:
 
     def change_sent(self, change_id: int) -> None:
         with self.conn as c:
+            row = c.execute("SELECT field, message_id FROM pending WHERE id=?",
+                            (change_id,)).fetchone()
             c.execute("DELETE FROM pending WHERE id=?", (change_id,))
+            if row is not None and row["field"] == "delete":  # gone on the server: forget it
+                c.execute("DELETE FROM pending WHERE message_id=?", (row["message_id"],))
+                c.execute("DELETE FROM bodies WHERE message_id=?", (row["message_id"],))
+                c.execute("DELETE FROM messages WHERE id=?", (row["message_id"],))
 
     def change_refused(self, change_id: int) -> None:
         """The server rejected a change (no write access, message gone): undo it locally."""
@@ -661,7 +697,7 @@ class Store:
             if row["field"] == "isRead":
                 c.execute("UPDATE messages SET is_read=? WHERE id=?",
                           (int(row["old"]), row["message_id"]))
-            elif row["field"] == "move":
+            elif row["field"] in ("move", "delete"):
                 c.execute("UPDATE messages SET folder_id=? WHERE id=?",
                           (row["old"], row["message_id"]))
             else:

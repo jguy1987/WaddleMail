@@ -55,6 +55,12 @@ class _Signals(QObject):
     failed = Signal(str)
 
 
+class Progress(QObject):
+    """Progress from a worker thread; connect it to a QObject's method so the slot runs on
+    the GUI thread."""
+    changed = Signal(int, int)  # done, total
+
+
 class Worker(QRunnable):
     def __init__(self, fn, *args):
         super().__init__()
@@ -106,6 +112,7 @@ class MainWindow(QMainWindow):
         self.folder_tree.createFolderRequested.connect(self._create_folder)
         self.folder_tree.renameFolderRequested.connect(self._rename_folder)
         self.folder_tree.deleteFolderRequested.connect(self.delete_folder)
+        self.folder_tree.emptyFolderRequested.connect(self.empty_deleted_items)
         self.folder_tree.moveFolderRequested.connect(self.move_folder)
         self.folder_tree.pickMoveFolderRequested.connect(self.pick_move_folder)
         self.folder_tree.messagesDropped.connect(
@@ -702,9 +709,15 @@ class MainWindow(QMainWindow):
         box = self.mailboxes.for_folder(self._current_folder) if self._current_folder else None
         if row is None or box is None:
             return
-        win = MessageWindow(row, self.images_action.isChecked(), [self.act_delete],
+        # (no parent yet: a main-window parent would make Del delete it from the main window)
+        delete = QAction(iconset.load("trash-2"), "Delete")
+        delete.setShortcut(QKeySequence.StandardKey.Delete)
+        delete.setToolTip("Delete: to Deleted Items (Del)")
+        win = MessageWindow(row, self.images_action.isChecked(), [delete],
                             lambda copy: self.move_messages([mid], copy=copy, parent=win), self,
                             respond=lambda kind: self.respond(kind, mid))
+        delete.setParent(win)
+        delete.triggered.connect(lambda: self.delete_messages([mid], parent=win) and win.close())
         self._windows.add(win)
         win.destroyed.connect(lambda *_: self._windows.discard(win))
         self._connect_attachments(win.view)
@@ -1027,7 +1040,7 @@ class MainWindow(QMainWindow):
         return dlg.chosen
 
     def move_messages(self, ids: list[str], dest: str | None = None, copy: bool = False,
-                      parent=None):
+                      parent=None, status: str | None = None):
         """Move (or copy) messages to folder `dest`; without `dest`, ask which folder.
         A move shows at once and is sent through the change queue; a copy needs the server,
         which makes the new message."""
@@ -1082,7 +1095,124 @@ class MainWindow(QMainWindow):
                 self.msg_list.select_id(follow)
         self._counts_changed()
         self._send_timer.start()
-        self.statusBar().showMessage(f"Moved {what} to {name}", 4000)
+        self.statusBar().showMessage(status or f"Moved {what} to {name}", 4000)
+
+    # -- deleting ------------------------------------------------------------
+    def _in_trash(self, folder_id: str) -> bool:
+        return any(r["well_known"] == "deleteditems" for r in self.store.folder_path(folder_id))
+
+    def delete_messages(self, ids: list[str], permanent: bool = False, parent=None) -> bool:
+        """Delete as Outlook does: to Deleted Items; for good (after asking) with `permanent`
+        (Shift+Del), in Deleted Items, or where there's no Deleted Items to use. Sent through
+        the change queue. Returns whether anything was deleted."""
+        rows = [r for r in (self.store.message_row(i) for i in ids) if r is not None]
+        if not rows:
+            return False
+        source = rows[0]["folder_id"]
+        box = self.mailboxes.for_folder(source)
+        if box is None:
+            return False
+        ids = [r["id"] for r in rows]
+        what = "1 message" if len(ids) == 1 else f"{len(ids)} messages"
+        trash = self.store.well_known_folder(box.id, "deleteditems")
+        if not (permanent or trash is None or self._in_trash(source)):
+            self.move_messages(ids, trash, parent=parent, status=f"Deleted {what}")
+            return True
+        if QMessageBox.question(
+                parent or self, "Delete permanently",
+                f"Permanently delete {what}?\n\nThey won't go to Deleted Items. Outlook's "
+                "\"Recover deleted items\" can still bring them back for a while.") != \
+                QMessageBox.StandardButton.Yes:
+            return False
+        follow = self.msg_list.neighbor_after(set(ids))
+        gone = self.store.delete_messages(box.id, ids)
+        if source == self._current_folder:
+            selected = set(self.msg_list.selected_ids())
+            self._refresh_messages()
+            if selected & set(gone) and follow:
+                self.msg_list.select_id(follow)
+        self._counts_changed()
+        self._send_timer.start()
+        self.statusBar().showMessage(f"Permanently deleted {what}", 4000)
+        return True
+
+    def _empty_current_trash(self):
+        folder = self._current_folder
+        box = self.mailboxes.for_folder(folder) if folder else None
+        boxes = [box] if box is not None else self.mailboxes.all()
+        trash = next((t for t in (self.store.well_known_folder(b.id, "deleteditems")
+                                  for b in boxes) if t), None)
+        if trash is None:
+            QMessageBox.information(self, "Empty Deleted Items",
+                                    "There's no Deleted Items folder to empty.")
+            return
+        self.empty_deleted_items(trash)
+
+    def _emptying(self, done: int, total: int):
+        self.statusBar().showMessage(f"Emptying Deleted Items: {done} of {total}…")
+
+    def empty_deleted_items(self, folder_id: str):
+        """Delete everything in Deleted Items for good: its messages (all of them on the
+        server, not only the ones kept here) and its folders, after asking."""
+        row = self.store.folder_row(folder_id)
+        box = self.mailboxes.for_folder(folder_id)
+        if row is None or box is None or row["well_known"] != "deleteditems":
+            return
+        subtree = self.store.folder_subtree(folder_id)
+        children = [r["id"] for r in subtree if r["parent_id"] == folder_id]
+        items = row["total"] or 0
+        parts = [f"{items} message{'s' if items != 1 else ''}"]
+        if children:
+            n = len(subtree) - 1
+            parts.append(f"{n} folder{'s' if n != 1 else ''}")
+        where = f" of {box.display_name}" if len(self.mailboxes.all()) > 1 else ""
+        if QMessageBox.question(
+                self, "Empty Deleted Items",
+                f"Permanently delete everything in Deleted Items{where} "
+                f"({' and '.join(parts)})?\n\nOutlook's \"Recover deleted items\" can still "
+                "bring messages back for a while.") != QMessageBox.StandardButton.Yes:
+            return
+        token = self.status.begin("Emptying Deleted Items…")
+        progress = Progress()
+        progress.changed.connect(self._emptying)
+
+        def job():
+            try:
+                box.sync.send_changes()  # (messages on their way there go too)
+            except Exception:
+                log.exception("sending changes before emptying")
+            ids = box.graph.folder_message_ids(folder_id)
+            refused = box.graph.delete_messages(ids, progress.changed.emit)
+            for child in children:
+                box.graph.delete_folder(child)
+            box.sync.sync_folders()
+            self.store.clear_folders([r["id"] for r in subtree])
+            try:  # what's left (refused ones), and the counts
+                box.sync.sync_folder(folder_id)
+            except Exception:
+                log.exception("syncing Deleted Items after emptying it")
+            return len(ids) - len(refused), refused
+
+        def done(result):
+            self.status.end(token)
+            deleted, refused = result
+            self._populate_folders()
+            if self._current_folder not in {r["id"] for r in self.store.folder_rows(box.id)}:
+                self._current_folder = None
+                self.folder_tree.select_folder(folder_id)
+            elif self._current_folder in {r["id"] for r in subtree}:
+                self._refresh_messages()
+            self.statusBar().showMessage(
+                f"Emptied Deleted Items ({deleted} message{'s' if deleted != 1 else ''})"
+                + (f"; {len(refused)} couldn't be deleted" if refused else ""), 6000)
+
+        def failed(msg):
+            self.status.end(token)
+            self._refresh_messages()
+            QMessageBox.warning(self, "Empty Deleted Items",
+                                f"Deleted Items wasn't emptied completely.\n\n{msg}")
+
+        self._run(job, done, on_failed=failed)
 
     def pick_move_folder(self, folder_id: str):
         row = self.store.folder_row(folder_id)
@@ -1403,7 +1533,6 @@ class MainWindow(QMainWindow):
         return act
 
     def _build_actions(self):
-        soon = "Coming soon"
         self.new_menu = QMenu("&New", self)
         self.new_menu.addAction(self._themed(
             "&Mail message", "mail-plus", self.new_mail, QKeySequence.StandardKey.New))
@@ -1427,7 +1556,7 @@ class MainWindow(QMainWindow):
         self.act_select_all = self._themed(
             "Select &all", "", self._edit_select_all, QKeySequence.StandardKey.SelectAll)
 
-        # Placeholders until the outbox / message actions exist.
+        # Reply, reply all, forward: on the shown message.
         self.act_reply = self._themed("Reply", "reply", lambda: self.respond("reply"),
                                       "Ctrl+R", enabled=False, tip="Reply (Ctrl+R)")
         self.act_reply_all = self._themed("Reply all", "reply-all",
@@ -1435,7 +1564,6 @@ class MainWindow(QMainWindow):
                                           enabled=False, tip="Reply all (Ctrl+Shift+R)")
         self.act_forward = self._themed("Forward", "forward", lambda: self.respond("forward"),
                                         "Ctrl+F", enabled=False, tip="Forward (Ctrl+F)")
-        self.act_delete = self._themed("Delete", "trash-2", lambda: None, enabled=False, tip=soon)
 
         # Message actions; they work on the selection. "\tEnter" only labels the key: the
         # list handles Enter itself.
@@ -1461,9 +1589,18 @@ class MainWindow(QMainWindow):
             icon="folder-input")
         self.act_copy_to = self._list_action(
             "Cop&y to folder…", lambda: self.move_messages(sel(), copy=True), icon="copy")
+        self.msg_list.addAction(self._separator())
+        self.act_delete = self._list_action(
+            "&Delete", lambda: self.delete_messages(sel()), QKeySequence.StandardKey.Delete,
+            icon="trash-2")
+        self.act_delete.setToolTip("Delete: to Deleted Items (Del)")
+        self.act_delete_forever = self._list_action(
+            "Delete &permanently…", lambda: self.delete_messages(sel(), permanent=True),
+            "Shift+Del")
         self._message_actions = [self.act_open, self.act_mark_read, self.act_mark_unread,
                                  self.act_toggle_read, self.act_toggle_flag,
-                                 self.act_flag_complete, self.act_move, self.act_copy_to]
+                                 self.act_flag_complete, self.act_move, self.act_copy_to,
+                                 self.act_delete, self.act_delete_forever]
 
         self.act_threads = QAction("Group by &conversation", self)
         self.act_threads.setCheckable(True)
@@ -1594,6 +1731,8 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(self.act_send_receive)
         file_menu.addSeparator()
+        file_menu.addAction(self._action("&Empty Deleted Items…", self._empty_current_trash))
+        file_menu.addSeparator()
         file_menu.addAction(self.act_add_account)
         file_menu.addAction(self.act_add_shared)
         file_menu.addSeparator()
@@ -1638,6 +1777,9 @@ class MainWindow(QMainWindow):
         msg_menu.addSeparator()
         msg_menu.addAction(self.act_move)
         msg_menu.addAction(self.act_copy_to)
+        msg_menu.addSeparator()
+        msg_menu.addAction(self.act_delete)
+        msg_menu.addAction(self.act_delete_forever)
 
         help_menu = mb.addMenu("&Help")
         self.act_launcher = self._action(self._launcher_label(), self._toggle_launcher)
