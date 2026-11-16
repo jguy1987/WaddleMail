@@ -4,7 +4,7 @@ Release:        1%{?dist}
 Summary:        Linux mail client for Microsoft 365
 
 License:        MIT
-URL:            https://github.com/jmish1987/WaddleMail
+URL:            https://github.com/jguy1987/WaddleMail
 Source0:        WaddleMail-%{version}.tar.gz
 BuildArch:      noarch
 

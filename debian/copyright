@@ -1,6 +1,6 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: WaddleMail
-Source: https://github.com/jmish1987/WaddleMail
+Source: https://github.com/jguy1987/WaddleMail
 
 Files: *
 Copyright: 2026 John Mish

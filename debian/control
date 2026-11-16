@@ -4,7 +4,7 @@ Priority: optional
 Maintainer: John Mish <jmish1987@gmail.com>
 Build-Depends: debhelper-compat (= 13), dh-python, pybuild-plugin-pyproject, python3-all, python3-setuptools
 Standards-Version: 4.6.2
-Homepage: https://github.com/jmish1987/WaddleMail
+Homepage: https://github.com/jguy1987/WaddleMail
 Rules-Requires-Root: no
 
 Package: waddlemail
