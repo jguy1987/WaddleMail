@@ -44,5 +44,5 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/waddlemail.desktop
 %{_datadir}/icons/hicolor/*/apps/waddlemail*
 
 %changelog
-* Mon Nov 16 2026 jmish <jmish1987@gmail.com> - 1.0.0-1
+* Mon Nov 16 2026 John Mish <jmish1987@gmail.com> - 1.0.0-1
 - First stable release
