@@ -117,10 +117,16 @@ class Authenticator:
             raise AuthError(detail)
         return result["access_token"]
 
-    def add_account(self) -> dict:
-        """Interactive sign-in with the account picker; returns the (new or existing) account."""
+    def add_account(self, login_hint: str | None = None) -> dict:
+        """Interactive sign-in; returns the (new or existing) account. With `login_hint` (an
+        email address) the browser's sign-in page starts with it filled in; without, it
+        shows the account picker."""
         with self._lock:
-            result = self._app.acquire_token_interactive(self.scopes, prompt="select_account")
+            if login_hint:
+                result = self._app.acquire_token_interactive(self.scopes, login_hint=login_hint)
+            else:
+                result = self._app.acquire_token_interactive(self.scopes,
+                                                             prompt="select_account")
             self._persist()
         if "access_token" not in result:
             raise AuthError(result.get("error_description", "sign-in cancelled"))

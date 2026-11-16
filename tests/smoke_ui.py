@@ -362,6 +362,7 @@ def checks():
     picture_checks()
     outbox_checks()
     tasks_checks()
+    account_checks()
 
     w.close()
     saved = Settings(str(tmp / "settings.ini"))
@@ -1826,6 +1827,59 @@ def tasks_checks():
     check(dlg.repeat.combo.currentText() == f"Weekly on {weekday}",
           "editing shows its repeat")
     w.show_page("mail")
+
+
+def account_checks():
+    from waddlemail.ui import account_setup
+    from waddlemail.ui.account_setup import AddAccountDialog, WelcomeWizard
+    hints = []
+    real_add = w.mailboxes.add_account
+
+    def add(hint=None):
+        hints.append(hint)
+        return w.mailboxes.get("a")
+
+    w.mailboxes.add_account = add
+    # File > Add account: the type, and the address passed on to the sign-in page
+    real_exec = AddAccountDialog.exec
+
+    def fill(dlg):
+        check(not dlg.form.imap.isEnabled() and dlg.form.kind() == account_setup.M365,
+              "Add account asks what kind (IMAP/SMTP shown, for later)")
+        dlg.form.address.setText("bad address")
+        dlg.accept()
+        check(not dlg.form.problem.isHidden() and not dlg.result(),
+              "...and catches an address that isn't one")
+        dlg.form.address.setText("sam@contoso.com")
+        return 1
+
+    AddAccountDialog.exec = fill
+    w.add_account()
+    wait(800)
+    AddAccountDialog.exec = real_exec
+    check(hints == ["sam@contoso.com"], "the address goes to the browser's sign-in page")
+
+    # the first run: no account yet, so the welcome wizard asks for one
+    real_wizard = WelcomeWizard.exec
+    shown = []
+
+    def welcome(wiz):
+        shown.append(wiz)
+        wiz.next()
+        wiz.form.address.setText("jordan@contoso.com")
+        return 1
+
+    WelcomeWizard.exec = welcome
+    has = w.mailboxes.has_accounts
+    w.mailboxes.has_accounts = lambda: False
+    w._start_initial_sync()
+    wait(300)
+    w.mailboxes.has_accounts = has
+    wait(1500)
+    WelcomeWizard.exec = real_wizard
+    check(shown and hints[-1] == "jordan@contoso.com",
+          "first run: the welcome wizard asks for the account, then signs in")
+    w.mailboxes.add_account = real_add
 
 
 def travel_id():

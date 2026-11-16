@@ -6,6 +6,11 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
 
 - Sign-in with MSAL (public client, system browser + PKCE, no client secret). Tokens are kept in the
   system keyring, or a 0600 file if no keyring is available.
+- **Adding an account**: the first run opens a welcome wizard that asks for your first account;
+  File > Add account… asks the same. Choose the kind (Microsoft 365 / Exchange Online; IMAP /
+  SMTP is listed for a later version) and type your address: the browser's sign-in page opens
+  with it filled in (leave it empty to pick the account there). Cancelling the wizard leaves
+  WaddleMail open, empty, until you add one.
 - **Several accounts and shared mailboxes** in one folder pane (File > Add account… / Add shared
   mailbox…, or right-click the pane). Each mailbox is a heading with its folders below; right-click
   a heading to remove a shared mailbox or sign out of an account. A shared mailbox can be a full
@@ -326,7 +331,8 @@ To get WaddleMail in your application menu (Linux), run `waddlemail --install-de
 (or use Help > Add to application menu). GNOME shows tray icons only with the AppIndicator
 extension; notifications work without it.
 
-The first launch opens your browser to sign in. Mail data lives in `~/.local/share/waddlemail/`
+The first launch asks for your account (a short wizard), then opens your browser to sign in.
+Mail data lives in `~/.local/share/waddlemail/`
 unless you change the data location in Preferences.
 
 ## Tests
@@ -370,7 +376,8 @@ waddlemail/ui/tray.py      system tray icon
 waddlemail/ui/status_indicator.py  connection dot and activity in the status bar
 waddlemail/ui/calendar_view.py  the Calendar page: day/week/month views and event details
 waddlemail/ui/event_editor.py  the event/meeting editor and the scheduling assistant
-waddlemail/ui/recurrence_dialog.py  custom repeat pattern
+waddlemail/ui/recurrence_dialog.py  the Repeat choice and the custom repeat pattern
+waddlemail/ui/account_setup.py  the account type/address form, Add account and the welcome wizard
 waddlemail/ui/reminders.py  reminders window and the service that raises it
 waddlemail/ui/compose_window.py  the compose window (new, reply, forward)
 waddlemail/ui/rich_editor.py  WYSIWYG editor with formatting bar (mail and signatures)

@@ -42,6 +42,7 @@ from . import iconset
 from .contacts_view import ContactsView
 from .calendar_view import CalendarPage
 from .compose_window import ComposeWindow
+from .account_setup import M365, AddAccountDialog, WelcomeWizard
 from .dialogs import SharedMailboxDialog
 from .event_editor import EventEditor
 from .reminders import ReminderService, ReminderWindow
@@ -101,6 +102,7 @@ class MainWindow(QMainWindow):
         self._current_message: str | None = None  # the one selected message, if exactly one
         self._syncing = False  # one sync/send job at a time
         self._flushing = False  # sending the Outbox
+        self._started = False   # the first sync is done (there's an account)
         # Server search for the quick filter: hits per (folder, words), and a generation
         # number so a slow answer to an older query is ignored.
         self._server_hits: dict[tuple[str, str], list[str]] = {}
@@ -300,11 +302,34 @@ class MainWindow(QMainWindow):
 
     # -- startup ------------------------------------------------------
     def _start_initial_sync(self):
+        """Open the mailboxes; on the first run (no account yet), the welcome wizard first."""
+        if not self.mailboxes.has_accounts():
+            QTimer.singleShot(0, self._welcome)  # (once the window is up)
+            return
+        self._initial_sync()
+
+    def _welcome(self):
+        wizard = WelcomeWizard(self)
+        if not wizard.exec():
+            self.msg_view.show_placeholder("No account yet: add one with File > Add account…")
+            self.statusBar().showMessage("No account yet: File > Add account…")
+            return
+        self._initial_sync(sign_in=wizard.account())
+
+    def _initial_sync(self, sign_in: dict | None = None):
+        """Sign in first with `sign_in` ({"kind", "email"}: from the wizard), then open the
+        mailboxes and sync the first Inbox."""
         mailboxes = self.mailboxes
+        if sign_in is not None:
+            self.statusBar().showMessage("Signing in… (finish in your browser)")
 
         def job():
-            mailboxes.ensure_accounts()  # opens the browser on first run
+            if sign_in is not None:
+                mailboxes.add_account(sign_in["email"] or None)
+            mailboxes.ensure_accounts()
             self._sync_all_folders()
+            if not mailboxes.all():
+                return None, None, []
             first = mailboxes.all()[0]
             inbox = self.store.well_known_folder(first.id, "inbox")
             error, new = None, []
@@ -316,9 +341,17 @@ class MainWindow(QMainWindow):
                     error = str(exc)
             return inbox, error, new
 
+        def failed(msg: str):
+            self._syncing = False
+            if sign_in is None:
+                return
+            QMessageBox.warning(self, "Sign in", f"Signing in didn't finish.\n\n{msg}")
+            if not mailboxes.has_accounts():
+                self._welcome()  # (try again, or cancel)
+
         self._syncing = True
-        self._run(job, self._initial_sync_done, on_failed=self._sync_failed,
-                  activity="Connecting…")
+        self._run(job, self._initial_sync_done, on_failed=failed,
+                  activity="Signing in…" if sign_in is not None else "Connecting…")
 
     def _sync_all_folders(self):
         """Send queued changes and refresh every mailbox's folder list and counts (worker
@@ -335,6 +368,7 @@ class MainWindow(QMainWindow):
                 log.warning("folder sync failed for %s: %s", box.display_name, exc)
 
     def _initial_sync_done(self, payload):
+        self._started = True
         inbox_id, error, new = payload
         self._populate_folders()
         if inbox_id:
@@ -384,18 +418,32 @@ class MainWindow(QMainWindow):
 
     # -- mailboxes ----------------------------------------------------
     def add_account(self):
+        """File > Add account: what kind, and its address (filled in on the sign-in page)."""
         if self._syncing:
             self.statusBar().showMessage("Wait for the current sync to finish", 4000)
+            return
+        dlg = AddAccountDialog(self)
+        if not dlg.exec():
+            return
+        account = dlg.account()
+        if account["kind"] != M365:
+            return
+        if not self._started:  # (no account yet: this one starts everything)
+            self._initial_sync(sign_in=account)
             return
         self.statusBar().showMessage("Signing in… (finish in your browser)")
         self._syncing = True
 
         def job():
-            box = self.mailboxes.add_account()
+            box = self.mailboxes.add_account(account["email"] or None)
             box.sync.sync_folders()
             return box.id
 
-        self._run(job, self._mailbox_added, on_failed=self._sync_failed, activity="Signing in…")
+        def failed(msg: str):
+            self._syncing = False
+            QMessageBox.warning(self, "Add account", f"The account wasn't added.\n\n{msg}")
+
+        self._run(job, self._mailbox_added, on_failed=failed, activity="Signing in…")
 
     def add_shared_mailbox(self):
         accounts = [(b.account_id, b.display_name) for b in self.mailboxes.all() if not b.shared]

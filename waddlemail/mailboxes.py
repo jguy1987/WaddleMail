@@ -93,12 +93,13 @@ class MailboxManager:
             box.bodies.max_bytes = max_bytes
 
     # -- changes (these talk to Graph or the browser: run them off the UI thread) -------
+    def has_accounts(self) -> bool:
+        """Whether there's anything to open (else the first-run wizard asks for an account)."""
+        return bool(self.store.mailbox_rows() or self.auth.accounts())
+
     def ensure_accounts(self) -> None:
-        """Sign in if nobody is, and make sure every signed-in account has its own mailbox."""
+        """Make sure every signed-in account has its own mailbox."""
         accounts = self.auth.accounts()
-        if not accounts:
-            self.auth.get_token()  # first run: opens the browser
-            accounts = self.auth.accounts()
         first = not self.store.mailbox_rows()
         for acct in accounts:
             self._add_own(acct)
@@ -106,8 +107,9 @@ class MailboxManager:
             self.store.adopt_orphan_folders(accounts[0]["home_account_id"])
         self.reload()
 
-    def add_account(self) -> Mailbox:
-        acct = self.auth.add_account()
+    def add_account(self, login_hint: str | None = None) -> Mailbox:
+        """Sign in to a Microsoft 365 account (in the browser; `login_hint`: its address)."""
+        acct = self.auth.add_account(login_hint)
         self._add_own(acct)
         self.reload()
         return self._boxes[acct["home_account_id"]]
