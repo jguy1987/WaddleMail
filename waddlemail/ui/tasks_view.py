@@ -118,6 +118,7 @@ class TasksPage(QWidget):
         counts = self.store.task_counts(today)
         rows = self.store.task_lists()
         accounts = {r["account_id"] for r in rows}
+        names = self.store.account_names()
         self.lists.blockSignals(True)
         self.lists.clear()
         total = sum(n for n, _ in counts.values())
@@ -129,7 +130,8 @@ class TasksPage(QWidget):
         current = everything
         for r in rows:
             n, late = counts.get(r["id"], (0, 0))
-            name = r["name"] if len(accounts) == 1 else f"{r['name']} · {r['account_id']}"
+            name = r["name"] if len(accounts) == 1 else \
+                f"{r['name']} · {names.get(r['account_id'], r['account_id'])}"
             item = QTreeWidgetItem([self._label(name, n, late or 0)])
             item.setData(0, ID_ROLE, r["id"])
             item.setIcon(0, iconset.load("flag" if r["well_known"] == "flaggedEmails" else

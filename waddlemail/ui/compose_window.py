@@ -26,6 +26,7 @@ from ..compose import (
 )
 from ..contacts import format_address
 from ..inline import extract_inline
+from ..linkify import linkify_html
 from ..text import body_text
 from . import iconset
 from .attachment_bar import AttachmentBar
@@ -256,7 +257,7 @@ class ComposeWindow(QMainWindow):
 
     def outgoing(self) -> Outgoing:
         plain = self.editor.is_plain()
-        body, inline = (self.editor.text(), []) if plain else extract_inline(self.editor.html())
+        body, inline = (self.editor.text(), []) if plain else extract_inline(linkify_html(self.editor.html()))
         return Outgoing(subject=self.subject.text().strip(), body=body, html=not plain,
                         to=self.to.addresses(), cc=self.cc.addresses(),
                         bcc=self.bcc.addresses(), inline=inline)

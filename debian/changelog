@@ -1,3 +1,11 @@
+waddlemail (1.0.1) unstable; urgency=medium
+
+  * Web addresses in messages you read or send become links.
+  * Choosing a contact in To/Cc no longer inserts it twice.
+  * Task lists show the account's address instead of its internal id.
+
+ -- John Mish <jmish1987@gmail.com>  Mon, 16 Nov 2026 14:00:00 +0000
+
 waddlemail (1.0.0) unstable; urgency=medium
 
   * First stable release.

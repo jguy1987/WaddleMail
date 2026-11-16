@@ -29,9 +29,10 @@ class TaskEditor(QDialog):
     def __init__(self, lists: list, categories: dict[str, str], row=None,
                  list_id: str | None = None, title: str = "", body: str = "",
                  due: dt.date | None = None, links: list | None = None, tz: str = "UTC",
-                 parent=None):
+                 parent=None, account_names: dict[str, str] | None = None):
         """`lists`: task_lists rows to choose from; `row`: the task to edit (else a new one,
-        in `list_id`, filled with `title`, `body`, `due` and `links`: [(name, url, id)])."""
+        in `list_id`, filled with `title`, `body`, `due` and `links`: [(name, url, id)]);
+        `account_names`: account id -> the name to show beside a list when there are several."""
         super().__init__(parent)
         self.row = row
         self.links = links or []
@@ -50,8 +51,10 @@ class TaskEditor(QDialog):
 
         self.list = QComboBox()
         accounts = {r["account_id"] for r in lists}
+        names = account_names or {}
         for r in lists:
-            label = r["name"] if len(accounts) == 1 else f"{r['name']} ({r['account_id']})"
+            label = (r["name"] if len(accounts) == 1 else
+                     f"{r['name']} ({names.get(r['account_id'], r['account_id'])})")
             self.list.addItem(label, r["id"])
         form.addRow("List:", self.list)
 

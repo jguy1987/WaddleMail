@@ -134,3 +134,10 @@ def test_repeating_tasks_repeat_from_the_due_date():
     assert weekly["range"]["startDate"] == "2026-01-01"  # (the original isn't changed)
     assert "recurrence" not in TaskDraft("x", recurrence=weekly).fields(new=True)  # no due
     assert TaskDraft("x", due=dt.date(2026, 11, 20)).fields()["recurrence"] is None  # stops
+
+
+def test_account_names_are_the_sign_in_addresses(tmp_path):
+    st = Store(tmp_path / "m.db")
+    st.add_mailbox("acct1", "acct1", None, "me@example.com")
+    st.add_mailbox("acct1/team@example.com", "acct1", "team@example.com", "Team")
+    assert st.account_names() == {"acct1": "me@example.com"}  # shared mailboxes aren't accounts

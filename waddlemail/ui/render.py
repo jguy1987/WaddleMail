@@ -5,6 +5,8 @@ import html
 
 import nh3
 
+from ..linkify import linkify_html, linkify_text
+
 _ATTRS = {k: set(v) for k, v in nh3.ALLOWED_ATTRIBUTES.items()}
 _ATTRS.setdefault("*", set()).update({"style", "class", "dir", "align", "bgcolor", "width", "height"})
 _ATTRS.setdefault("img", set()).update({"src", "alt", "width", "height"})
@@ -24,9 +26,10 @@ def csp(allow_remote_images: bool) -> str:
 
 def render_body(content_type: str, content: str, allow_remote_images: bool = False) -> str:
     if content_type == "text":
-        inner = f"<pre>{html.escape(content)}</pre>"
+        inner = f"<pre>{linkify_text(html.escape(content))}</pre>"
     else:
-        inner = nh3.clean(content, attributes=_ATTRS, url_schemes={"http", "https", "mailto", "cid", "data"})
+        inner = linkify_html(nh3.clean(content, attributes=_ATTRS,
+                                       url_schemes={"http", "https", "mailto", "cid", "data"}))
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         f"<meta http-equiv='Content-Security-Policy' content=\"{csp(allow_remote_images)}\">"

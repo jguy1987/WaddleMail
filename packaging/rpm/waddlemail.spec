@@ -1,5 +1,5 @@
 Name:           waddlemail
-Version:        1.0.0
+Version:        1.0.1
 Release:        1%{?dist}
 Summary:        Linux mail client for Microsoft 365
 
@@ -44,5 +44,10 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/waddlemail.desktop
 %{_datadir}/icons/hicolor/*/apps/waddlemail*
 
 %changelog
+* Mon Nov 16 2026 John Mish <jmish1987@gmail.com> - 1.0.1-1
+- Web addresses in messages you read or send become links
+- Choosing a contact in To/Cc no longer inserts it twice
+- Task lists show the account's address instead of its internal id
+
 * Mon Nov 16 2026 John Mish <jmish1987@gmail.com> - 1.0.0-1
 - First stable release

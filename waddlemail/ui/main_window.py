@@ -2485,7 +2485,8 @@ class MainWindow(QMainWindow):
     def _task_editor(self, row=None, **kwargs) -> TaskEditor:
         """The editor for a task (`row`) or a new one; for an email's task, which email."""
         dlg = TaskEditor(self.store.task_lists(), self.store.category_colors(), row=row,
-                         tz=self._time_zone(), parent=self, **kwargs)
+                         tz=self._time_zone(), parent=self,
+                         account_names=self.store.account_names(), **kwargs)
         dlg.openEmailRequested.connect(self.open_task_email)
         if row is None:
             return dlg

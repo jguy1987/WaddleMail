@@ -43,10 +43,11 @@ class _Completer(QCompleter):
         return [path[last + 1:].strip()]
 
     def pathFromIndex(self, index) -> str:
+        # Highlighting a suggestion already writes it into the field, so what precedes the
+        # address being typed comes from what the user typed (RecipientEdit.typed_before),
+        # not from the field's current text: that would insert the choice twice.
         field = self.widget()
-        text = field.text() if field is not None else ""
-        last = max(text.rfind(";"), text.rfind(","))
-        before = text[:last + 1].strip()
+        before = field.typed_before() if field is not None else ""
         chosen = "; ".join(index.data(INSERT_ROLE) or [])
         return (f"{before} " if before else "") + chosen + "; "
 
@@ -70,6 +71,16 @@ class RecipientEdit(QLineEdit):
         completer.setMaxVisibleItems(10)
         self.setCompleter(completer)
         self._completer = completer
+        self._before = ""
+        self.textEdited.connect(self._remember_before)  # (not emitted by highlighting)
+
+    def _remember_before(self, text: str) -> None:
+        last = max(text.rfind(";"), text.rfind(","))
+        self._before = text[:last + 1].strip()
+
+    def typed_before(self) -> str:
+        """The addresses already in the field before the one being typed."""
+        return self._before
 
     def addresses(self) -> list[str]:
         return split_addresses(self.text())

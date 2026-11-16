@@ -415,6 +415,11 @@ class Store:
         return self.conn.execute(
             "SELECT * FROM mailboxes ORDER BY position, display_name COLLATE NOCASE").fetchall()
 
+    def account_names(self) -> dict[str, str]:
+        """account id -> the name shown for the account (its sign-in address)."""
+        return {m["account_id"]: m["display_name"] for m in self.mailbox_rows()
+                if not m["address"]}
+
     def add_mailbox(self, mailbox_id: str, account_id: str, address: str | None,
                     display_name: str) -> None:
         with self.conn as c:
