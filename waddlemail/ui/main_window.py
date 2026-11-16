@@ -17,7 +17,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QKeySequence
 from PySide6.QtWebEngineCore import QWebEnginePage
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QSplitter,
+    QApplication, QFileDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QSplitter,
     QStackedWidget, QSystemTrayIcon, QTextEdit, QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -46,7 +46,7 @@ from .account_setup import M365, AddAccountDialog, WelcomeWizard
 from .dialogs import SharedMailboxDialog
 from .event_editor import EventEditor
 from .reminders import ReminderService, ReminderWindow
-from .folder_pane import FolderPane
+from .folder_pane import FavoritesPane, FolderPane
 from .folder_picker import TOP, FolderPicker
 from .message_list import OUTGOING, FilterBar, MessageListView, OlderMailBar
 from .message_view import MessageView, MessageWindow
@@ -132,7 +132,34 @@ class MainWindow(QMainWindow):
         self.folder_tree.pickMoveFolderRequested.connect(self.pick_move_folder)
         self.folder_tree.messagesDropped.connect(
             lambda ids, dest, copy: self.move_messages(ids, dest, copy))
+        self.folder_tree.favoriteToggled.connect(
+            lambda fid, on: self.favorites.set_favorite(fid, on))
         self._last_dest: dict[str, str] = {}  # mailbox -> last Move/Copy destination
+
+        # Favorites: a box of their own above the folders, the line between them draggable
+        self.favorites = FavoritesPane(store)
+        self.favorites.folderSelected.connect(self._favorite_selected)
+        self.favorites.messagesDropped.connect(
+            lambda ids, dest, copy: self.move_messages(ids, dest, copy))
+        self.folder_tree.folderSelected.connect(lambda _: self.favorites.clear_current())
+        favorites_box = QWidget()
+        flay = QVBoxLayout(favorites_box)
+        flay.setContentsMargins(0, 0, 0, 0)
+        flay.setSpacing(0)
+        title = QLabel("  Favorites")
+        font = title.font()
+        font.setBold(True)
+        title.setFont(font)
+        title.setContentsMargins(4, 4, 4, 2)
+        flay.addWidget(title)
+        flay.addWidget(self.favorites, 1)
+        self.left = QSplitter(Qt.Orientation.Vertical)
+        self.left.addWidget(favorites_box)
+        self.left.addWidget(self.folder_tree)
+        self.left.setStretchFactor(1, 1)  # a taller window grows the folders
+        self.left.setChildrenCollapsible(False)
+        self.left.setSizes([120, 600])
+        self.left.setMinimumWidth(160)
 
         # messages: quick filter bar over the list
         self.filter_bar = FilterBar()
@@ -165,7 +192,7 @@ class MainWindow(QMainWindow):
         self.content.addWidget(self.msg_view)
         self.content.setChildrenCollapsible(False)
         self.outer = QSplitter()
-        self.outer.addWidget(self.folder_tree)
+        self.outer.addWidget(self.left)
         self.outer.addWidget(self.content)
         self.outer.setStretchFactor(1, 1)  # resizing the window grows the mail, not the folders
         self.outer.setSizes([240, 960])
@@ -390,8 +417,9 @@ class MainWindow(QMainWindow):
 
     # -- folders ------------------------------------------------------
     def _populate_folders(self):
-        self.folder_tree.extra_totals = self._outbox_totals()
+        self.folder_tree.extra_totals = self.favorites.extra_totals = self._outbox_totals()
         self.folder_tree.populate()
+        self.favorites.populate()
         self._update_unread_indicators()
         self._update_title()
 
@@ -408,13 +436,20 @@ class MainWindow(QMainWindow):
         self.msg_list.scrollToTop()
         self.sync_current()       # then catch up in the background
 
+    def _favorite_selected(self, fid: str):
+        """A favorite opens its folder (the tree shows nothing selected meanwhile)."""
+        self.folder_tree.clear_current()
+        if fid == self._current_folder:
+            return
+        self._on_folder_selected(fid)
+
     def _update_title(self):
-        item = self.folder_tree.currentItem()
+        folder = self.store.folder_row(self._current_folder) if self._current_folder else None
         box = self.mailboxes.for_folder(self._current_folder) if self._current_folder else None
-        if item is None or box is None:
+        if folder is None or box is None:
             self.setWindowTitle("WaddleMail")
         else:
-            self.setWindowTitle(f"{item.text(0)} – {box.display_name} – WaddleMail")
+            self.setWindowTitle(f"{folder['name']} – {box.display_name} – WaddleMail")
 
     # -- mailboxes ----------------------------------------------------
     def add_account(self):
@@ -472,6 +507,7 @@ class MainWindow(QMainWindow):
     def _mailbox_added(self, mailbox_id: str):
         self._syncing = False
         self._populate_folders()
+        self.contacts_view.reload()  # (another account to choose contacts from)
         inbox = self.store.well_known_folder(mailbox_id, "inbox")
         if inbox:
             self.folder_tree.select_folder(inbox)
@@ -497,6 +533,8 @@ class MainWindow(QMainWindow):
             self.msg_view.show_placeholder("Select a folder.")
         self.mailboxes.remove(mailbox_id)
         self._populate_folders()
+        self.contacts_view.reload()
+        self.calendar_page.reload_calendars()
 
     # -- folder management --------------------------------------------
     def new_folder(self):
@@ -1024,7 +1062,8 @@ class MainWindow(QMainWindow):
     def save_contact(self, fields: dict, contact_id: str, folder_id: str, folder_name: str,
                      photo: bytes | None = None):
         row = self.store.contact_row(contact_id) if contact_id else None
-        box = self._contacts_box(row["account_id"] if row else None)
+        # (a new one: in the account whose contacts are showing)
+        box = self._contacts_box(row["account_id"] if row else self.contacts_view.account())
         if box is None:
             return
 
@@ -1088,7 +1127,7 @@ class MainWindow(QMainWindow):
         """Create a contact group (no `group_id`) or change one: name, notes, members to add
         (addMembers payloads) and stored members to remove."""
         g = self.store.group_row(group_id) if group_id else None
-        box = self._contacts_box(g["account_id"] if g else None)
+        box = self._contacts_box(g["account_id"] if g else self.contacts_view.account())
         if box is None:
             return
 
@@ -1451,6 +1490,7 @@ class MainWindow(QMainWindow):
     # -- tray, notifications, badge ---------------------------------------
     def _counts_changed(self):
         self.folder_tree.refresh_counts()
+        self.favorites.refresh_counts()
         self._update_unread_indicators()
         self.status.refresh()  # read/flag/move changes waiting to be sent
 
@@ -1588,6 +1628,9 @@ class MainWindow(QMainWindow):
         split = s.get("window/folder_split")
         if not split.isEmpty():
             self.outer.restoreState(split)
+        split = s.get("window/favorites_split")
+        if not split.isEmpty():
+            self.left.restoreState(split)
         self._split_states = {"right": s.get("window/split_right"),
                               "bottom": s.get("window/split_bottom")}
         self.msg_list.restore_header(s.get("list/header"))
@@ -1607,6 +1650,7 @@ class MainWindow(QMainWindow):
             self._split_states[self._pane_mode] = self.content.saveState()
         s.set("window/geometry", self.saveGeometry())
         s.set("window/folder_split", self.outer.saveState())
+        s.set("window/favorites_split", self.left.saveState())
         s.set("window/split_right", self._split_states["right"])
         s.set("window/split_bottom", self._split_states["bottom"])
         s.set("list/header", self.msg_list.header_state())
@@ -1899,7 +1943,7 @@ class MainWindow(QMainWindow):
         folders = QAction("Show &folder pane", self)
         folders.setCheckable(True)
         folders.setChecked(True)
-        folders.toggled.connect(self.folder_tree.setVisible)
+        folders.toggled.connect(self.left.setVisible)
         view_menu.addAction(folders)
         view_menu.addSeparator()
         view_menu.addAction(self.images_action)
@@ -2109,8 +2153,9 @@ class MainWindow(QMainWindow):
                 if (fid := self.store.well_known_folder(mbox, "outbox"))}
 
     def _outbox_changed(self):
-        self.folder_tree.extra_totals = self._outbox_totals()
+        self.folder_tree.extra_totals = self.favorites.extra_totals = self._outbox_totals()
         self.folder_tree.refresh_counts()
+        self.favorites.refresh_counts()
         self.status.refresh()
         folder = self.store.folder_row(self._current_folder) if self._current_folder else None
         if folder is not None and folder["well_known"] == "outbox":

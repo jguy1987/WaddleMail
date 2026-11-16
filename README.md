@@ -13,10 +13,17 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   WaddleMail open, empty, until you add one.
 - **Several accounts and shared mailboxes** in one folder pane (File > Add account… / Add shared
   mailbox…, or right-click the pane). Each mailbox is a heading with its folders below; right-click
-  a heading to remove a shared mailbox or sign out of an account. A shared mailbox can be a full
+  a heading to move the account up or down, remove a shared mailbox or sign out of an account. A shared mailbox can be a full
   mailbox (e.g. support@) or a person who shared only some folders with you: if the mailbox
   itself can't be listed, WaddleMail shows whichever default folders (Inbox, Sent Items, ...) you
   can open, with their subfolders.
+- **Favorites** in a box of their own above the folder pane: right-click any folder > Add to
+  Favorites, or drag a folder (Inbox too) into the box. They work like the folder itself (open
+  it, drop mail on it, counts), from every mailbox, with the mailbox's name dimmed beside them
+  when there are several (shortened first when space runs out; the folder's name always shows).
+  Right-click a favorite to move it up or down or remove it; Del removes it from the Favorites
+  (the folder stays). Drag the line between the box and the folders to make it taller or
+  shorter, and the line beside them to make both wider; both are remembered.
 - Folder pane in Outlook order: Inbox, Drafts, Sent Items, Deleted Items, Junk Email, Archive,
   Outbox, then other folders A-Z (subfolders A-Z). Each default folder has its own icon; unread
   counts are right-aligned (Drafts/Outbox show how many items they hold), and a collapsed folder
@@ -143,6 +150,9 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
 - **Calendar** (the rail, or Ctrl+2):
   - Day, Work week, Week and Month views; Today and back/forward; a mini month and your
     calendars (tick to show/hide) on the left; the selected event's details on the right.
+    With several accounts the calendars are grouped under each account, whose box shows or
+    hides all of its calendars at once (so each tenant's calendar can be seen on its own).
+    New events go to a calendar you're showing.
   - Events are coloured by their first category (your Outlook categories and colours), else
     by their calendar. The bar on an event's left shows its Show as, as Outlook draws it:
     solid Busy, hatched Tentative, purple Out of office, dotted Working elsewhere, outline
@@ -208,6 +218,10 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   - Sources: all personal contacts and each contact folder, **contact groups**, the
     **organization directory**, and **recent recipients** (people you send to, from Sent
     Items, and people whose mail you replied to; most used first).
+  - With several accounts, **Contacts from** above the sources picks whose: one account's
+    contacts, groups, directory (its organization) and recipients, or All accounts. The choice
+    is remembered; new contacts and groups go to that account. Name completion when writing
+    mail still offers everyone.
   - Search by name, address, company, title or department; a details card with avatar,
     addresses (click to write), phones and notes; "Email everyone in this group".
   - Personal contacts can be created, edited and deleted: names, up to three addresses,

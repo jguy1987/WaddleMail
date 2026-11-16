@@ -114,7 +114,7 @@ def test_recent_recipients(tmp_path):
 def test_suggestions_rank_and_dedupe(tmp_path):
     st = make_store(tmp_path)
     ContactSync(st, FakeGraph(), "a").refresh()
-    st.conn.execute("INSERT INTO recipients VALUES('bo@y.org', 'Bo', 5, 0, '2026-11-01')")
+    st.conn.execute("INSERT INTO recipients VALUES('a', 'bo@y.org', 'Bo', 5, 0, '2026-11-01')")
     st.conn.commit()
     sug = suggestions(st)
     assert sug[0].kind == "recent" and "bo@y.org" in sug[0].text

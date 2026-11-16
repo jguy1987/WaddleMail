@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS folders(
     child_count INTEGER DEFAULT 0,
     unread INTEGER DEFAULT 0,
     total INTEGER DEFAULT 0,
-    collapsed INTEGER DEFAULT 0
+    collapsed INTEGER DEFAULT 0,
+    favorite INTEGER                -- its place among the Favorites; NULL = not one
 );
 CREATE TABLE IF NOT EXISTS messages(
     id TEXT PRIMARY KEY,
@@ -224,11 +225,13 @@ CREATE TABLE IF NOT EXISTS photos(
 );
 -- People you send to and reply to, for the Recent list and autocomplete.
 CREATE TABLE IF NOT EXISTS recipients(
-    address TEXT PRIMARY KEY,       -- lower case
+    account_id TEXT NOT NULL,       -- whose mail it was counted from
+    address TEXT NOT NULL,          -- lower case
     name TEXT,
     sent INTEGER DEFAULT 0,         -- messages you sent them (To/Cc)
     replied INTEGER DEFAULT 0,      -- their messages you replied to
-    last_used TEXT
+    last_used TEXT,
+    PRIMARY KEY(account_id, address)
 );
 """
 
@@ -374,6 +377,12 @@ class Store:
         for col in ("mailbox_id", "well_known"):
             if col not in cols:
                 self.conn.execute(f"ALTER TABLE folders ADD COLUMN {col} TEXT")
+        if "favorite" not in cols:
+            self.conn.execute("ALTER TABLE folders ADD COLUMN favorite INTEGER")
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(recipients)")}
+        if "account_id" not in cols:  # (counted again from the mail by rebuild_recipients)
+            self.conn.execute("DROP TABLE recipients")
+            self.conn.executescript(SCHEMA)
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(contacts)")}
         for col in ("addresses", "birthday", "website", "nickname"):
             if col not in cols:
@@ -430,6 +439,42 @@ class Store:
             c.execute("DELETE FROM pending WHERE mailbox_id=?", (mailbox_id,))
             c.execute("DELETE FROM mailboxes WHERE id=?", (mailbox_id,))
         self.purge_orphan_bodies()
+
+    def move_mailbox(self, mailbox_id: str, step: int) -> None:
+        """Move a mailbox up (-1) or down (+1) in the folder pane."""
+        order = [r["id"] for r in self.mailbox_rows()]
+        if mailbox_id not in order:
+            return
+        i = order.index(mailbox_id)
+        j = max(0, min(len(order) - 1, i + step))
+        order.insert(j, order.pop(i))
+        with self.conn as c:
+            c.executemany("UPDATE mailboxes SET position=? WHERE id=?",
+                          [(n, mid) for n, mid in enumerate(order)])
+
+    # -- favorite folders --------------------------------------------------
+    def favorite_folders(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM folders WHERE favorite IS NOT NULL"
+                                 " ORDER BY favorite").fetchall()
+
+    def set_favorite(self, folder_id: str, on: bool) -> None:
+        with self.conn as c:
+            if on:
+                c.execute("UPDATE folders SET favorite = (SELECT COALESCE(MAX(favorite), -1)"
+                          " + 1 FROM folders) WHERE id=? AND favorite IS NULL", (folder_id,))
+            else:
+                c.execute("UPDATE folders SET favorite=NULL WHERE id=?", (folder_id,))
+
+    def move_favorite(self, folder_id: str, step: int) -> None:
+        """Move a favorite up (-1) or down (+1) in the Favorites."""
+        order = [r["id"] for r in self.favorite_folders()]
+        if folder_id not in order:
+            return
+        i = order.index(folder_id)
+        order.insert(max(0, min(len(order) - 1, i + step)), order.pop(i))
+        with self.conn as c:
+            c.executemany("UPDATE folders SET favorite=? WHERE id=?",
+                          [(n, fid) for n, fid in enumerate(order)])
 
     def set_mailbox_collapsed(self, mailbox_id: str, collapsed: bool) -> None:
         with self.conn as c:
@@ -865,13 +910,16 @@ class Store:
         return self.conn.execute("SELECT * FROM contacts WHERE id=?", (contact_id,)).fetchone()
 
     def contacts(self, source: str | None = None, folder_id: str | None = None,
-                 search: str = "") -> list[sqlite3.Row]:
-        """Contacts A-Z; every word of `search` must appear in the name, an address, the
-        company, title or department."""
+                 search: str = "", account_id: str | None = None) -> list[sqlite3.Row]:
+        """Contacts A-Z (of one account, or all); every word of `search` must appear in the
+        name, an address, the company, title or department."""
         sql, args = "SELECT * FROM contacts WHERE 1", []
         if source:
             sql += " AND source=?"
             args.append(source)
+        if account_id is not None:
+            sql += " AND account_id=?"
+            args.append(account_id)
         if folder_id is not None:
             sql += " AND folder_id=?"
             args.append(folder_id)
@@ -881,11 +929,13 @@ class Store:
             args.extend([f"%{word}%"] * 5)
         return self.conn.execute(sql + " ORDER BY display_name COLLATE NOCASE", args).fetchall()
 
-    def contact_folders(self) -> list[sqlite3.Row]:
+    def contact_folders(self, account_id: str | None = None) -> list[sqlite3.Row]:
+        sql, args = ("SELECT DISTINCT account_id, folder_id, folder_name FROM contacts "
+                     "WHERE source='personal'"), ()
+        if account_id is not None:
+            sql, args = sql + " AND account_id=?", (account_id,)
         return self.conn.execute(
-            "SELECT DISTINCT account_id, folder_id, folder_name FROM contacts "
-            "WHERE source='personal' ORDER BY folder_id != '', folder_name COLLATE NOCASE"
-        ).fetchall()
+            sql + " ORDER BY folder_id != '', folder_name COLLATE NOCASE", args).fetchall()
 
     def replace_groups(self, account_id: str, groups: list[dict]) -> None:
         with self.conn as c:
@@ -896,8 +946,11 @@ class Store:
                 [(g["id"], account_id, g["name"], g.get("notes"), json.dumps(g["members"]))
                  for g in groups])
 
-    def groups(self, search: str = "") -> list[sqlite3.Row]:
+    def groups(self, search: str = "", account_id: str | None = None) -> list[sqlite3.Row]:
         sql, args = "SELECT * FROM contact_groups WHERE 1", []
+        if account_id is not None:
+            sql += " AND account_id=?"
+            args.append(account_id)
         for word in search.split():
             sql += " AND (name LIKE ? OR members LIKE ?)"
             args.extend([f"%{word}%"] * 2)
@@ -919,45 +972,56 @@ class Store:
 
     def rebuild_recipients(self) -> int:
         """Recount who you write to (To/Cc of mail in Sent Items) and reply to (senders of
-        mail marked replied/replied-all). Returns how many people that is."""
-        people: dict[str, dict] = {}
+        mail marked replied/replied-all), per account (the one whose mailbox it's in; a
+        shared mailbox counts for the account that opens it). Returns how many that is."""
+        people: dict[tuple[str, str], dict] = {}
 
-        def bump(name, address, field, when):
+        def bump(account, name, address, field, when):
             if not address or "@" not in address:
                 return
-            p = people.setdefault(address.lower(), {"name": "", "sent": 0, "replied": 0,
-                                                    "last_used": ""})
+            p = people.setdefault((account, address.lower()),
+                                  {"name": "", "sent": 0, "replied": 0, "last_used": ""})
             p[field] += 1
             if name and (not p["name"] or (when or "") >= p["last_used"]):
                 p["name"] = name
             p["last_used"] = max(p["last_used"], when or "")
 
         for r in self.conn.execute(
-                "SELECT m.to_recipients, m.cc_recipients, m.received FROM messages m "
-                "JOIN folders f ON f.id = m.folder_id WHERE f.well_known = 'sentitems'"):
+                "SELECT b.account_id, m.to_recipients, m.cc_recipients, m.received "
+                "FROM messages m JOIN folders f ON f.id = m.folder_id "
+                "JOIN mailboxes b ON b.id = f.mailbox_id WHERE f.well_known = 'sentitems'"):
             for name, address in recipients(r["to_recipients"]) + recipients(r["cc_recipients"]):
-                bump(name, address, "sent", r["received"])
+                bump(r["account_id"], name, address, "sent", r["received"])
         for r in self.conn.execute(
-                "SELECT sender_name, sender_addr, received FROM messages "
-                "WHERE last_verb IN (102, 103)"):
-            bump(r["sender_name"], r["sender_addr"], "replied", r["received"])
+                "SELECT b.account_id, m.sender_name, m.sender_addr, m.received FROM messages m "
+                "JOIN folders f ON f.id = m.folder_id JOIN mailboxes b ON b.id = f.mailbox_id "
+                "WHERE m.last_verb IN (102, 103)"):
+            bump(r["account_id"], r["sender_name"], r["sender_addr"], "replied", r["received"])
         mine = {(m["address"] or "").lower() for m in self.mailbox_rows()}
         mine |= {(m["display_name"] or "").lower() for m in self.mailbox_rows()}
         with self.conn as c:
             c.execute("DELETE FROM recipients")
             c.executemany(
-                "INSERT INTO recipients(address, name, sent, replied, last_used) VALUES(?,?,?,?,?)",
-                [(a, p["name"], p["sent"], p["replied"], p["last_used"])
-                 for a, p in people.items() if a not in mine])
+                "INSERT INTO recipients(account_id, address, name, sent, replied, last_used)"
+                " VALUES(?,?,?,?,?,?)",
+                [(acct, a, p["name"], p["sent"], p["replied"], p["last_used"])
+                 for (acct, a), p in people.items() if a not in mine])
         return len(people)
 
-    def recent_recipients(self, search: str = "", limit: int = 500) -> list[sqlite3.Row]:
-        """Most used first: replies count double, recent use breaks ties."""
+    def recent_recipients(self, search: str = "", limit: int = 500,
+                          account_id: str | None = None) -> list[sqlite3.Row]:
+        """Most used first (one account's, or all added up): replies count double, recent
+        use breaks ties."""
         sql, args = "SELECT * FROM recipients WHERE 1", []
+        if account_id is not None:
+            sql += " AND account_id=?"
+            args.append(account_id)
         for word in search.split():
             sql += " AND (name LIKE ? OR address LIKE ?)"
             args.extend([f"%{word}%"] * 2)
-        sql += " ORDER BY sent + 2 * replied DESC, last_used DESC LIMIT ?"
+        sql = ("SELECT address, MAX(name) AS name, SUM(sent) AS sent, SUM(replied) AS replied,"
+               f" MAX(last_used) AS last_used FROM ({sql}) GROUP BY address"
+               " ORDER BY sent + 2 * replied DESC, last_used DESC LIMIT ?")
         return self.conn.execute(sql, (*args, limit)).fetchall()
 
     # -- calendar ----------------------------------------------------------

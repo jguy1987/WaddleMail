@@ -229,6 +229,9 @@ class EventEditor(QDialog):
             if cal["can_edit"]:
                 self.calendar.addItem(color_icon(cal["color"] or "#4f8cff"), cal["name"],
                                       cal["id"])
+        shown = next((i for i in range(self.calendar.count()) if any(
+            c["id"] == self.calendar.itemData(i) and c["visible"] for c in calendars)), 0)
+        self.calendar.setCurrentIndex(shown)  # a new event: in a calendar you're showing
         self.private = QCheckBox("Private")
         line = QHBoxLayout()
         line.addWidget(QLabel("Categories:"))

@@ -363,6 +363,7 @@ def checks():
     outbox_checks()
     tasks_checks()
     account_checks()
+    organize_checks()
 
     w.close()
     saved = Settings(str(tmp / "settings.ini"))
@@ -982,7 +983,7 @@ def calendar_checks():
     page.set_mode(WEEK)
     w.refresh_calendar(calendars=True)
     wait(600)
-    check(w.pages.currentWidget() is page and page.cal_list.count() == 1,
+    check(w.pages.currentWidget() is page and page.calendar_count() == 1,
           "Ctrl+2 opens the Calendar with its calendars")
     check(sorted(e.subject for e in page.grid.events) == ["Design review", "Standup",
                                                            "Weekly 1:1"],
@@ -1880,6 +1881,131 @@ def account_checks():
     check(shown and hints[-1] == "jordan@contoso.com",
           "first run: the welcome wizard asks for the account, then signs in")
     w.mailboxes.add_account = real_add
+
+
+def organize_checks():
+    from PySide6.QtGui import QDropEvent, QImage
+    from waddlemail.ui import dnd
+    from waddlemail.ui.contacts_view import ALL
+    from waddlemail.ui.folder_pane import ID_ROLE
+    w.show_page("mail")
+    pane, favs = w.folder_tree, w.favorites
+    check(favs.topLevelItemCount() == 0 and favs.isVisible()
+          and w.left.indexOf(favs.parentWidget()) == 0,
+          "a Favorites box above the folders (empty, it says how to fill it)")
+    pane.favoriteToggled.emit("in", True)  # (right-click a folder > Add to Favorites)
+    check(favs.topLevelItemCount() == 1 and favs.topLevelItem(0).text(0) == "Inbox"
+          and pane.topLevelItem(0).data(0, ID_ROLE) == "a",
+          "Add to Favorites puts the folder, named, in the box (the tree is unchanged)")
+    favs.select_folder("in")
+    wait(300)
+    check(w._current_folder == "in" and pane.currentItem() is None,
+          "a favorite opens its folder (only one place shows a selection)")
+    pane.select_folder(travel_id())
+    wait(300)
+    check(favs.currentItem() is None and w._current_folder == travel_id(),
+          "...and choosing in the tree clears the favorite")
+
+    def drop_on_favorites(payload_type, payload, item=None):
+        mime = dnd.encode(payload_type, payload)
+        pos = QPointF(favs.visualItemRect(item).center()) if item else QPointF(10, 60)
+        ev = QDropEvent(pos, Qt.DropAction.MoveAction | Qt.DropAction.LinkAction, mime,
+                        Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        favs.dropEvent(ev)
+        wait(400)
+        return ev.isAccepted()
+
+    travel = travel_id()
+    check(drop_on_favorites(dnd.FOLDER, {"folder": travel}), "dropping a folder in the box adds it")
+    check([r["id"] for r in st.favorite_folders()] == ["in", travel], "...at the end")
+    st.apply_message_changes("in", [m("fav1", "Boarding pass", "Air Line", 1)])
+    check(drop_on_favorites(dnd.MESSAGES, {"folder": "in", "ids": ["fav1"]},
+                            favs.topLevelItem(1))
+          and st.message_row("fav1")["folder_id"] == travel,
+          "mail dropped on a favorite moves to its folder")
+    favs.move_favorite(travel, -1)
+    check([r["id"] for r in st.favorite_folders()] == [travel, "in"], "favorites can be reordered")
+    favs.select_folder(travel)
+    favs.setFocus()
+    QTest.keyClick(favs, Qt.Key.Key_Delete)
+    wait(200)
+    check([r["id"] for r in st.favorite_folders()] == ["in"] and st.folder_row(travel),
+          "Del on a favorite takes it out of the Favorites (the folder stays)")
+    sizes = w.left.sizes()
+    w.left.setSizes([sizes[0] + 80, sizes[1] - 80])
+    check(w.left.sizes()[0] == sizes[0] + 80 and w.left.orientation() == Qt.Orientation.Vertical,
+          "the Favorites box can be made taller (and the folder column wider, as before)")
+
+    # a second account: accounts reorder; its calendars and contacts are its own
+    st.add_mailbox("b", "b", None, "jordan@a-very-long-personal-domain-name.example.org")
+    st.upsert_folders("b", [{"id": "b-in", "displayName": "Inbox", "wellKnownName": "inbox"}])
+    w._populate_folders()
+    favs.resize(150, favs.height())  # narrow: the long mailbox name mustn't hide the folder's
+    img = QImage(favs.viewport().size(), QImage.Format.Format_ARGB32)
+    img.fill(Qt.GlobalColor.white)
+    favs.viewport().render(img)
+    check(favs.topLevelItem(0).text(0) == "Inbox" and favs.topLevelItem(0).data(0, ID_ROLE + 5)
+          and _ink(img, 24, 70) > 30, "with several mailboxes a favorite shows its mailbox too, "
+          "and its name still shows when narrow")
+    heads = lambda: [pane.topLevelItem(i).data(0, ID_ROLE)  # noqa: E731
+                     for i in range(pane.topLevelItemCount())]
+    check(heads() == ["a", "b"], "accounts in their order")
+    pane.move_mailbox("b", -1)
+    check(heads() == ["b", "a"], "an account can be moved up")
+    pane.move_mailbox("b", 1)
+
+    st.replace_calendars("b", [{"id": "cal-b", "name": "Family", "color": "#e74856",
+                                "is_default": 1, "can_edit": 1, "teams": 0, "owner": ""}])
+    page = w.calendar_page
+    page.reload_calendars()
+    home = page.account_item("jordan@a-very-long-personal-domain-name.example.org")
+    work = page.account_item("jordan@contoso.com")
+    check(home is not None and work is not None and home.childCount() == 1,
+          "calendars are grouped by account")
+    home.setCheckState(0, Qt.CheckState.Unchecked)
+    wait(200)
+    vis = {r["id"]: r["visible"] for r in st.calendar_rows()}
+    check(vis["cal-b"] == 0 and all(v for k, v in vis.items() if k != "cal-b"),
+          "an account's box hides all of its calendars (and only those)")
+    home.setCheckState(0, Qt.CheckState.Checked)
+    wait(200)
+
+    st.upsert_contact({"id": "c-home", "account_id": "b", "source": "personal",
+                       "folder_id": "", "display_name": "Mum"})
+    cv = w.contacts_view
+    cv.reload()
+    check(not cv.accounts.isHidden() and cv.accounts.count() == 3,
+          "Contacts from: each account, and All accounts")
+    cv.show_source(ALL)
+
+    def names_for(account):
+        cv.accounts.setCurrentIndex(cv.accounts.findData(account))
+        cv._account_chosen(cv.accounts.currentIndex())
+        cv.show_source(ALL)
+        return [cv.list.topLevelItem(i).text(0) for i in range(cv.list.topLevelItemCount())]
+
+    home_names, work_names, all_names = names_for("b"), names_for("a"), names_for("")
+    check(home_names == ["Mum"] and "Mum" not in work_names and "Mum" in all_names
+          and len(all_names) == len(work_names) + 1,
+          "switching accounts switches the contacts shown")
+    check(st.get_state("contacts:account") == "", "...and the choice is remembered")
+    names_for("a")
+    st.remove_mailbox("b")
+    st.replace_calendars("b", [])
+    favs.set_favorite("in", False)
+    w._populate_folders()
+    cv.reload()
+    page.reload_calendars()
+    check(cv.accounts.isHidden() and page.account_item(
+        "jordan@a-very-long-personal-domain-name.example.org") is None,
+          "with one account again, no account choices")
+
+
+def _ink(img, x0: int, x1: int) -> int:
+    """Dark pixels in columns x0..x1 of the first row (is there text there?)."""
+    row_h = 24
+    return sum(1 for x in range(x0, min(x1, img.width())) for y in range(2, row_h)
+               if img.pixelColor(x, y).lightness() < 128)
 
 
 def travel_id():

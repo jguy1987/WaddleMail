@@ -1,7 +1,9 @@
 """The Contacts view: sources | searchable list | details card.
 
 Sources: all contacts, each personal contact folder, contact groups, the organization
-directory, and recent recipients (people you send to and reply to).
+directory, and recent recipients (people you send to and reply to). With several accounts,
+"Contacts from" above them picks whose (or all accounts'): each account's contacts, groups,
+directory (its organization) and recipients are its own. New contacts and groups go to it.
 
 - Personal contacts: new, edit (with photo, addresses, birthday, ...), delete.
 - Contact groups: new, edit (name, notes, members), delete; "Add to group" adds whoever is
@@ -22,7 +24,7 @@ import time
 from PySide6.QtCore import QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QPalette, QTextDocument
 from PySide6.QtWidgets import (
-    QAbstractItemView, QLabel, QLineEdit, QMenu, QSplitter, QTextBrowser, QToolBar,
+    QAbstractItemView, QComboBox, QLabel, QLineEdit, QMenu, QSplitter, QTextBrowser, QToolBar,
     QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -93,6 +95,18 @@ class ContactsView(QWidget):
         self.sources.setRootIsDecorated(False)
         self.sources.setIndentation(14)
         self.sources.currentItemChanged.connect(lambda *_: self._fill_list())
+        self.accounts = QComboBox()  # "Contacts from": one account's, or everyone's
+        self.accounts.setToolTip("Whose contacts, groups, directory and recipients to show")
+        self.accounts.activated.connect(self._account_chosen)
+        left = QWidget()
+        llay = QVBoxLayout(left)
+        llay.setContentsMargins(0, 0, 0, 0)
+        llay.setSpacing(2)
+        self.accounts_label = QLabel("Contacts from:")
+        self.accounts_label.setContentsMargins(6, 4, 6, 0)
+        llay.addWidget(self.accounts_label)
+        llay.addWidget(self.accounts)
+        llay.addWidget(self.sources, 1)
 
         middle = QWidget()
         mlay = QVBoxLayout(middle)
@@ -123,7 +137,7 @@ class ContactsView(QWidget):
         self.details.anchorClicked.connect(self._link)
 
         split = QSplitter()
-        split.addWidget(self.sources)
+        split.addWidget(left)
         split.addWidget(middle)
         split.addWidget(self.details)
         split.setStretchFactor(1, 1)
@@ -131,9 +145,37 @@ class ContactsView(QWidget):
         lay.addWidget(split, 1)
         self.reload()
 
+    # -- whose contacts -------------------------------------------------------------
+    def account(self) -> str | None:
+        """The account shown (None: all of them)."""
+        return self.accounts.currentData() or None
+
+    def _fill_accounts(self) -> None:
+        """One entry per account (the account's own mailbox name), then All accounts; the
+        choice is remembered. Hidden with just one account."""
+        own = [(m["account_id"], m["display_name"]) for m in self.store.mailbox_rows()
+               if not m["address"]]
+        keep = self.accounts.currentData() if self.accounts.count() else \
+            self.store.get_state("contacts:account")
+        self.accounts.blockSignals(True)
+        self.accounts.clear()
+        for account_id, name in own:
+            self.accounts.addItem(iconset.load("user-round"), name, account_id)
+        self.accounts.addItem(iconset.load("users-round"), "All accounts", "")
+        index = self.accounts.findData(keep) if keep is not None else -1
+        self.accounts.setCurrentIndex(max(index, 0))
+        self.accounts.blockSignals(False)
+        for w in (self.accounts, self.accounts_label):
+            w.setVisible(len(own) > 1)
+
+    def _account_chosen(self, _index: int) -> None:
+        self.store.set_state("contacts:account", self.accounts.currentData() or "")
+        self.reload()
+
     # -- sources ----------------------------------------------------------------
     def reload(self) -> None:
         """Re-read everything from the store, keeping the chosen source and selection."""
+        self._fill_accounts()
         current = self.sources.currentItem()
         keep = current.data(0, SOURCE_ROLE) if current else (ALL, None)
         selected = self.selected_keys()
@@ -148,7 +190,7 @@ class ContactsView(QWidget):
             return item
 
         everyone = add("All contacts", "contact", (ALL, None))
-        for f in self.store.contact_folders():
+        for f in self.store.contact_folders(self.account()):
             add(f["folder_name"] or "Contacts", "book-user", (FOLDER, f["folder_id"]), everyone)
         add("Contact groups", "users-round", (GROUPS, None))
         add("Organization", "users-round", (DIR, None))
@@ -190,19 +232,20 @@ class ContactsView(QWidget):
         self.list.clear()
         if kind == GROUPS:
             self._columns(["Group", "Members"])
-            for g in self.store.groups(search):
+            for g in self.store.groups(search, self.account()):
                 n = len(json.loads(g["members"] or "[]"))
                 self._row([g["name"], str(n)], ("group", g["id"]), "users-round")
         elif kind == RECENT:
             self._columns(["Name", "Email", "Sent", "Replied", "Last"])
-            for r in self.store.recent_recipients(search):
+            for r in self.store.recent_recipients(search, account_id=self.account()):
                 self._row([r["name"] or r["address"], r["address"], str(r["sent"]),
                            str(r["replied"]), (r["last_used"] or "")[:10]],
                           ("recent", r["address"]), "reply")
         else:
             self._columns(["Name", "Email", "Company", "Title"])
             source = DIRECTORY if kind == DIR else PERSONAL
-            rows = self.store.contacts(source, folder if kind == FOLDER else None, search)
+            rows = self.store.contacts(source, folder if kind == FOLDER else None, search,
+                                       self.account())
             for c in rows:
                 emails = json.loads(c["emails"] or "[]")
                 self._row([c["display_name"], emails[0][1] if emails else "",
@@ -414,7 +457,7 @@ class ContactsView(QWidget):
 
     def _folders(self) -> list[tuple[str, str]]:
         folders = [(f["folder_id"], f["folder_name"] or "Contacts")
-                   for f in self.store.contact_folders()]
+                   for f in self.store.contact_folders(self.account())]
         return folders or [("", "Contacts")]
 
     def new_item(self):
@@ -500,7 +543,7 @@ class ContactsView(QWidget):
     def _fill_group_menu(self):
         self._group_menu.clear()
         people = self._people(self.selected_keys())
-        groups = self.store.groups()
+        groups = self.store.groups(account_id=self.account())
         for g in groups:
             act = self._group_menu.addAction(iconset.load("users-round"), g["name"])
             act.triggered.connect(lambda _=False, gid=g["id"]: self.add_to_group(gid, people))

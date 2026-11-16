@@ -30,6 +30,7 @@ DEFAULTS = {
     # Window layout, saved on exit (not shown in Preferences).
     "window/geometry": QByteArray(),
     "window/folder_split": QByteArray(),
+    "window/favorites_split": QByteArray(),
     "window/split_right": QByteArray(),
     "window/split_bottom": QByteArray(),
     "list/header": QByteArray(),   # column order, widths, visibility and sort

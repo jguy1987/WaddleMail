@@ -20,9 +20,9 @@ import json
 from PySide6.QtCore import QDate, QLocale, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
-    QButtonGroup, QCalendarWidget, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QPushButton, QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QTextBrowser, QToolBar,
-    QToolButton, QVBoxLayout, QWidget,
+    QButtonGroup, QCalendarWidget, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy,
+    QSplitter, QStackedWidget, QTextBrowser, QToolBar, QToolButton, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..calendars import (
@@ -576,8 +576,16 @@ class CalendarPage(QWidget):
         self.mini.clicked.connect(lambda d: self.go_to(d.toPython()))
         llay.addWidget(self.mini)
         llay.addWidget(QLabel("<b>Calendars</b>"))
-        self.cal_list = QListWidget()
+        # Grouped by account (with several): an account's box shows or hides all of its
+        # calendars; each calendar has its own too.
+        self.cal_list = QTreeWidget()
+        self.cal_list.setHeaderHidden(True)
+        self.cal_list.setIndentation(14)
         self.cal_list.itemChanged.connect(self._calendar_checked)
+        self._redraw_soon = QTimer(self)  # (an account's box changes all of its calendars)
+        self._redraw_soon.setSingleShot(True)
+        self._redraw_soon.setInterval(0)
+        self._redraw_soon.timeout.connect(self.reload)
         llay.addWidget(self.cal_list, 1)
 
         self.grid = TimeGrid()
@@ -707,22 +715,60 @@ class CalendarPage(QWidget):
     def reload_calendars(self):
         self.cal_list.blockSignals(True)
         self.cal_list.clear()
-        for cal in self.store.calendar_rows():
-            item = QListWidgetItem(color_icon(cal["color"] or DEFAULT_CALENDAR_COLOR, 14),
-                                   cal["name"])
-            item.setData(Qt.ItemDataRole.UserRole, cal["id"])
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Checked if cal["visible"]
+        names = {m["account_id"]: m["display_name"] for m in self.store.mailbox_rows()
+                 if not m["address"]}
+        calendars = self.store.calendar_rows()
+        accounts = list(dict.fromkeys(c["account_id"] for c in calendars))
+        heads = {}
+        if len(accounts) > 1:
+            font = QFont(self.cal_list.font())
+            font.setBold(True)
+            for account in accounts:
+                head = QTreeWidgetItem([names.get(account, account)])
+                head.setFont(0, font)
+                head.setToolTip(0, "Show or hide all of this account's calendars")
+                head.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+                              | Qt.ItemFlag.ItemIsAutoTristate)
+                self.cal_list.addTopLevelItem(head)
+                heads[account] = head
+        for cal in calendars:
+            item = QTreeWidgetItem([cal["name"]])
+            item.setIcon(0, color_icon(cal["color"] or DEFAULT_CALENDAR_COLOR, 14))
+            item.setData(0, Qt.ItemDataRole.UserRole, cal["id"])
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(0, Qt.CheckState.Checked if cal["visible"]
                                else Qt.CheckState.Unchecked)
             if cal["owner"]:
-                item.setToolTip(cal["owner"])
-            self.cal_list.addItem(item)
+                item.setToolTip(0, cal["owner"])
+            head = heads.get(cal["account_id"])
+            if head is not None:
+                head.addChild(item)
+            else:
+                self.cal_list.addTopLevelItem(item)
+        self.cal_list.expandAll()
         self.cal_list.blockSignals(False)
 
-    def _calendar_checked(self, item: QListWidgetItem):
-        self.calendarToggled.emit(item.data(Qt.ItemDataRole.UserRole),
-                                  item.checkState() == Qt.CheckState.Checked)
-        self.reload()
+    def calendar_count(self) -> int:
+        return sum(1 for _ in self._calendar_items())
+
+    def _calendar_items(self):
+        for i in range(self.cal_list.topLevelItemCount()):
+            top = self.cal_list.topLevelItem(i)
+            if top.data(0, Qt.ItemDataRole.UserRole):
+                yield top
+            for j in range(top.childCount()):
+                yield top.child(j)
+
+    def account_item(self, name: str) -> QTreeWidgetItem | None:
+        tops = (self.cal_list.topLevelItem(i) for i in range(self.cal_list.topLevelItemCount()))
+        return next((t for t in tops if t.text(0) == name), None)
+
+    def _calendar_checked(self, item: QTreeWidgetItem, _column: int = 0):
+        cal = item.data(0, Qt.ItemDataRole.UserRole)
+        if not cal:  # an account's box: Qt ticks its calendars, which come here one by one
+            return
+        self.calendarToggled.emit(cal, item.checkState(0) == Qt.CheckState.Checked)
+        self._redraw_soon.start()
 
     def reload(self):
         """Redraw from the store (after a fetch or a change)."""

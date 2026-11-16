@@ -1,4 +1,10 @@
-"""Folder pane: one top-level node per mailbox, its folders below in Outlook order.
+"""Folder pane: one top-level node per mailbox, its folders below in Outlook order; and the
+Favorites box above it (FavoritesPane).
+
+Favorites: right-click a folder > Add to Favorites (or drag a folder into the Favorites box) to
+have it there too, from any mailbox; right-click a favorite to move it up or down, or remove
+it (Del removes it from the Favorites, not the folder). Mailboxes move up and down from their
+headings' menu.
 
 Default folders (Inbox, Drafts, Sent Items, ...) come first in a fixed order, then the rest A-Z;
 subfolders are A-Z. Each row shows an icon for its folder type and a right-aligned count: unread
@@ -121,22 +127,27 @@ class FolderDelegate(QStyledItemDelegate):
                              Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, badge)
             rect.setRight(rect.right() - w - 8)
 
+        # The name first; the dim note after it ("Shared", a favorite's mailbox) gets what's
+        # left, shortened or left out, never the name.
         fm = QFontMetrics(opt.font)
-        note = index.data(NOTE_ROLE) or ""
-        note_w = 0
-        if note:
-            nfont = QFont(opt.font)
-            nfont.setBold(False)
-            note_w = QFontMetrics(nfont).horizontalAdvance(note) + 6
-        text = fm.elidedText(name, Qt.TextElideMode.ElideRight, max(rect.width() - note_w, 0))
+        text = fm.elidedText(name, Qt.TextElideMode.ElideRight, max(rect.width(), 0))
         painter.setFont(opt.font)
         painter.setPen(text_color)
         painter.drawText(rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, text)
+        note = index.data(NOTE_ROLE) or ""
         if note and text == name:
-            painter.setFont(nfont)
-            painter.setPen(dim_color)
-            painter.drawText(rect.adjusted(fm.horizontalAdvance(text) + 6, 0, 0, 0),
-                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, note)
+            nfont = QFont(opt.font)
+            nfont.setBold(False)
+            nfm = QFontMetrics(nfont)
+            room = rect.width() - fm.horizontalAdvance(text) - 6
+            note = nfm.elidedText(note, Qt.TextElideMode.ElideRight, room) \
+                if room > nfm.horizontalAdvance("ab…") else ""
+            if note:
+                painter.setFont(nfont)
+                painter.setPen(dim_color)
+                painter.drawText(rect.adjusted(fm.horizontalAdvance(text) + 6, 0, 0, 0),
+                                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                                 note)
         painter.restore()
 
     @staticmethod
@@ -162,6 +173,7 @@ class FolderPane(QTreeWidget):
     moveFolderRequested = Signal(str, str)         # folder id, new parent ("" = top)
     pickMoveFolderRequested = Signal(str)          # folder id: ask where to
     messagesDropped = Signal(list, str, bool)      # message ids, folder id, copy?
+    favoriteToggled = Signal(str, bool)            # folder id, in the Favorites?
 
     def __init__(self, store: Store, parent=None):
         super().__init__(parent)
@@ -311,6 +323,13 @@ class FolderPane(QTreeWidget):
                 stack.append(child)
         return None
 
+    def clear_current(self) -> None:
+        """No folder selected here (one in the Favorites is)."""
+        self.blockSignals(True)
+        self.setCurrentItem(None)
+        self.clearSelection()
+        self.blockSignals(False)
+
     def select_folder(self, folder_id: str, emit: bool = True) -> None:
         item = self._find(folder_id)
         if item is None:
@@ -355,6 +374,11 @@ class FolderPane(QTreeWidget):
         while item.parent() is not None:
             item = item.parent()
         return item
+
+    # -- order ------------------------------------------------------------------
+    def move_mailbox(self, mailbox_id: str, step: int) -> None:
+        self.store.move_mailbox(mailbox_id, step)
+        self.populate()
 
     def start_new_folder(self, parent: QTreeWidgetItem | None = None) -> None:
         """Add a "New folder" row under `parent` (a folder or a mailbox heading; default: the
@@ -435,14 +459,23 @@ class FolderPane(QTreeWidget):
     # -- drag and drop ------------------------------------------------------
     def startDrag(self, supported_actions):
         item = self.currentItem()
-        if item is None or not self.can_change(item):
-            return  # default folders stay where they are
+        if item is None:
+            return
+        if not self.can_change(item):  # default folders stay; they can still be favorites
+            drag = QDrag(self)
+            drag.setMimeData(dnd.encode(dnd.FOLDER, {"folder": item.data(0, ID_ROLE)}))
+            pm, hot = dnd.label_pixmap(item.text(0))
+            drag.setPixmap(pm)
+            drag.setHotSpot(hot)
+            drag.exec(Qt.DropAction.LinkAction, Qt.DropAction.LinkAction)
+            return
         drag = QDrag(self)
         drag.setMimeData(dnd.encode(dnd.FOLDER, {"folder": item.data(0, ID_ROLE)}))
         pm, hot = dnd.label_pixmap(item.text(0))
         drag.setPixmap(pm)
         drag.setHotSpot(hot)
-        drag.exec(Qt.DropAction.MoveAction, Qt.DropAction.MoveAction)
+        # moved within its mailbox, or linked into the Favorites
+        drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.LinkAction, Qt.DropAction.MoveAction)
 
     def _drop_target(self, event) -> tuple[QTreeWidgetItem, dict, dict] | None:
         """(target item, messages payload, folder payload) if a drop here would be allowed."""
@@ -463,6 +496,8 @@ class FolderPane(QTreeWidget):
         if not self.can_hold_folders(item) or self.store.folder_mailbox(fid) != mailbox:
             return None
         row = self.store.folder_row(fid)
+        if row is not None and row["well_known"]:
+            return None  # (dragged only to the Favorites)
         ids = {r["id"] for r in self.store.folder_rows(mailbox)}
         parent = row["parent_id"] if row and row["parent_id"] in ids else ""
         dest = item.data(0, ID_ROLE) if kind == "folder" else ""
@@ -539,6 +574,11 @@ class FolderPane(QTreeWidget):
                 act = menu.addAction(iconset.load("trash-2"), "&Delete\tDel",
                                      lambda: self.request_delete(item))
                 act.setEnabled(changeable)
+                fid = item.data(0, ID_ROLE)
+                on = any(r["id"] == fid for r in self.store.favorite_folders())
+                menu.addAction(iconset.load("star"),
+                               "Remove from &Favorites" if on else "Add to &Favorites",
+                               lambda: self.favoriteToggled.emit(fid, not on))
                 if item.data(0, WELL_KNOWN_ROLE) == "deleteditems":
                     menu.addAction(iconset.load("trash-2"), "&Empty Deleted Items…",
                                    lambda: self.emptyFolderRequested.emit(
@@ -549,6 +589,12 @@ class FolderPane(QTreeWidget):
             shared = bool(root.data(0, NOTE_ROLE))
             label = "&Remove shared mailbox" if shared else "Sign &out of this account"
             mid = root.data(0, ID_ROLE)
+            if item is root:  # a heading: its place among the mailboxes
+                index = self.indexOfTopLevelItem(root)
+                up = menu.addAction("Move account &up", lambda: self.move_mailbox(mid, -1))
+                down = menu.addAction("Move account do&wn", lambda: self.move_mailbox(mid, 1))
+                up.setEnabled(index > 0)
+                down.setEnabled(index < self.topLevelItemCount() - 1)
             menu.addAction(label, lambda: self.removeMailboxRequested.emit(mid))
             menu.addSeparator()
         for act in self._extra_actions:
@@ -569,3 +615,182 @@ class FolderPane(QTreeWidget):
             elif item.data(0, KIND_ROLE) == "mailbox":
                 item.setExpanded(True)
             stack.extend(item.child(i) for i in range(item.childCount()))
+
+
+class FavoritesPane(QTreeWidget):
+    """The Favorites box above the folder tree: folders from any mailbox, in your order. Each
+    works like its folder (open it, drop mail on it to move it there; its counts); the
+    mailbox's name is beside it when there are several. Drag a folder in to add it;
+    right-click to move one up or down or take it out (Del takes it out too)."""
+    folderSelected = Signal(str)
+    messagesDropped = Signal(list, str, bool)  # message ids, folder id, copy?
+    changed = Signal()                         # added, removed or moved
+
+    def __init__(self, store: Store, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self.extra_totals: dict[str, int] = {}
+        self.setHeaderHidden(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setRootIsDecorated(False)
+        self.setIndentation(0)
+        self.setUniformRowHeights(True)
+        self.setIconSize(QSize(16, 16))
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setItemDelegate(FolderDelegate(self))
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(False)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self.drop_key: tuple[str, str] | None = None
+        self.itemSelectionChanged.connect(self._on_selection)
+
+    # the folder tree's helpers apply here too
+    _set_counts = FolderPane._set_counts
+    _folder_item = FolderPane._folder_item
+    _set_drop_item = FolderPane._set_drop_item
+
+    def populate(self) -> None:
+        current = self.current_folder()
+        names = {m["id"]: m["display_name"] for m in self.store.mailbox_rows()}
+        self.blockSignals(True)
+        self.clear()
+        for r in self.store.favorite_folders():
+            item = self._folder_item(r)
+            if len(names) > 1:
+                item.setData(0, NOTE_ROLE, names.get(r["mailbox_id"], ""))
+                item.setToolTip(0, f"{item.toolTip(0)}\n{names.get(r['mailbox_id'], '')}")
+            self.addTopLevelItem(item)
+        self.blockSignals(False)
+        if current:
+            self.select_folder(current, emit=False)
+
+    def refresh_counts(self) -> None:
+        rows = {r["id"]: r for r in self.store.favorite_folders()}
+        for i in range(self.topLevelItemCount()):
+            item = self.topLevelItem(i)
+            r = rows.get(item.data(0, ID_ROLE))
+            if r is not None:
+                self._set_counts(item, r)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.topLevelItemCount():
+            return
+        painter = QPainter(self.viewport())  # empty: say how to fill it
+        painter.setPen(self.palette().color(QPalette.ColorRole.PlaceholderText))
+        painter.drawText(self.viewport().rect().adjusted(8, 4, -8, -4),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+                         | Qt.TextFlag.TextWordWrap,
+                         "Drag a folder here, or right-click one > Add to Favorites.")
+        painter.end()
+
+    # -- selection ---------------------------------------------------------------
+    def current_folder(self) -> str | None:
+        item = self.currentItem()
+        return item.data(0, ID_ROLE) if item is not None else None
+
+    def select_folder(self, folder_id: str, emit: bool = True) -> None:
+        item = next((self.topLevelItem(i) for i in range(self.topLevelItemCount())
+                     if self.topLevelItem(i).data(0, ID_ROLE) == folder_id), None)
+        if item is None:
+            return
+        if not emit:
+            self.blockSignals(True)
+        self.setCurrentItem(item)
+        self.blockSignals(False)
+
+    def clear_current(self) -> None:
+        self.blockSignals(True)
+        self.setCurrentItem(None)
+        self.clearSelection()
+        self.blockSignals(False)
+
+    def _on_selection(self):
+        fid = self.current_folder()
+        if fid:
+            self.folderSelected.emit(fid)
+
+    # -- changing ----------------------------------------------------------------
+    def set_favorite(self, folder_id: str, on: bool) -> None:
+        self.store.set_favorite(folder_id, on)
+        self.populate()
+        self.changed.emit()
+
+    def move_favorite(self, folder_id: str, step: int) -> None:
+        self.store.move_favorite(folder_id, step)
+        self.populate()
+        self.changed.emit()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Delete and self.current_folder():
+            self.set_favorite(self.current_folder(), False)  # (the folder stays)
+            return
+        super().keyPressEvent(event)
+
+    def contextMenuEvent(self, event):
+        item = self.itemAt(event.pos())
+        if item is None:
+            return
+        fid, index = item.data(0, ID_ROLE), self.indexOfTopLevelItem(item)
+        menu = QMenu(self)
+        menu.addAction(iconset.load("star"), "Remove from &Favorites\tDel",
+                       lambda: self.set_favorite(fid, False))
+        menu.addAction("Move &up", lambda: self.move_favorite(fid, -1)).setEnabled(index > 0)
+        menu.addAction("Move &down", lambda: self.move_favorite(fid, 1)).setEnabled(
+            index < self.topLevelItemCount() - 1)
+        menu.exec(event.globalPos())
+
+    # -- dropping: mail onto a favorite (moves it there), a folder anywhere (adds it) --------
+    def _target(self, event):
+        msgs = dnd.decode(event.mimeData(), dnd.MESSAGES)
+        folder = dnd.decode(event.mimeData(), dnd.FOLDER)
+        if folder:
+            return (None, None, folder) if not any(
+                r["id"] == folder["folder"] for r in self.store.favorite_folders()) else None
+        item = self.itemAt(event.position().toPoint())
+        if msgs and item is not None:
+            fid = item.data(0, ID_ROLE)
+            if fid != msgs["folder"] and \
+                    self.store.folder_mailbox(fid) == self.store.folder_mailbox(msgs["folder"]):
+                return item, msgs, None
+        return None
+
+    def dragEnterEvent(self, event):
+        mime = event.mimeData()
+        if mime.hasFormat(dnd.MESSAGES) or mime.hasFormat(dnd.FOLDER):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        target = self._target(event)
+        self._set_drop_item(target[0] if target else None)
+        if target is None:
+            event.ignore()
+            return
+        if target[2]:  # a folder: linked here, not moved
+            event.setDropAction(Qt.DropAction.LinkAction)
+        else:
+            copy = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            event.setDropAction(Qt.DropAction.CopyAction if copy else Qt.DropAction.MoveAction)
+        event.accept()
+
+    def dragLeaveEvent(self, event):
+        self._set_drop_item(None)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        target = self._target(event)
+        self._set_drop_item(None)
+        if target is None:
+            event.ignore()
+            return
+        item, msgs, folder = target
+        event.accept()
+        if folder:
+            event.setDropAction(Qt.DropAction.LinkAction)
+            self.set_favorite(folder["folder"], True)
+        else:
+            copy = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            event.setDropAction(Qt.DropAction.CopyAction if copy else Qt.DropAction.MoveAction)
+            self.messagesDropped.emit(list(msgs["ids"]), item.data(0, ID_ROLE), copy)
