@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 # Entra app registration (public client). See README for setup.
-CLIENT_ID = os.environ.get("WADDLEMAIL_CLIENT_ID", "")
+CLIENT_ID = '7dea41eb-0d30-4444-a293-e99bace95334'
 # "common" = work/school and personal accounts. Use your tenant ID to restrict.
 TENANT = os.environ.get("WADDLEMAIL_TENANT", "common")
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT}"

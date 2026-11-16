@@ -339,13 +339,14 @@ In the Entra admin center (entra.microsoft.com) > App registrations > New regist
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
-export WADDLEMAIL_CLIENT_ID=<your client id>      # optional: WADDLEMAIL_TENANT=<tenant id>
+# optional: use your own Entra app registration instead of the built-in one
+#   export WADDLEMAIL_CLIENT_ID=<your client id> WADDLEMAIL_TENANT=<tenant id>
 waddlemail            # or: python -m waddlemail   or: python run.py
 ```
 
 Do not run `waddlemail/__main__.py` directly as a script: it uses package-relative imports. In
 PyCharm use a run configuration with **Module name** `waddlemail`, or use **Script path** `run.py`;
-set `WADDLEMAIL_CLIENT_ID` under Environment variables.
+you can set `WADDLEMAIL_CLIENT_ID` under Environment variables to use your own app registration.
 
 To get WaddleMail in your application menu (Linux), run `waddlemail --install-desktop` once
 (or use Help > Add to application menu). GNOME shows tray icons only with the AppIndicator
