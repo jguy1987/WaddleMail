@@ -1,10 +1,12 @@
 """SQLite store: mailboxes, folder tree, message metadata, LRU body cache, sync cursors."""
 from __future__ import annotations
 
+import datetime as dt
 import json
 import sqlite3
 import threading
 import time
+from email.utils import parseaddr
 from pathlib import Path
 
 from .graph import DELTA_QUERY_VERSION, PROP_LAST_VERB, PROP_SIZE
@@ -81,6 +83,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS body_fts USING fts5(
 CREATE TRIGGER IF NOT EXISTS bodies_fts_delete AFTER DELETE ON bodies BEGIN
     DELETE FROM body_fts WHERE rowid = old.rowid;
 END;
+-- Messages waiting to be sent (outbox.py): the server couldn't be reached when you sent them.
+CREATE TABLE IF NOT EXISTS outbox(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mailbox_id TEXT NOT NULL,
+    created TEXT NOT NULL,          -- ISO UTC: when you sent it
+    payload TEXT NOT NULL,          -- JSON (outbox.make_payload), updated after each try
+    error TEXT,                     -- why the last try failed
+    refused INTEGER DEFAULT 0       -- 1: the server refused it: waits for you, not retried
+);
 -- Pictures a cached body shows with cid: links (its inline attachments), by content id
 -- (cid_key). They count toward the body's size in the cache, and leave with it.
 CREATE TABLE IF NOT EXISTS inline_images(
@@ -293,6 +304,16 @@ def recipients(value: str | None) -> list[tuple[str, str]]:
         return [tuple(r) for r in json.loads(value)] if value else []
     except (ValueError, TypeError):
         return []
+
+
+def _people(addresses: list[str]) -> list[list[str]]:
+    """"Name <address>" strings as a to_recipients column's [[name, address], ...]."""
+    out = []
+    for text in addresses:
+        name, addr = parseaddr(text)
+        if addr:
+            out.append([name or addr, addr])
+    return out
 
 
 _SEARCH_COLUMNS = ("subject", "sender_name", "sender_addr", "to_recipients", "cc_recipients",
@@ -1030,8 +1051,67 @@ class Store:
             "SELECT 1 FROM bodies WHERE message_id=?", (message_id,)).fetchone() is not None
 
     def pending_count(self) -> int:
-        """Local changes not yet sent, all mailboxes."""
-        return self.conn.execute("SELECT COUNT(*) FROM pending").fetchone()[0]
+        """Local changes and messages not yet sent, all mailboxes."""
+        return self.conn.execute("SELECT (SELECT COUNT(*) FROM pending)"
+                                 " + (SELECT COUNT(*) FROM outbox)").fetchone()[0]
+
+    # -- the Outbox ------------------------------------------------------
+    def outbox_add(self, mailbox_id: str, payload: dict, error: str | None = None) -> int:
+        with self.conn as c:
+            cur = c.execute("INSERT INTO outbox(mailbox_id, created, payload, error)"
+                            " VALUES(?,?,?,?)",
+                            (mailbox_id, dt.datetime.now(dt.timezone.utc).strftime(
+                                "%Y-%m-%dT%H:%M:%SZ"), json.dumps(payload), error))
+        return cur.lastrowid
+
+    def outbox_items(self, mailbox_id: str | None = None,
+                     refused: bool = True) -> list[sqlite3.Row]:
+        """Oldest first; without `refused`, only the ones to try again by themselves."""
+        sql, args = "SELECT * FROM outbox WHERE 1", []
+        if mailbox_id is not None:
+            sql, args = sql + " AND mailbox_id=?", [mailbox_id]
+        if not refused:
+            sql += " AND refused=0"
+        return self.conn.execute(sql + " ORDER BY id", args).fetchall()
+
+    def outbox_item(self, item_id: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM outbox WHERE id=?", (item_id,)).fetchone()
+
+    def outbox_update(self, item_id: int, payload: dict, error: str | None,
+                      refused: bool = False) -> None:
+        with self.conn as c:
+            c.execute("UPDATE outbox SET payload=?, error=?, refused=? WHERE id=?",
+                      (json.dumps(payload), error, int(refused), item_id))
+
+    def outbox_remove(self, item_id: int) -> None:
+        with self.conn as c:
+            c.execute("DELETE FROM outbox WHERE id=?", (item_id,))
+
+    def outbox_counts(self) -> dict[str, int]:
+        """Waiting messages per mailbox."""
+        return dict(self.conn.execute(
+            "SELECT mailbox_id, COUNT(*) FROM outbox GROUP BY mailbox_id").fetchall())
+
+    def outbox_rows(self, mailbox_id: str, folder_id: str, me: str = "") -> list[dict]:
+        """The waiting messages of a mailbox as message-list rows (ids "outbox:<n>")."""
+        cols = [r[1] for r in self.conn.execute("PRAGMA table_info(messages)")]
+        out = []
+        for item in self.outbox_items(mailbox_id):
+            p = json.loads(item["payload"])
+            row = dict.fromkeys(cols)
+            text = body_text("html" if p["html"] else "text", p["body"])
+            note = (f"Not sent: {item['error']}" if item["refused"] else
+                    "Waiting to be sent" + (f" ({item['error']})" if item["error"] else ""))
+            row.update(id=f"outbox:{item['id']}", folder_id=folder_id, subject=p["subject"],
+                       sender_name=me, sender_addr=me, received=item["created"], is_read=1,
+                       has_attachments=int(bool(p["attachments"])),
+                       preview=f"{note} · {text[:200]}",
+                       to_recipients=json.dumps(_people(p["to"])),
+                       cc_recipients=json.dumps(_people(p["cc"])),
+                       importance="normal", flag="notFlagged",
+                       size=len(p["body"]) + sum(a["size"] for a in p["attachments"]))
+            out.append(row)
+        return out
 
     def body_cache_size(self) -> int:
         return self.conn.execute("SELECT COALESCE(SUM(size),0) FROM bodies").fetchone()[0]

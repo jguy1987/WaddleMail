@@ -56,6 +56,7 @@ class ComposeWindow(QMainWindow):
         self.sent = False
         self.draft_id: str | None = None  # once saved to Drafts
         self.had_pictures = False  # a saved draft has had inline pictures (see MainWindow)
+        self.mailbox_id: str | None = None  # where it goes out from, if not From's account
         self.resize(820, 700)
         me = {a for _, a in accounts}
 
@@ -231,6 +232,24 @@ class ComposeWindow(QMainWindow):
     def _title(self, *_):
         what = {NEW: "New message", FORWARD: "Forward"}.get(self.kind, "Reply")
         self.setWindowTitle(self.subject.text().strip() or what)
+
+    def load(self, subject: str, to: list[str], cc: list[str], bcc: list[str], html: bool,
+             body: str, attachments: list):
+        """Fill the window with a message written before (one taken out of the Outbox):
+        `body` is HTML with its pictures as data: URIs, or text."""
+        self.act_plain.setChecked(not html)
+        self.subject.setText(subject)
+        for field, people in ((self.to, to), (self.cc, cc), (self.bcc, bcc)):
+            field.setText("; ".join(people) + ("; " if people else ""))
+        self.act_cc.setChecked(bool(cc))
+        self.act_bcc.setChecked(bool(bcc))
+        if html:
+            self.editor.edit.setHtml(body)
+        else:
+            self.editor.edit.setPlainText(body)
+        self.attachments.add(attachments)
+        self.has_had_attachments = self.has_had_attachments or bool(attachments)
+        self.editor.edit.document().setModified(True)  # (not sent: closing asks)
 
     def account_id(self) -> str:
         return self.sender.currentData() or ""

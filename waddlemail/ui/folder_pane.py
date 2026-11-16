@@ -167,6 +167,7 @@ class FolderPane(QTreeWidget):
         super().__init__(parent)
         self.store = store
         self._extra_actions: list[QAction] = []
+        self.extra_totals: dict[str, int] = {}  # folder id -> items kept here (the Outbox's)
         self.setHeaderHidden(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setIndentation(14)
@@ -265,12 +266,13 @@ class FolderPane(QTreeWidget):
     def _set_counts(self, item: QTreeWidgetItem, r) -> None:
         wk = r["well_known"]
         total_only = wk in _COUNT_TOTAL
+        total = (r["total"] or 0) + self.extra_totals.get(r["id"], 0)
         item.setData(0, TOTAL_ROLE, total_only)
-        item.setData(0, COUNT_ROLE, (r["total"] if total_only else r["unread"]) or 0)
+        item.setData(0, COUNT_ROLE, total if total_only else (r["unread"] or 0))
         font = QFont(self.font())
         font.setBold(bool(r["unread"]) and not total_only)
         item.setFont(0, font)
-        tip = f"{r['total']} items, {r['unread']} unread" if r["total"] else "Empty"
+        tip = f"{total} items, {r['unread']} unread" if total else "Empty"
         item.setToolTip(0, f"{r['name']}\n{tip}")
 
     def refresh_counts(self) -> None:

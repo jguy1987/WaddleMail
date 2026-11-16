@@ -360,6 +360,7 @@ def checks():
     compose_checks()
     attachment_checks()
     picture_checks()
+    outbox_checks()
 
     w.close()
     saved = Settings(str(tmp / "settings.ini"))
@@ -1562,6 +1563,86 @@ def picture_checks():
     check(atts.items[f"/me/events/{eid}"] == [] and "img" not in server.saved[-1]["body"]["content"],
           "...and a picture taken out of the notes is removed from the event")
     graph.GraphClient.event_body = real_body
+
+
+def outbox_checks():
+    import requests
+    out = FakeOutbox()
+    out.install()
+    real_send = graph.GraphClient.send_mail
+
+    def down(c, message):
+        raise requests.ConnectionError("no route to host")
+
+    graph.GraphClient.send_mail = down
+    w.new_mail(to=["Ana Ruiz <ana@x.com>"])
+    wait(200)
+    win = compose_windows()[-1]
+    win.subject.setText("While offline")
+    win.editor.edit.textCursor().insertText("Sent from the train. ")
+    win.act_send.trigger()
+    wait(500)
+    check(win not in compose_windows() and len(st.outbox_items()) == 1
+          and "Outbox" in w.statusBar().currentMessage(),
+          "offline: the message waits in the Outbox and the window closes")
+    w.folder_tree.select_folder("out")
+    wait(300)
+    item = w.folder_tree._find("out")
+    check(item.data(0, Qt.ItemDataRole.UserRole + 2) == 1, "the Outbox folder counts it")
+    waiting = [i for i in ids() if i.startswith("outbox:")]
+    check(len(waiting) == 1, "...and lists it")
+    w._show_in_pane(waiting[0])
+    wait(300)
+    check(w.msg_view._body and "train" in w.msg_view._body[1]
+          and "While offline" in w.msg_view.header.subject.text(),
+          "...and shows it in the reader")
+
+    graph.GraphClient.send_mail = real_send
+    w.flush_outbox()
+    wait(800)
+    check(not st.outbox_items() and any(m["subject"] == "While offline" for m in out.sent)
+          and not [i for i in ids() if i.startswith("outbox:")],
+          "back online: it's sent and leaves the Outbox")
+
+    # the server refuses one: it stays, reported, and can be edited or deleted
+    def refuse(c, message):
+        raise graph.GraphError("Graph 400: invalid recipient", 400)
+
+    graph.GraphClient.send_mail = down
+    w.new_mail(to=["nobody"])
+    wait(200)
+    win = compose_windows()[-1]
+    win.to.setText("Bo <bo@y.org>; ")
+    win.cc.setText("Cy <cy@z.org>; ")
+    win.subject.setText("Typo")
+    win.act_send.trigger()
+    wait(500)
+    graph.GraphClient.send_mail = refuse
+    before = len(warnings)
+    w.flush_outbox()
+    wait(800)
+    [item] = st.outbox_items()
+    check(item["refused"] and len(warnings) == before + 1 and "Typo" in warnings[-1],
+          "a refused message stays in the Outbox, and you're told")
+    w.flush_outbox()
+    wait(500)
+    check(len(warnings) == before + 1, "...and isn't retried by itself")
+    w._refresh_messages()
+    waiting = [i for i in ids() if i.startswith("outbox:")]
+    w.open_message(waiting[0])
+    wait(300)
+    win = compose_windows()[-1]
+    check(win.subject.text() == "Typo" and "cy@z.org" in win.cc.text()
+          and win.cc.isVisible() and not st.outbox_items(),
+          "opening it takes it out of the Outbox to edit")
+    graph.GraphClient.send_mail = down
+    win.act_send.trigger()
+    wait(500)
+    w._refresh_messages()
+    waiting = [i for i in ids() if i.startswith("outbox:")]
+    check(len(waiting) == 1 and w.delete_messages(waiting) and not st.outbox_items(),
+          "an Outbox message can be deleted")
+    graph.GraphClient.send_mail = real_send
 
 
 def travel_id():

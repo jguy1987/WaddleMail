@@ -5,8 +5,11 @@ import datetime as dt
 import json
 import logging
 import os
+import shutil
 import sys
 import tempfile
+import uuid
+from pathlib import Path
 
 from PySide6.QtCore import (
     QObject, QRunnable, QStandardPaths, Qt, QThreadPool, QTimer, QUrl, Signal,
@@ -27,6 +30,10 @@ from ..graph import NO_SUBFOLDERS
 from ..inline import cid_refs, resolve_cids
 from ..mailboxes import MailboxManager
 from ..notify import make_notifier
+from ..outbox import (
+    attachments_of, deliver, drop_files, keep_files, make_payload, pictures_of, transient,
+    write_draft,
+)
 from ..settings import Settings
 from ..store import Store
 from . import iconset
@@ -88,6 +95,7 @@ class MainWindow(QMainWindow):
         self._current_folder: str | None = None
         self._current_message: str | None = None  # the one selected message, if exactly one
         self._syncing = False  # one sync/send job at a time
+        self._flushing = False  # sending the Outbox
         # Server search for the quick filter: hits per (folder, words), and a generation
         # number so a slow answer to an older query is ignored.
         self._server_hits: dict[tuple[str, str], list[str]] = {}
@@ -235,6 +243,7 @@ class MainWindow(QMainWindow):
         self.contacts_timer = QTimer(self)  # contacts change slowly: hourly is plenty
         self.contacts_timer.setInterval(60 * 60_000)
         self.contacts_timer.timeout.connect(self.refresh_contacts)
+        self._clean_outbox_files()
         self._apply_settings()
         self._restore_layout()
 
@@ -325,6 +334,7 @@ class MainWindow(QMainWindow):
 
     # -- folders ------------------------------------------------------
     def _populate_folders(self):
+        self.folder_tree.extra_totals = self._outbox_totals()
         self.folder_tree.populate()
         self._update_unread_indicators()
         self._update_title()
@@ -559,6 +569,10 @@ class MainWindow(QMainWindow):
         rows = self.store.list_messages(self._current_folder, since=self._list_cutoff(),
                                         also_ids=hits, **self.filter_bar.criteria())
         folder = self.store.folder_row(self._current_folder)
+        if folder is not None and folder["well_known"] == "outbox" and not words:
+            box = self.mailboxes.for_folder(self._current_folder)
+            rows = self.store.outbox_rows(folder["mailbox_id"], folder["id"],
+                                          box.display_name if box else "") + list(rows)
         self.msg_list.folder_id = self._current_folder  # for dragging messages out
         self.msg_list.set_messages(rows, bool(folder) and folder["well_known"] in OUTGOING)
         self._update_message_actions()
@@ -608,6 +622,11 @@ class MainWindow(QMainWindow):
     def _listed_ids(self) -> list[str]:
         return [m["id"] for m in self.msg_list.model_.root.messages()]
 
+    def send_receive(self):
+        """F5: sync, and try the whole Outbox again (refused messages too)."""
+        self.flush_outbox(everything=True)
+        self.sync_current()
+
     def sync_current(self):
         fid = self._current_folder
         box = self.mailboxes.for_folder(fid) if fid else None
@@ -654,6 +673,7 @@ class MainWindow(QMainWindow):
                     f"The server didn't send {' or '.join(refused)} for {box.display_name}",
                     15_000)
         self.status.synced()
+        self.flush_outbox()  # connected again: what's waiting goes out
         self._notify_new(new)
         if res.upserted or res.removed:  # new mail may match a search: ask the server again
             self._server_hits = {k: v for k, v in self._server_hits.items() if k[0] != fid}
@@ -679,6 +699,13 @@ class MainWindow(QMainWindow):
             self._show_in_pane(shown)
 
     def _show_in_pane(self, mid: str):
+        if self.outbox_id(mid) is not None:  # a message waiting in the Outbox
+            row = next((r for r in self.msg_list.model_.root.messages() if r["id"] == mid),
+                       None)
+            if row is not None:
+                self.msg_view.show_message(row)
+                self._show_outbox_item(self.outbox_id(mid), self.msg_view)
+            return
         row = self.store.message_row(mid)
         box = self.mailboxes.for_folder(self._current_folder)
         if row is None or box is None:
@@ -704,7 +731,11 @@ class MainWindow(QMainWindow):
             self.msg_view.reader.setHtml(placeholder(f"Couldn't load this message: {msg}"))
 
     def open_message(self, mid: str):
-        """Open one message in its own window (double-click / Enter) and mark it read."""
+        """Open one message in its own window (double-click / Enter) and mark it read. One
+        waiting in the Outbox opens to edit."""
+        if self.outbox_id(mid) is not None:
+            self.edit_outbox_item(self.outbox_id(mid))
+            return
         row = self.store.message_row(mid)
         box = self.mailboxes.for_folder(self._current_folder) if self._current_folder else None
         if row is None or box is None:
@@ -1104,7 +1135,24 @@ class MainWindow(QMainWindow):
     def delete_messages(self, ids: list[str], permanent: bool = False, parent=None) -> bool:
         """Delete as Outlook does: to Deleted Items; for good (after asking) with `permanent`
         (Shift+Del), in Deleted Items, or where there's no Deleted Items to use. Sent through
-        the change queue. Returns whether anything was deleted."""
+        the change queue; messages waiting in the Outbox are just dropped (after asking).
+        Returns whether anything was deleted."""
+        waiting = [n for n in map(self.outbox_id, ids) if n is not None]
+        if waiting:
+            what = "this unsent message" if len(waiting) == 1 else \
+                f"these {len(waiting)} unsent messages"
+            if QMessageBox.question(parent or self, "Delete",
+                                    f"Delete {what} from the Outbox?") != \
+                    QMessageBox.StandardButton.Yes:
+                return False
+            for n in waiting:
+                item = self.store.outbox_item(n)
+                if item is not None:
+                    drop_files(json.loads(item["payload"]))
+                    self.store.outbox_remove(n)
+            self._outbox_changed()
+            self.statusBar().showMessage("Deleted from the Outbox", 4000)
+            return True
         rows = [r for r in (self.store.message_row(i) for i in ids) if r is not None]
         if not rows:
             return False
@@ -1547,7 +1595,7 @@ class MainWindow(QMainWindow):
         self.act_add_shared = self._action("Add &shared mailbox…", self.add_shared_mailbox)
 
         self.act_send_receive = self._themed(
-            "Send/&Receive", "refresh-cw", self.sync_current, "F5",
+            "Send/&Receive", "refresh-cw", self.send_receive, "F5",
             tip="Send and receive mail (F5)")
 
         self.act_cut = self._themed("Cu&t", "scissors", self._edit_cut, QKeySequence.StandardKey.Cut)
@@ -1850,74 +1898,92 @@ class MainWindow(QMainWindow):
                   activity=None if self.store.has_body(mid) else "Downloading message…")
 
     def _sending_box(self, win: ComposeWindow):
-        """A reply goes out from the mailbox its message is in; new mail from From."""
+        """A reply goes out from the mailbox its message is in; new mail from From; one
+        taken back out of the Outbox from where it was going to go."""
+        if win.mailbox_id is not None:
+            return next((b for b in self.mailboxes.all() if b.id == win.mailbox_id), None)
         if win.original is not None:
             return self.mailboxes.for_folder(win.original["folder_id"])
         return next((b for b in self.mailboxes.all()
                      if not b.shared and b.account_id == win.account_id()), None)
 
-    def _write_draft(self, box, win: ComposeWindow, out) -> str:
-        """Create or update the message `out` (win.outgoing(), taken on the GUI thread) in
-        Drafts (worker thread); returns its id."""
-        message = out.graph_message()
-        draft_id = win.draft_id
-        if draft_id is None and win.original is None:
-            draft_id = box.graph.create_draft(message)["id"]
-        else:
-            if draft_id is None:
-                draft_id = box.graph.create_response(win.original["id"], win.kind)["id"]
-            box.graph.update_message(draft_id, message)
-        # attachments: upload the new, remove the ones taken out (a forward's included)
-        if win.has_had_attachments:
-            reconcile(box.graph, box.graph.message_path(draft_id), win.attachments.items(),
-                      remove_others=win.originals_known)
-        # pictures in the body: inline attachments its cid: links point to
-        if out.inline or win.had_pictures:
-            ours = {i.content_id.lower() for i in out.inline}
-            reconcile_inline(box.graph, box.graph.message_path(draft_id), out.inline,
-                             keep_others=bool(cid_refs(out.body) - ours))
-            win.had_pictures = True
-        return draft_id
+    def _payload(self, box, win: ComposeWindow) -> dict:
+        """What the window has, to send or save (on the GUI thread)."""
+        return make_payload(box.id, win.outgoing(), win.kind,
+                            win.original["id"] if win.original is not None else None,
+                            win.draft_id, win.attachments.items(), win.originals_known,
+                            win.has_had_attachments, win.had_pictures)
+
+    @staticmethod
+    def _saved(win: ComposeWindow, p: dict):
+        """Remember what writing the draft did, so the next save only sends changes."""
+        win.had_pictures = p["had_pictures"]
+        for att, done in zip(win.attachments.items(), p["attachments"]):
+            att.remote_id = done["remote_id"]
+
+    def _outbox_folder(self) -> str:
+        return str(Path(self.store.path).parent / "outbox" / uuid.uuid4().hex)
 
     def send_message(self, win: ComposeWindow):
+        """Send now; if the server can't be reached, the message waits in the Outbox (with
+        copies of its files) and goes out on a later try. A refusal (an address the server
+        won't take) is shown, and the window stays open to fix it."""
         box = self._sending_box(win)
         if box is None:
             return
-        out = win.outgoing()
+        p = self._payload(box, win)
         win.act_send.setEnabled(False)
 
         def job():
-            if win.original is None and win.draft_id is None and not win.attachments.items() \
-                    and not out.inline:
-                box.graph.send_mail(out.graph_message())  # plain new mail: straight out
-            else:  # attachments, pictures, replies/forwards (threading), saved drafts: a draft
-                box.graph.send_draft(self._write_draft(box, win, out))
+            try:
+                deliver(box.graph, p)
+                return None
+            except Exception as exc:
+                if not transient(exc):
+                    raise
+                keep_files(p, self._outbox_folder())
+                self.store.outbox_add(box.id, p, str(exc))
+                return str(exc)
 
-        original = win.original["id"] if win.original is not None else None
-        verb = {"reply": 102, "replyAll": 103, "forward": 104}.get(win.kind)
-
-        def done(_):
+        def done(queued: str | None):
             win.sent = True
             win.close()
-            self.statusBar().showMessage(f"Sent: {out.subject or '(no subject)'}", 5000)
-            if original and verb:  # replied / forwarded mark on the original, right away
-                self.store.mark_responded(original, verb)
-                self.msg_list.model_.update_rows([self.store.message_row(original)])
+            if queued is not None:
+                self.statusBar().showMessage(
+                    f"Not sent yet ({queued}): \"{p['subject'] or '(no subject)'}\" waits in "
+                    "the Outbox and goes out when the server can be reached", 10_000)
+                self._outbox_changed()
+                return
+            self.statusBar().showMessage(f"Sent: {p['subject'] or '(no subject)'}", 5000)
+            self._answered(p)
             QTimer.singleShot(5000, self.sync_current)  # the reply mark, Sent Items
 
         def failed(msg: str):
             win.act_send.setEnabled(True)
+            self._saved(win, p)  # (a draft may have been made: the next try reuses it)
+            win.draft_id = p["draft_id"]
             QMessageBox.warning(win, "Send", f"The message wasn't sent.\n\n{msg}")
 
         self._run(job, done, on_failed=failed, activity="Sending…")
+
+    def _answered(self, p: dict):
+        """The replied / forwarded mark on the original, right away."""
+        verb = {"reply": 102, "replyAll": 103, "forward": 104}.get(p["kind"])
+        if p["original_id"] and verb:
+            self.store.mark_responded(p["original_id"], verb)
+            row = self.store.message_row(p["original_id"])
+            if row is not None:
+                self.msg_list.model_.update_rows([row])
 
     def save_draft(self, win: ComposeWindow):
         box = self._sending_box(win)
         if box is None:
             return
         closing = win.sent  # "Save draft" from closing the window
+        p = self._payload(box, win)
 
         def done(draft_id: str):
+            self._saved(win, p)
             win.mark_saved(draft_id)
             self.statusBar().showMessage("Saved to Drafts", 3000)
             if closing:
@@ -1927,9 +1993,128 @@ class MainWindow(QMainWindow):
             win.sent = False
             QMessageBox.warning(win, "Save draft", f"The draft wasn't saved.\n\n{msg}")
 
-        out = win.outgoing()
-        self._run(lambda: self._write_draft(box, win, out), done, on_failed=failed,
+        self._run(lambda: write_draft(box.graph, p), done, on_failed=failed,
                   activity="Saving draft…")
+
+    # -- the Outbox ------------------------------------------------------------
+    @staticmethod
+    def outbox_id(mid: str | None) -> int | None:
+        """The Outbox item a message-list id stands for ("outbox:<n>"), if it is one."""
+        return int(mid[7:]) if mid and mid.startswith("outbox:") else None
+
+    def _clean_outbox_files(self):
+        """Remove copies of files no waiting message uses any more (one taken out of the
+        Outbox to edit leaves its copies to the window)."""
+        root = Path(self.store.path).parent / "outbox"
+        used = {json.loads(i["payload"]).get("files") for i in self.store.outbox_items()}
+        for folder in root.iterdir() if root.is_dir() else []:
+            if str(folder) not in used:
+                shutil.rmtree(folder, ignore_errors=True)
+
+    def _outbox_totals(self) -> dict[str, int]:
+        """Each mailbox's Outbox folder -> its waiting messages (for the folder's count)."""
+        return {fid: n for mbox, n in self.store.outbox_counts().items()
+                if (fid := self.store.well_known_folder(mbox, "outbox"))}
+
+    def _outbox_changed(self):
+        self.folder_tree.extra_totals = self._outbox_totals()
+        self.folder_tree.refresh_counts()
+        self.status.refresh()
+        folder = self.store.folder_row(self._current_folder) if self._current_folder else None
+        if folder is not None and folder["well_known"] == "outbox":
+            self._refresh_messages()
+
+    def flush_outbox(self, everything: bool = False):
+        """Try the Outbox again: the messages that couldn't reach the server (and, with
+        `everything`, the ones it refused too: Send/Receive). A mailbox still offline is
+        left for later; a refusal is reported and stays in the Outbox for you to fix."""
+        if self._flushing:
+            return
+        items = self.store.outbox_items(refused=everything)
+        boxes = {b.id: b for b in self.mailboxes.all()}
+        items = [i for i in items if i["mailbox_id"] in boxes]
+        if not items:
+            return
+        self._flushing = True
+
+        def job():
+            sent, refused, offline = [], [], set()
+            for item in items:
+                if item["mailbox_id"] in offline or self.store.outbox_item(item["id"]) is None:
+                    continue  # (taken out to edit meanwhile)
+                p = json.loads(item["payload"])
+                try:
+                    deliver(boxes[item["mailbox_id"]].graph, p)
+                except Exception as exc:
+                    if transient(exc):
+                        offline.add(item["mailbox_id"])
+                        self.store.outbox_update(item["id"], p, str(exc))
+                    else:
+                        self.store.outbox_update(item["id"], p, str(exc), refused=True)
+                        refused.append((p["subject"], str(exc)))
+                    continue
+                self.store.outbox_remove(item["id"])
+                drop_files(p)
+                sent.append(p)
+            return sent, refused
+
+        def done(result):
+            self._flushing = False
+            sent, refused = result
+            for p in sent:
+                self._answered(p)
+            self._outbox_changed()
+            if sent:
+                n = len(sent)
+                self.statusBar().showMessage(
+                    f"Sent {n} message{'s' if n != 1 else ''} from the Outbox", 5000)
+                QTimer.singleShot(5000, self.sync_current)
+            if refused:
+                QMessageBox.warning(self, "Outbox", "The server didn't accept:\n\n" + "\n".join(
+                    f"\"{subject or '(no subject)'}\": {why}" for subject, why in refused)
+                    + "\n\nThey stay in the Outbox: open one to fix it, then send it again.")
+
+        def failed(_msg):
+            self._flushing = False
+
+        self._run(job, done, on_failed=failed, activity="Sending Outbox…")
+
+    def _show_outbox_item(self, item_id: int, view):
+        """A waiting message in the reader: as it will go out."""
+        item = self.store.outbox_item(item_id)
+        if item is None:
+            view.show_placeholder("This message is no longer in the Outbox.")
+            return
+        p = json.loads(item["payload"])
+        body = p["message"]["body"]["content"]
+        if p["html"]:
+            body = resolve_cids(body, {i.content_id.lower(): (i.content_type, i.data)
+                                       for i in pictures_of(p)})
+        view.set_body("html" if p["html"] else "text", body, self.images_action.isChecked())
+
+    def edit_outbox_item(self, item_id: int):
+        """Take a waiting message out of the Outbox and open it to change (Send puts it back
+        on its way)."""
+        item = self.store.outbox_item(item_id)
+        if item is None:
+            return
+        p = json.loads(item["payload"])
+        original = self.store.message_row(p["original_id"]) if p["original_id"] else None
+        win = self._compose(account_id=next((b.account_id for b in self.mailboxes.all()
+                                             if b.id == p["mailbox_id"]), None))
+        win.mailbox_id = p["mailbox_id"]
+        win.kind, win.draft_id = p["kind"], p["draft_id"]
+        win.original = original if original is not None else (
+            {"id": p["original_id"]} if p["original_id"] else None)
+        win.originals_known = p["originals_known"]
+        win.had_pictures = p["had_pictures"]
+        win.load(p["subject"], p["to"], p["cc"], p["bcc"], p["html"],
+                 resolve_cids(p["body"], {i.content_id.lower(): (i.content_type, i.data)
+                                          for i in pictures_of(p)}) if p["html"] else p["body"],
+                 attachments_of(p))
+        self.store.outbox_remove(item_id)  # (its files stay: the window uses them)
+        self._outbox_changed()
+        self.statusBar().showMessage("Taken out of the Outbox to edit: Send to send it", 6000)
 
     # -- calendar ------------------------------------------------------------
     def _calendar_boxes(self):

@@ -119,6 +119,14 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   - Send (Ctrl+Enter). New mail without attachments is sent directly; replies and forwards go through Exchange's
     reply/forward draft, so they stay in the conversation and a forward keeps the original's
     attachments. Save draft (Ctrl+S) keeps it in Drafts; closing an unsent message asks.
+  - **Outbox**: when the server can't be reached (offline, timing out, busy), the message
+    waits in the Outbox, with copies of its files, and the window closes. The account's
+    Outbox folder counts and lists it (the reader shows it as it will go out); it goes out
+    after the next successful sync, or on Send/Receive (F5). Each try carries on where the
+    last stopped (same draft, files not uploaded twice). A message the server refuses (an
+    address it won't take) stays there, you're told, and it isn't retried by itself: open it
+    (double-click) to fix it, which takes it out of the Outbox, or delete it. A refusal while
+    you're sending is shown straight away, with the window kept open.
   - Preferences > Compose: write new mail in HTML or plain text; default font, size and
     colour (a font that isn't installed, such as Calibri on Linux, is shown as its stand-in
     but mail keeps naming it).
@@ -248,7 +256,7 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
 
 ## Not yet
 
-An offline outbox (sending needs a connection), searching all folders at once, emptying Junk
+Searching all folders at once, emptying Junk
 Email, moving or copying between mailboxes. Conversations only group messages within the current
 folder (your replies in Sent Items are not pulled in, as Outlook does).
 
@@ -313,6 +321,7 @@ waddlemail/notify.py       desktop notifications and the task manager unread bad
 waddlemail/contacts.py     contacts/directory/contact group sync, To/Cc suggestions
 waddlemail/calendars.py    calendars, events, categories, free/busy, layout and free-time search
 waddlemail/compose.py      replies: recipients, subjects, quoted header; the message to send
+waddlemail/outbox.py       sending (directly or through a draft), and the Outbox
 waddlemail/attachments.py  attachments being written (reconcile an item's with the list); safe names to save
 waddlemail/inline.py       pictures in bodies: cid: links to data: URIs and back
 waddlemail/resources/      app icon (SVG + PNG sizes), tray icons, launcher template
@@ -369,10 +378,9 @@ waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 
 ## Next steps
 
-1. An offline outbox (sending through the change queue, like read/flag/move/delete).
-2. Removing a contact's photo (Graph has no call for it); photos in lists and autocomplete.
-3. Calendar: other people's shared calendars, room booking; reminders dismissed on another
+1. Removing a contact's photo (Graph has no call for it); photos in lists and autocomplete.
+2. Calendar: other people's shared calendars, room booking; reminders dismissed on another
    device aren't noticed here until they'd fire (Graph's reminderView could tell).
-4. Search across all folders; optional background download of
+3. Search across all folders; optional background download of
    bodies so local search covers everything offline.
-5. Publisher verification of the app registration before sharing with other organizations.
+4. Publisher verification of the app registration before sharing with other organizations.
