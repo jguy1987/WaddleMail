@@ -1,4 +1,5 @@
-"""Showing one message: a header (subject, sender, recipients, date) over the sandboxed body.
+"""Showing one message: a header (subject, sender, recipients, date, attachments) over the
+sandboxed body.
 
 Used by the reading pane and by MessageWindow, the window a double-click opens.
 """
@@ -7,12 +8,16 @@ from __future__ import annotations
 import datetime as dt
 import html
 
-from PySide6.QtCore import QDate, QDateTime, QLocale, Qt, QTime
+from PySide6.QtCore import QDate, QDateTime, QLocale, QSize, Qt, QTime, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QFont, QKeySequence, QPalette
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import QFrame, QLabel, QMainWindow, QToolBar, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QAbstractItemView, QFrame, QLabel, QListWidget, QListWidgetItem, QMainWindow, QMenu,
+    QToolBar, QVBoxLayout, QWidget,
+)
 
+from ..attachments import human_size
 from ..store import recipients
 from . import iconset
 from .render import placeholder, render_body
@@ -102,6 +107,65 @@ class MessageHeader(QFrame):
         self.date.setText(html.escape(_long_date(row["received"])))
 
 
+class AttachmentStrip(QListWidget):
+    """A received message's attachments. Double-click (or Enter) opens one; the context menu
+    opens, saves the selected, or saves them all. The owner downloads: open_requested /
+    save_requested carry the message id and the attachments (Graph's dicts)."""
+    open_requested = Signal(str, list)
+    save_requested = Signal(str, list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFlow(QListWidget.Flow.LeftToRight)
+        self.setWrapping(True)
+        self.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.setSpacing(2)
+        self.setIconSize(QSize(16, 16))
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setMaximumHeight(64)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._menu)
+        self.itemActivated.connect(lambda item: self._emit(self.open_requested, [item]))
+        self.message_id: str | None = None
+        self.hide()
+
+    def show_attachments(self, message_id: str, items: list[dict]) -> None:
+        self.clear()
+        self.message_id = message_id
+        for att in items:
+            item = QListWidgetItem(iconset.load("paperclip"),
+                                   f"{att.get('name') or 'attachment'}  "
+                                   f"({human_size(int(att.get('size') or 0))})")
+            item.setData(Qt.ItemDataRole.UserRole, att)
+            item.setToolTip("Double-click to open; right-click to save")
+            self.addItem(item)
+        self.setVisible(bool(items))
+
+    def forget(self) -> None:
+        self.clear()
+        self.message_id = None
+        self.hide()
+
+    def attachments(self, items=None) -> list[dict]:
+        items = items if items is not None else [self.item(i) for i in range(self.count())]
+        return [i.data(Qt.ItemDataRole.UserRole) for i in items]
+
+    def _emit(self, signal, items) -> None:
+        if self.message_id and items:
+            signal.emit(self.message_id, self.attachments(items))
+
+    def _menu(self, pos) -> None:
+        chosen = self.selectedItems() or ([self.itemAt(pos)] if self.itemAt(pos) else [])
+        menu = QMenu(self)
+        if chosen:
+            menu.addAction("&Open", lambda: self._emit(self.open_requested, chosen))
+            menu.addAction(iconset.load("save"), "&Save as…" if len(chosen) == 1 else
+                           "&Save selected…", lambda: self._emit(self.save_requested, chosen))
+        menu.addAction("Save &all…", lambda: self._emit(self.save_requested,
+                                                       [self.item(i) for i in range(self.count())]))
+        menu.exec(self.viewport().mapToGlobal(pos))
+
+
 class MessageView(QWidget):
     """Header + body. The owner loads the body and hands it over with set_body()."""
 
@@ -111,6 +175,8 @@ class MessageView(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         self.header = MessageHeader()
+        self.attachments = AttachmentStrip()
+        self.header.layout().addWidget(self.attachments)
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         line.setFrameShadow(QFrame.Shadow.Sunken)
@@ -126,6 +192,7 @@ class MessageView(QWidget):
     def show_placeholder(self, text: str) -> None:
         self.message_id = None
         self._body = None
+        self.attachments.forget()
         self.header.hide()
         self._line.hide()
         self.reader.setHtml(placeholder(text))
@@ -134,6 +201,7 @@ class MessageView(QWidget):
         """Show the header right away; the body follows via set_body()."""
         self.message_id = row["id"]
         self._body = None
+        self.attachments.forget()
         self.header.show_message(row)
         self.header.show()
         self._line.show()
@@ -142,6 +210,10 @@ class MessageView(QWidget):
     def set_body(self, content_type: str, content: str, remote_images: bool) -> None:
         self._body = (content_type, content)
         self.rerender(remote_images)
+
+    def set_attachments(self, message_id: str, items: list[dict]) -> None:
+        if message_id == self.message_id:  # (not if the user has moved on)
+            self.attachments.show_attachments(message_id, items)
 
     def rerender(self, remote_images: bool) -> None:
         if self._body:
@@ -216,6 +288,10 @@ class MessageWindow(QMainWindow):
     @property
     def message_id(self) -> str | None:
         return self.view.message_id
+
+    def set_attachments(self, items: list[dict]) -> None:
+        if not self.closed:
+            self.view.set_attachments(self.view.message_id, items)
 
     def set_body(self, content_type: str, content: str) -> None:
         if not self.closed:

@@ -26,6 +26,7 @@ from ..calendars import (
 )
 from ..contacts import format_address
 from . import iconset
+from .attachment_bar import AttachmentBar
 from .recipients import RecipientEdit
 
 STATUS_COLORS = {"busy": "#4f8cff", "tentative": "#4f8cff", "oof": "#8764b8",
@@ -242,6 +243,13 @@ class EventEditor(QDialog):
         line.addWidget(self.private)
         line.addStretch()
         form.addRow(line)
+        self.attachments = AttachmentBar()
+        # an existing event's attachments arrive after it opens (set_attachments); until then
+        # the ones it has are left alone when saving
+        self.attachments_known = row is None
+        self.attachments_changed = False  # (only then is anything sent about them)
+        self.attachments.changed.connect(lambda: setattr(self, "attachments_changed", True))
+        form.addRow("Attachments:", self.attachments)
         self.notes = QPlainTextEdit()
         self.notes.setPlaceholderText("Notes, agenda…")
         self.notes.textChanged.connect(self._notes_edited)
@@ -347,6 +355,12 @@ class EventEditor(QDialog):
         self.notes.blockSignals(True)
         self.notes.setPlainText(row["preview"] or "")
         self.notes.blockSignals(False)
+
+    def set_attachments(self, existing: list):
+        """The event's attachments as they are on the server (loaded after opening)."""
+        self.attachments.add(existing)
+        self.attachments_known = True
+        self.attachments_changed = False  # loading them isn't a change
 
     def set_body(self, text: str):
         """The full notes, loaded after the dialog opened (unless the user already typed)."""

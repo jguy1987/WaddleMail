@@ -4,17 +4,22 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import os
 import sys
+import tempfile
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtCore import (
+    QObject, QRunnable, QStandardPaths, Qt, QThreadPool, QTimer, QUrl, Signal,
+)
 from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QKeySequence
 from PySide6.QtWebEngineCore import QWebEnginePage
 from PySide6.QtWidgets import (
-    QApplication, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QSplitter,
+    QApplication, QFileDialog, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QSplitter,
     QStackedWidget, QSystemTrayIcon, QTextEdit, QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .. import __version__, desktop, graph
+from ..attachments import Attachment, file_name, reconcile, unique_path
 from ..calendars import event_row as calendar_event_row
 from ..calendars import event_span
 from ..contacts import personal_row, removal_payload, suggestions
@@ -130,6 +135,8 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.older_bar)
 
         self.msg_view = MessageView()
+        self._connect_attachments(self.msg_view)
+        self._save_dir: str | None = None  # where attachments were last saved
 
         self.content = QSplitter()
         self.content.addWidget(list_box)
@@ -670,6 +677,7 @@ class MainWindow(QMainWindow):
         if row is None or box is None:
             return
         self.msg_view.show_message(row)
+        self._load_attachments(box, row, lambda items: self.msg_view.set_attachments(mid, items))
         self._run(lambda: (mid, box.bodies.get(mid)), self._body_ready,
                   on_failed=lambda msg: self._body_failed(mid, msg),
                   activity=None if self.store.has_body(mid) else "Downloading message…")
@@ -699,12 +707,89 @@ class MainWindow(QMainWindow):
                             respond=lambda kind: self.respond(kind, mid))
         self._windows.add(win)
         win.destroyed.connect(lambda *_: self._windows.discard(win))
+        self._connect_attachments(win.view)
         win.show()
+        self._load_attachments(box, row, win.set_attachments)
         self._run(lambda: box.bodies.get(mid),
                   lambda body: win.set_body(body.content_type, body.content),
                   activity=None if self.store.has_body(mid) else "Downloading message…",
                   on_failed=win.show_error)
         self.mark_read([mid], True)
+
+    # -- received attachments -------------------------------------------------
+    def _connect_attachments(self, view: MessageView):
+        view.attachments.open_requested.connect(self.open_attachments)
+        view.attachments.save_requested.connect(self.save_attachments)
+
+    def _load_attachments(self, box, row, show):
+        """List a message's attachments (not the pictures in its body) for `show`."""
+        if not row["has_attachments"]:
+            return
+        item = box.graph.message_path(row["id"])
+        self._run(lambda: [a for a in box.graph.attachments(item) if not a.get("isInline")],
+                  show)
+
+    def _download(self, mid: str, items: list[dict], folder: str, paths=None):
+        """A job writing attachments into `folder` (or to `paths`); returns the paths."""
+        row = self.store.message_row(mid)
+        box = self.mailboxes.for_folder(row["folder_id"]) if row else None
+        if box is None:
+            return None
+        item = box.graph.message_path(mid)
+
+        def job():
+            out = []
+            for i, att in enumerate(items):
+                path = paths[i] if paths else unique_path(folder, file_name(att))
+                data = box.graph.attachment_content(item, att["id"])
+                with open(path, "wb") as fh:
+                    fh.write(data)
+                out.append(path)
+            return out
+        return job
+
+    def open_attachments(self, mid: str, items: list[dict]):
+        """Download to a private temporary folder and open with the desktop's app."""
+        job = self._download(mid, items, tempfile.mkdtemp(prefix="waddlemail-"))
+        if job is None:
+            return
+
+        def done(paths):
+            for path in paths:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+        self._run(job, done, on_failed=lambda msg: QMessageBox.warning(
+            self, "Open attachment", f"The attachment couldn't be opened.\n\n{msg}"),
+                  activity="Downloading attachment…")
+
+    def save_attachments(self, mid: str, items: list[dict]):
+        """One: Save as; several: into a folder (names already there get " (2)")."""
+        parent = QApplication.activeWindow() or self
+        start = self._save_dir or QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DownloadLocation) or os.path.expanduser("~")
+        if len(items) == 1:
+            path, _ = QFileDialog.getSaveFileName(parent, "Save attachment",
+                                                  os.path.join(start, file_name(items[0])))
+            if not path:
+                return
+            folder, paths = os.path.dirname(path), [path]
+        else:
+            folder = QFileDialog.getExistingDirectory(parent, "Save attachments to", start)
+            if not folder:
+                return
+            paths = None
+        self._save_dir = folder
+        job = self._download(mid, items, folder, paths)
+        if job is None:
+            return
+
+        def done(saved):
+            what = os.path.basename(saved[0]) if len(saved) == 1 else f"{len(saved)} attachments"
+            self.statusBar().showMessage(f"Saved {what} to {folder}", 5000)
+
+        self._run(job, done, on_failed=lambda msg: QMessageBox.warning(
+            parent, "Save attachment", f"The attachment wasn't saved.\n\n{msg}"),
+                  activity="Saving attachment…")
 
     # -- older mail ---------------------------------------------------------
     def _update_older_bar(self):
@@ -1600,10 +1685,26 @@ class MainWindow(QMainWindow):
         box = self.mailboxes.for_folder(row["folder_id"]) if row else None
         if row is None or box is None:
             return
-        self._run(lambda: box.bodies.get(mid),
-                  lambda body: self._compose(kind=kind, original=row,
-                                             original_body=(body.content_type, body.content),
-                                             account_id=box.account_id),
+        def job():
+            body = box.bodies.get(mid)
+            originals: list | None = []
+            if kind == "forward" and row["has_attachments"]:
+                try:  # shown in the forward, so some can be taken out
+                    originals = [Attachment.from_server(a, original=True) for a in
+                                 box.graph.attachments(box.graph.message_path(mid))
+                                 if not a.get("isInline")]
+                except Exception as exc:  # can't list them: they all go along, unshown
+                    log.warning("original attachments not listed: %s", exc)
+                    originals = None
+            return body, originals
+
+        def done(result):
+            body, originals = result
+            self._compose(kind=kind, original=row,
+                          original_body=(body.content_type, body.content),
+                          account_id=box.account_id, original_attachments=originals)
+
+        self._run(job, done,
                   activity=None if self.store.has_body(mid) else "Downloading message…")
 
     def _sending_box(self, win: ComposeWindow):
@@ -1617,13 +1718,16 @@ class MainWindow(QMainWindow):
         """Create or update the message in Drafts (worker thread); returns its id."""
         message = win.outgoing().graph_message()
         draft_id = win.draft_id
-        if draft_id is None:
-            if win.original is not None:
+        if draft_id is None and win.original is None:
+            draft_id = box.graph.create_draft(message)["id"]
+        else:
+            if draft_id is None:
                 draft_id = box.graph.create_response(win.original["id"], win.kind)["id"]
-            else:
-                draft_id = box.graph.create_draft(message)["id"]
-                return draft_id
-        box.graph.update_message(draft_id, message)
+            box.graph.update_message(draft_id, message)
+        # attachments: upload the new, remove the ones taken out (a forward's included)
+        if win.has_had_attachments:
+            reconcile(box.graph, box.graph.message_path(draft_id), win.attachments.items(),
+                      remove_others=win.originals_known)
         return draft_id
 
     def send_message(self, win: ComposeWindow):
@@ -1634,9 +1738,9 @@ class MainWindow(QMainWindow):
         win.act_send.setEnabled(False)
 
         def job():
-            if win.original is None and win.draft_id is None:
-                box.graph.send_mail(out.graph_message())  # new mail: straight out
-            else:  # replies/forwards (threading, forwarded attachments) and saved drafts
+            if win.original is None and win.draft_id is None and not win.attachments.items():
+                box.graph.send_mail(out.graph_message())  # plain new mail: straight out
+            else:  # attachments, replies/forwards (threading) and saved drafts: via a draft
                 box.graph.send_draft(self._write_draft(box, win))
 
         original = win.original["id"] if win.original is not None else None
@@ -1752,6 +1856,9 @@ class MainWindow(QMainWindow):
             event_id = row["id"]
             self._run(lambda: box.graph.event_body(event_id),
                       lambda body: dlg.set_body(_plain(*body)))
+            self._run(lambda: [Attachment.from_server(a) for a in box.graph.attachments(
+                box.graph.event_path(event_id)) if not a.get("isInline")],
+                dlg.set_attachments)
         return dlg
 
     def new_event(self, start=None, end=None, all_day: bool = False):
@@ -1864,8 +1971,21 @@ class MainWindow(QMainWindow):
         # again. A single event or occurrence comes back whole and is stored as it is.
         series = bool(draft.recurrence) or dlg.series
 
+        files = dlg.attachments.items()
+        known = dlg.attachments_known
+        attachments_changed = dlg.attachments_changed
+        notes = dlg.notes.toPlainText()
+
         def job():
             item = box.graph.save_event(fields, row["id"] if row else None, calendar_id)
+            if attachments_changed:  # add the new files, remove the ones taken out
+                changed = reconcile(box.graph, box.graph.event_path(item["id"]), files,
+                                    remove_others=known)
+                if meeting and (changed.uploaded or changed.removed):
+                    # Attendees got the invitation as it was saved; changing the event once
+                    # more sends them an update that carries the attachments.
+                    item = box.graph.save_event({"body": {"contentType": "text",
+                                                          "content": notes}}, item["id"])
             if not series:
                 self.store.upsert_event(calendar_event_row(item, box.account_id, calendar_id))
             return item["id"]

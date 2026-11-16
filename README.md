@@ -60,6 +60,11 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
       folder, up to 250 hits). It finds mail whose body was never downloaded and mail older
       than the sync window; those hits are stored and merged into the list. The count shows
       how many came from the server.
+- **Received attachments** (and your own, in Sent Items) are listed under the message header,
+  in the reading pane and the message window. Double-click one to download it to a private
+  temporary folder and open it with the desktop's app; right-click to save it (Save as), the
+  selected ones or all of them (into a folder; names already there get " (2)"). An attached
+  message saves as `.eml`. Pictures in the body (inline) aren't listed.
     - While searching, the "Show in message list" period is ignored, so old mail is found.
 - **Reading pane** (View > Reading pane): Right, Bottom or Off. On the right the list switches to
   compact two-line rows with a Sort button. The pane shows a header (subject, sender, To/Cc,
@@ -83,7 +88,15 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   - **Signatures**, one per account (Preferences > Signatures, rich text), added
     automatically to new messages and/or replies and forwards; **Insert signature** adds it
     just above the quoted text (or at the end of a new message).
-  - Send (Ctrl+Enter). New mail is sent directly; replies and forwards go through Exchange's
+  - **Attachments**: Attach (Ctrl+Shift+A) or drop files anywhere on the window (dropping on
+    the body attaches rather than pasting the path); the strip under the subject shows each
+    with its size, Delete or × takes one out, and the total is shown. A forward lists the
+    original's attachments so you can leave some out. Files up to 150 MB each (Graph's
+    limit: under 3 MB in one request, larger ones through an upload session in pieces under
+    4 MB); a total over 35 MB asks first, as most servers refuse bigger messages. Mail with
+    attachments goes out as a draft (create, attach, send); a saved draft keeps them, and
+    later saves or the send only upload or remove the differences.
+  - Send (Ctrl+Enter). New mail without attachments is sent directly; replies and forwards go through Exchange's
     reply/forward draft, so they stay in the conversation and a forward keeps the original's
     attachments. Save draft (Ctrl+S) keeps it in Drafts; closing an unsent message asks.
   - Preferences > Compose: write new mail in HTML or plain text; default font, size and
@@ -102,7 +115,8 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   - Event editor: title, attendees (required and optional, completed like To), location,
     start/end or All day, **Teams meeting** (Graph creates it and its join link; offered when
     your account can), **Show as** (Free, Working elsewhere, Tentative, Busy, Out of office),
-    categories, reminder, calendar, private, notes. With attendees it is a meeting: Save
+    categories, reminder, calendar, private, notes, **attachments** (an existing event's
+    are listed, so you can add or remove). With attendees it is a meeting: Save
     becomes Send and Exchange sends the invitations; changes send updates.
   - **Scheduling**: everyone's free/busy for the day (getSchedule) in a grid next to the
     meeting; click a time to move the meeting there, or **Find next free time** for the
@@ -210,8 +224,7 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
 
 ## Not yet
 
-Adding attachments to new mail (forwards keep the original's), inline (`cid:`) images, an
-offline outbox (sending needs a connection), searching all folders at once, deleting messages,
+Inline (`cid:`) images, an offline outbox (sending needs a connection), searching all folders at once, deleting messages,
 moving or copying between mailboxes. Conversations only group messages within the current
 folder (your replies in Sent Items are not pulled in, as Outlook does).
 
@@ -276,6 +289,7 @@ waddlemail/notify.py       desktop notifications and the task manager unread bad
 waddlemail/contacts.py     contacts/directory/contact group sync, To/Cc suggestions
 waddlemail/calendars.py    calendars, events, categories, free/busy, layout and free-time search
 waddlemail/compose.py      replies: recipients, subjects, quoted header; the message to send
+waddlemail/attachments.py  attachments being written (reconcile an item's with the list); safe names to save
 waddlemail/resources/      app icon (SVG + PNG sizes), tray icons, launcher template
 waddlemail/settings.py     Preferences (QSettings) and their defaults
 waddlemail/ui/             main window + menus/toolbar, preferences, new mail/event dialogs, safe rendering
@@ -293,6 +307,7 @@ waddlemail/ui/recurrence_dialog.py  custom repeat pattern
 waddlemail/ui/reminders.py  reminders window and the service that raises it
 waddlemail/ui/compose_window.py  the compose window (new, reply, forward)
 waddlemail/ui/rich_editor.py  WYSIWYG editor with formatting bar (mail and signatures)
+waddlemail/ui/attachment_bar.py  the attachments strip (compose window, event editor)
 waddlemail/ui/contacts_view.py  the Contacts page
 waddlemail/ui/contact_dialogs.py  contact editor (with photo), contact group editor, avatars
 waddlemail/ui/recipients.py  To/Cc field with name completion
@@ -329,11 +344,11 @@ waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 
 ## Next steps
 
-1. Attachments when writing, an offline outbox, and deleting messages through the change
+1. An offline outbox, and deleting messages through the change
    queue (`pending` table) that read/flag/move already use.
 2. Removing a contact's photo (Graph has no call for it); photos in lists and autocomplete.
 3. Calendar: other people's shared calendars, room booking; reminders dismissed on another
    device aren't noticed here until they'd fire (Graph's reminderView could tell).
-4. Attachments and `cid:` images; search across all folders; optional background download of
+4. `cid:` images (pictures in the body); search across all folders; optional background download of
    bodies so local search covers everything offline.
 5. Publisher verification of the app registration before sharing with other organizations.

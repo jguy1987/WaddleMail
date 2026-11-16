@@ -1,7 +1,9 @@
 """Thin Microsoft Graph client: paging, throttling/retry, delta, message bodies."""
 from __future__ import annotations
 
+import base64
 import logging
+import re
 import time
 from typing import Callable, Iterator
 from urllib.parse import quote
@@ -551,6 +553,76 @@ class GraphClient:
         return self._request(f"{self._root}/messages/{quote(message_id, safe='')}/copy",
                              method="POST", json={"destinationId": destination_id},
                              headers=_prefer())
+
+    # -- attachments (of a message or an event) -------------------------------------
+    # `item` is the item's path, from message_path() / event_path().
+    SMALL_ATTACHMENT = 3 * 1024 * 1024    # below this: one request; above: an upload session
+    MAX_ATTACHMENT = 150 * 1024 * 1024    # Graph's limit per file
+    UPLOAD_CHUNK = 12 * 320 * 1024        # < 4 MB per PUT, a multiple of 320 KiB
+
+    def message_path(self, message_id: str) -> str:
+        return f"{self._root}/messages/{quote(message_id, safe='')}"
+
+    def event_path(self, event_id: str) -> str:
+        return f"{self._root}/events/{quote(event_id, safe='')}"
+
+    def attachments(self, item: str) -> list[dict]:
+        """id, name, size, contentType, isInline of each attachment (not the content)."""
+        return list(self._paged(f"{item}/attachments", params={
+            "$select": "id,name,size,contentType,isInline"}, headers=_prefer()))
+
+    def attachment_content(self, item: str, attachment_id: str) -> bytes:
+        """The file itself (an attached message comes as its MIME text, an .eml)."""
+        return self._request(f"{item}/attachments/{quote(attachment_id, safe='')}/$value",
+                             raw=True)
+
+    def delete_attachment(self, item: str, attachment_id: str) -> None:
+        self._request(f"{item}/attachments/{quote(attachment_id, safe='')}", method="DELETE")
+
+    def add_attachment(self, item: str, name: str, data: bytes,
+                       content_type: str = "application/octet-stream") -> str | None:
+        """Attach a file; returns the attachment's id (None if the server didn't say)."""
+        if len(data) > self.MAX_ATTACHMENT:
+            raise GraphError(f"{name} is larger than 150 MB, the most an attachment can be")
+        if len(data) < self.SMALL_ATTACHMENT:
+            made = self._request(f"{item}/attachments", method="POST", json={
+                "@odata.type": "#microsoft.graph.fileAttachment", "name": name,
+                "contentType": content_type,
+                "contentBytes": base64.b64encode(data).decode("ascii")})
+            return made.get("id")
+        session = self._request(f"{item}/attachments/createUploadSession", method="POST",
+                                json={"AttachmentItem": {"attachmentType": "file",
+                                                         "name": name, "size": len(data)}})
+        return self._upload(session["uploadUrl"], data)
+
+    def _upload(self, url: str, data: bytes) -> str | None:
+        """PUT the bytes to an upload session, in order, a chunk at a time. The URL carries
+        its own authorisation: no Authorization header (as Microsoft asks)."""
+        total, start = len(data), 0
+        while start < total:
+            chunk = data[start:start + self.UPLOAD_CHUNK]
+            end = start + len(chunk) - 1
+            headers = {"Content-Type": "application/octet-stream",
+                       "Content-Length": str(len(chunk)),
+                       "Content-Range": f"bytes {start}-{end}/{total}"}
+            for attempt in range(4):
+                try:
+                    r = self._s.request("PUT", url, data=chunk, headers=headers, timeout=120)
+                except requests.RequestException as exc:
+                    _report(OFFLINE, _network_problem(exc))
+                    raise
+                if r.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+                    self._sleep(min(float(r.headers.get("Retry-After", 2 ** attempt)), 30))
+                    continue
+                break
+            _report(ONLINE)
+            if r.status_code == 201:  # the last piece: the Location names the attachment
+                m = re.search(r"Attachments\('([^']+)'\)", r.headers.get("Location", ""))
+                return m.group(1) if m else None
+            if not r.ok:
+                raise GraphError(f"upload {r.status_code}: {r.text[:200]}", r.status_code)
+            start = end + 1
+        return None
 
     # -- sending ------------------------------------------------------------
     def send_mail(self, message: dict) -> None:

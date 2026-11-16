@@ -354,6 +354,7 @@ def checks():
     reminder_checks()
     new_button_checks()
     compose_checks()
+    attachment_checks()
 
     w.close()
     saved = Settings(str(tmp / "settings.ini"))
@@ -1233,6 +1234,151 @@ def compose_checks():
           and w.settings.get("compose/size") == 12 and not w.settings.get("compose/html"),
           "Preferences: signature per account, when to add it, font and format")
     w.settings.set("compose/html", True)
+
+
+class FakeAttachments:
+    """attachments per item path, as the server keeps them."""
+
+    def __init__(self):
+        self.items: dict[str, list[dict]] = {}
+        self.added, self.deleted = [], []
+        self.n = 0
+
+    def install(self):
+        G = graph.GraphClient
+        G.attachments = lambda c, item: list(self.items.get(item, []))
+        G.add_attachment = lambda c, item, name, data, ctype="": self._add(item, name, data)
+        G.delete_attachment = lambda c, item, aid: self._delete(item, aid)
+        G.attachment_content = lambda c, item, aid: f"content of {aid}".encode()
+
+    def _add(self, item, name, data):
+        self.n += 1
+        self.items.setdefault(item, []).append({"id": f"att{self.n}", "name": name,
+                                                "size": len(data)})
+        self.added.append((item, name))
+        return f"att{self.n}"
+
+    def _delete(self, item, aid):
+        self.deleted.append((item, aid))
+        self.items[item] = [a for a in self.items.get(item, []) if a["id"] != aid]
+
+
+def attachment_checks():
+    from PySide6.QtCore import QMimeData, QPointF, QUrl
+    from PySide6.QtGui import QDropEvent
+    out, atts = FakeOutbox(), FakeAttachments()
+    out.install()
+    atts.install()
+    folder = tmp / "files"
+    folder.mkdir(exist_ok=True)
+    (folder / "plan.pdf").write_bytes(b"%PDF" + b"x" * 3000)
+    (folder / "notes.txt").write_text("remember the milk")
+
+    w.new_mail(to=["Ana Ruiz <ana@x.com>"])
+    wait(200)
+    win = compose_windows()[-1]
+    win.subject.setText("Files")
+    win.attachments.add_files([str(folder / "plan.pdf")])
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(folder / "notes.txt"))])
+    vp = win.editor.edit.viewport()
+    drop = QDropEvent(QPointF(10, 10), Qt.DropAction.CopyAction, mime,
+                      Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    win.eventFilter(vp, drop)
+    names = [a.name for a in win.attachments.items()]
+    check(names == ["plan.pdf", "notes.txt"] and "notes.txt" not in win.editor.text()
+          and "2 files" in win.attachments.total.text(),
+          "attach: button and dropping a file on the body (not pasted as text)")
+    win.act_send.trigger()
+    wait(500)
+    check(all(m.get("subject") != "Files" for m in out.sent),
+          "mail with attachments isn't sent directly (sendMail can't carry large files)")
+    check(out.drafts and [n for i, n in atts.added] == ["plan.pdf", "notes.txt"]
+          and out.sent_drafts[-1] == f"draft{len(out.drafts)}",
+          "mail with attachments goes out as a draft with its files")
+
+    # a forward: the original has two attachments; take one out
+    st.conn.execute("UPDATE messages SET has_attachments=1 WHERE id='m1'")
+    st.conn.commit()
+    atts.items["/me/messages/m1"] = [{"id": "o1", "name": "budget.xlsx", "size": 100},
+                                     {"id": "o2", "name": "old.doc", "size": 50}]
+    real_create = graph.GraphClient.create_response
+
+    def create_forward(c, mid, kind):  # Exchange copies the originals onto the forward
+        made = real_create(c, mid, kind)
+        atts.items[f"/me/messages/{made['id']}"] = [
+            {"id": "f1", "name": "budget.xlsx", "size": 100},
+            {"id": "f2", "name": "old.doc", "size": 50}]
+        return made
+
+    graph.GraphClient.create_response = create_forward
+    w.respond("forward", "m1")
+    wait(500)
+    win = compose_windows()[-1]
+    check([a.name for a in win.attachments.items()] == ["budget.xlsx", "old.doc"],
+          "a forward lists the original's attachments")
+    win.attachments.list.item(1).setSelected(True)
+    win.attachments.remove_selected()
+    win.to.setText("Bo <bo@y.org>; ")
+    win.act_send.trigger()
+    wait(500)
+    draft = out.sent_drafts[-1]
+    check([aid for item, aid in atts.deleted] == ["f2"]
+          and [a["name"] for a in atts.items[f"/me/messages/{draft}"]] == ["budget.xlsx"],
+          "...and one taken out isn't forwarded")
+    graph.GraphClient.create_response = real_create
+
+    # received attachments: listed under the header, opened, saved
+    from waddlemail.ui import main_window as mw
+    w._show_in_pane("m1")
+    wait(400)
+    strip = w.msg_view.attachments
+    check(not strip.isHidden() and [a["name"] for a in strip.attachments()]
+          == ["budget.xlsx", "old.doc"], "a received message's attachments show in the reader")
+    opened, real_desktop, real_dialog = [], mw.QDesktopServices, mw.QFileDialog
+    mw.QDesktopServices = type("D", (), {"openUrl": staticmethod(
+        lambda url: opened.append(url.toLocalFile()))})
+    strip.open_requested.emit("m1", strip.attachments()[:1])
+    wait(400)
+    check(len(opened) == 1 and opened[0].endswith("/budget.xlsx")
+          and Path(opened[0]).read_bytes() == b"content of o1",
+          "...opening one downloads it and hands it to the desktop")
+    saved = tmp / "saved"
+    saved.mkdir(exist_ok=True)
+    mw.QFileDialog = type("F", (), {"getExistingDirectory": staticmethod(
+        lambda *a: str(saved))})
+    for _ in range(2):
+        strip.save_requested.emit("m1", strip.attachments())
+        wait(400)
+    check(sorted(f.name for f in saved.iterdir()) == ["budget (2).xlsx", "budget.xlsx",
+                                                     "old (2).doc", "old.doc"],
+          "...and Save all writes them to a folder, not over files already there")
+    mw.QDesktopServices, mw.QFileDialog = real_desktop, real_dialog
+
+    # an event with an attachment, as a meeting
+    server = _calendar_server
+    nine = dt.datetime.combine(server.monday + dt.timedelta(days=21), dt.time(9)).astimezone()
+    dlg = w._event_editor(start=nine, end=nine + dt.timedelta(hours=1))
+    dlg.title.setText("Review the plan")
+    dlg.required.setText("Ana Ruiz <ana@x.com>; ")
+    dlg.attachments.add_files([str(folder / "plan.pdf")])
+    saves_before = len(server.saved)
+    w._save_event(dlg, None)
+    wait(500)
+    event_items = [i for i, n in atts.added if i.startswith("/me/events/")]
+    check(event_items and atts.added[-1][1] == "plan.pdf"
+          and len(server.saved) == saves_before + 2,
+          "event attachment uploaded; the meeting is updated so attendees get it")
+    eid = event_items[-1].rsplit("/", 1)[1]
+    dlg = w._event_editor(row=st.event_row(eid))
+    wait(400)
+    check([a.name for a in dlg.attachments.items()] == ["plan.pdf"]
+          and not dlg.attachments_changed, "editing an event shows its attachments")
+    dlg.attachments.list.item(0).setSelected(True)
+    dlg.attachments.remove_selected()
+    w._save_event(dlg, st.event_row(eid))
+    wait(500)
+    check(atts.items.get(f"/me/events/{eid}") == [], "...and one can be removed")
 
 
 def travel_id():

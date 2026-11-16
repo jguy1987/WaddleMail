@@ -11,13 +11,14 @@ and closes it when sending worked.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtGui import QKeySequence, QTextCursor
 from PySide6.QtWidgets import (
     QComboBox, QFormLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QToolBar, QVBoxLayout,
     QWidget,
 )
 
+from ..attachments import human_size
 from ..compose import (
     FORWARD, NEW, Outgoing, format_sent, quote_html, quote_text, reply_recipients,
     reply_subject,
@@ -25,9 +26,13 @@ from ..compose import (
 from ..contacts import format_address
 from ..text import body_text
 from . import iconset
+from .attachment_bar import AttachmentBar
 from .recipients import RecipientEdit
 from .render import quotable_html
 from .rich_editor import RichEditor
+
+
+LARGE_MESSAGE = 35 * 1024 * 1024  # Exchange Online's usual limit for a whole message
 
 
 class ComposeWindow(QMainWindow):
@@ -36,11 +41,13 @@ class ComposeWindow(QMainWindow):
 
     def __init__(self, accounts: list[tuple[str, str]], suggestions, defaults: dict,
                  signature, kind: str = NEW, original=None, original_body=None,
-                 to: list[str] | None = None, account_id: str | None = None, parent=None):
+                 to: list[str] | None = None, account_id: str | None = None,
+                 original_attachments: list | None = None, parent=None):
         """`accounts`: [(account id, address)] you can send from; `signature(account id)` ->
         a signatures row or None; `defaults`: html, font, size, color (Preferences);
         `original`: the stored message replied to / forwarded, with `original_body`
-        (content type, content)."""
+        (content type, content) and, for a forward, `original_attachments` (its attachments
+        as Attachment objects; None if they couldn't be listed: then they're all kept)."""
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.kind, self.original = kind, original
@@ -60,6 +67,10 @@ class ComposeWindow(QMainWindow):
                                        lambda: self.draftRequested.emit(self))
         self.act_draft.setShortcut(QKeySequence.StandardKey.Save)
         bar.addSeparator()
+        self.act_attach = bar.addAction(iconset.load("paperclip"), "Attach",
+                                        lambda: self.attachments.choose_files())
+        self.act_attach.setShortcut(QKeySequence("Ctrl+Shift+A"))
+        self.act_attach.setToolTip("Attach files (Ctrl+Shift+A); or drop them on the window")
         self.act_signature = bar.addAction(iconset.load("signature"), "Insert signature",
                                            self.insert_signature)
         bar.addSeparator()
@@ -92,10 +103,24 @@ class ComposeWindow(QMainWindow):
         form.addRow(self.cc_label, self.cc)
         form.addRow(self.bcc_label, self.bcc)
         form.addRow("Subject:", self.subject)
+        self.attachments = AttachmentBar()
+        self.attachments.changed.connect(self._attachment_change)
+        form.addRow("", self.attachments)
         self._form = form
+        self._attachments_changed = False
+        # whether attachments have come into it at all (only then do drafts check them)
+        self.has_had_attachments = bool(original_attachments) or (
+            kind == FORWARD and original_attachments is None)
+        # A forward carries the original's attachments: listed so you can take some out.
+        self.originals_known = original_attachments is not None
+        if original_attachments:
+            self.attachments.add(original_attachments)
+            self._attachments_changed = False
         lay.addLayout(form)
         self.editor = RichEditor()
         lay.addWidget(self.editor, 1)
+        self.setAcceptDrops(True)  # files dropped anywhere (the body too) become attachments
+        self.editor.edit.viewport().installEventFilter(self)
         self.setCentralWidget(central)
         self.act_cc.toggled.connect(lambda on: self._show_row(self.cc_label, self.cc, on))
         self.act_bcc.toggled.connect(lambda on: self._show_row(self.bcc_label, self.bcc, on))
@@ -216,7 +241,7 @@ class ComposeWindow(QMainWindow):
                         bcc=self.bcc.addresses())
 
     def is_dirty(self) -> bool:
-        return (self.editor.edit.document().isModified() or
+        return (self.editor.edit.document().isModified() or self._attachments_changed or
                 (self.kind == NEW and bool(self.to.text().strip() or self.subject.text().strip())))
 
     # -- send / close ------------------------------------------------------------------------
@@ -231,11 +256,53 @@ class ComposeWindow(QMainWindow):
                 QMessageBox.StandardButton.Yes:
             self.subject.setFocus()
             return
+        total = self.attachments.total_size()
+        if total > LARGE_MESSAGE and QMessageBox.question(
+                self, "Send", f"The attachments add up to {human_size(total)}. Most mail "
+                "servers don't accept messages over about 35 MB, so it may come back. Send "
+                "anyway?") != QMessageBox.StandardButton.Yes:
+            return
         self.sendRequested.emit(self)
+
+    def _attachment_change(self):
+        self._attachments_changed = True
+        self.has_had_attachments = True
 
     def mark_saved(self, draft_id: str):
         self.draft_id = draft_id
         self.editor.edit.document().setModified(False)
+        self._attachments_changed = False
+
+    # -- dropping files --------------------------------------------------------------------
+    @staticmethod
+    def _files(mime) -> list[str]:
+        return [u.toLocalFile() for u in mime.urls() if u.isLocalFile()] if mime.hasUrls() \
+            else []
+
+    def dragEnterEvent(self, event):
+        if self._files(event.mimeData()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        self._drop(self._files(event.mimeData()))
+        event.acceptProposedAction()
+
+    def eventFilter(self, obj, event):
+        # The body would paste a dropped file's path as text: attach it instead.
+        if event.type() in (QEvent.Type.DragEnter, QEvent.Type.DragMove) and \
+                self._files(event.mimeData()):
+            event.acceptProposedAction()
+            return True
+        if event.type() == QEvent.Type.Drop and self._files(event.mimeData()):
+            self._drop(self._files(event.mimeData()))
+            event.acceptProposedAction()
+            return True
+        return super().eventFilter(obj, event)
+
+    def _drop(self, paths: list[str]):
+        refused = self.attachments.add_files(paths)
+        if refused:
+            QMessageBox.warning(self, "Attach", "Not attached:\n" + "\n".join(refused))
 
     def closeEvent(self, event):
         if self.sent or not self.is_dirty():
