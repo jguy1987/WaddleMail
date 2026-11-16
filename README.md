@@ -58,6 +58,12 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   - Moves and copies work within one mailbox; Graph can't move mail between mailboxes.
 - Message list served from a local SQLite store, kept current with Graph **delta queries** (one
   cursor per folder). If the first sync fails (offline), the stored mail is still shown.
+  - Opening a folder shows it from the store at once and syncs just that folder; the full
+    sync (every account's Inbox, every mailbox's folders and counts) runs on the timer and
+    Send/Receive. The list is rebuilt after a sync only if something in it changed.
+  - Big folders stay quick: sorting happens in the model (not a Qt sort proxy asking Python
+    for every comparison), and keeping open conversations and the selection looks those rows
+    up directly. About a second for 36,000 messages, half that for 20,000.
   - Columns: read dot, replied/forwarded, attachment, importance, From (To in Sent Items, Drafts
     and Outbox), Subject, Received, flag; To and Size can be switched on. Click a header to sort
     by it, drag headers to reorder, right-click the header to show/hide columns. Order, widths

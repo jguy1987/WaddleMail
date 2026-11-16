@@ -21,8 +21,8 @@ import re
 from dataclasses import dataclass
 
 from PySide6.QtCore import (
-    QAbstractItemModel, QDate, QDateTime, QLocale, QModelIndex, QRect, QSize,
-    QSortFilterProxyModel, Qt, QTime, QTimer, Signal,
+    QAbstractItemModel, QDate, QDateTime, QIdentityProxyModel, QLocale, QModelIndex, QRect,
+    QSize, Qt, QTime, QTimer, Signal,
 )
 from PySide6.QtGui import (
     QActionGroup, QColor, QDrag, QFont, QFontMetrics, QIcon, QPainter, QPalette, QPixmap,
@@ -220,7 +220,9 @@ class MessageModel(QAbstractItemModel):
         super().__init__(parent)
         self.root = Node("root", "")
         self._by_id: dict[str, Node] = {}
+        self._by_key: dict[str, Node] = {}  # every node, by its key
         self.outgoing = False
+        self.sort_column, self.sort_order = 0, Qt.SortOrder.DescendingOrder
         pal = QApplication.palette()
         self._accent = pal.color(QPalette.ColorRole.Highlight)
         self._dim = pal.color(QPalette.ColorRole.PlaceholderText)
@@ -239,7 +241,7 @@ class MessageModel(QAbstractItemModel):
         self.beginResetModel()
         self.outgoing = outgoing
         self.root = Node("root", "")
-        self._by_id = {}
+        self._by_id, self._by_key = {}, {}
         msgs = [dict(r) for r in rows]
 
         top: list[Node] = []
@@ -254,29 +256,88 @@ class MessageModel(QAbstractItemModel):
                 top.append(self._message_node(members[0]))
                 continue
             thread = Node(THREAD, "t:" + conv, _summary(members, outgoing))
+            self._by_key[thread.key] = thread
             for m in members:
                 thread.add(self._message_node(m))
             top.append(thread)
 
         if grouped:
             groups: dict[int, Node] = {}
+            today = dt.date.today()
+            first_weekday = QLocale.system().firstDayOfWeek().value
+            # Many messages share an hour (or a minute, where the time zone is off by half
+            # hours): work each one out once.
+            offset = dt.datetime.now().astimezone().utcoffset() or dt.timedelta()
+            cut = 13 if offset.total_seconds() % 3600 == 0 else 16
+            seen: dict[str, tuple[int, str]] = {}
             for node in top:
-                rank, label = date_group(node.row["received"])
+                received = node.row["received"] or ""
+                rank, label = seen.get(received[:cut]) or seen.setdefault(
+                    received[:cut], date_group(received or None, today, first_weekday))
                 if rank not in groups:
                     groups[rank] = Node(GROUP, "g:" + label, label=label, rank=rank)
+                    self._by_key[groups[rank].key] = groups[rank]
                 groups[rank].add(node)
             for rank in sorted(groups, reverse=True):
                 self.root.add(groups[rank])
         else:
             for node in top:
                 self.root.add(node)
+        self._sort_nodes()
         self.endResetModel()
         self.headerDataChanged.emit(Qt.Orientation.Horizontal, COL["from"], COL["from"])
 
     def _message_node(self, m: dict) -> Node:
         node = Node(MESSAGE, "m:" + m["id"], m)
         self._by_id[m["id"]] = node
+        self._by_key[node.key] = node
         return node
+
+    # -- sorting (here, in Python: a sort proxy would ask data() for every comparison) ----
+    def sort(self, column: int, order=Qt.SortOrder.AscendingOrder) -> None:
+        self.sort_column, self.sort_order = column, order
+        if not self.root.children:
+            return
+        self.layoutAboutToBeChanged.emit()
+        old = self.persistentIndexList()
+        nodes = [(self.node(i), i.column()) for i in old]
+        self._sort_nodes()
+        self.changePersistentIndexList(
+            old, [self.createIndex(n.pos, c, n) if n is not None else QModelIndex()
+                  for n, c in nodes])
+        self.layoutChanged.emit()
+
+    def _sort_nodes(self) -> None:
+        """Every level in the sort column's order (headings by date); equal ones keep the
+        order they came in (newest first)."""
+        key = COLUMNS[self.sort_column].key
+        reverse = self.sort_order == Qt.SortOrder.DescendingOrder
+
+        def sort_key(n: Node):
+            return n.rank if n.kind == GROUP else self._sort_key(n.row, key)
+
+        def walk(parent: Node):
+            if not parent.children:
+                return
+            parent.children.sort(key=sort_key, reverse=reverse)
+            for pos, child in enumerate(parent.children):
+                child.pos = pos
+                if child.kind != MESSAGE:
+                    walk(child)
+
+        walk(self.root)
+
+    def node_by_key(self, key: str) -> Node | None:
+        return self._by_key.get(key)
+
+    def index_of(self, node: Node, column: int = 0) -> QModelIndex:
+        return self.createIndex(node.pos, column, node)
+
+    def walk(self, parent: Node | None = None):
+        """Every row, in the order shown (depth first)."""
+        for child in (parent or self.root).children:
+            yield child
+            yield from self.walk(child)
 
     def update_rows(self, rows) -> None:
         """Refresh messages in place (after marking read, flagging), keeping selection and
@@ -322,13 +383,14 @@ class MessageModel(QAbstractItemModel):
     def columnCount(self, parent=QModelIndex()):
         return len(COLUMNS)
 
+    _HEADING = Qt.ItemFlag.ItemIsEnabled  # (made once: the view asks for every row)
+    _ROW = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+
     def flags(self, index):
         node = self.node(index)
         if node is None:
             return Qt.ItemFlag.NoItemFlags
-        if node.kind == GROUP:  # a heading: not selectable
-            return Qt.ItemFlag.ItemIsEnabled
-        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        return self._HEADING if node.kind == GROUP else self._ROW  # a heading: not selectable
 
     # -- presentation --------------------------------------------------------
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
@@ -701,9 +763,10 @@ class MessageListView(QTreeView):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.model_ = MessageModel(self)
-        self.proxy = QSortFilterProxyModel(self)
+        # (sorting happens in the model; the proxy passes it on, and keeps the mapping calls
+        # the rest of the code makes)
+        self.proxy = QIdentityProxyModel(self)
         self.proxy.setSourceModel(self.model_)
-        self.proxy.setSortRole(SORT_ROLE)
         self.setModel(self.proxy)
         # Conversations expand with our own arrow in the Subject cell (the tree's built-in
         # branch arrows would land in whatever narrow column is first).
@@ -885,21 +948,17 @@ class MessageListView(QTreeView):
         elif node.kind == GROUP:
             (self._collapsed.discard if expanded else self._collapsed.add)(node.key)
 
-    def _walk(self, parent: QModelIndex = QModelIndex()):
-        """Every row (column 0) of the sorted view, depth first."""
-        for r in range(self.proxy.rowCount(parent)):
-            idx = self.proxy.index(r, 0, parent)
-            yield idx
-            yield from self._walk(idx)
+    def _view_index(self, node: Node) -> QModelIndex:
+        return self.proxy.mapFromSource(self.model_.index_of(node))
 
     def _apply_spans(self):
-        """Date headings run across all columns (in compact mode there is only one)."""
-        for r in range(self.proxy.rowCount()):
-            idx = self.proxy.index(r, 0)
-            node = idx.data(NODE_ROLE)
-            self.setFirstColumnSpanned(r, QModelIndex(),
-                                       not self.compact and node is not None
-                                       and node.kind == GROUP)
+        """Date headings run across all columns (in compact mode there is only one). Only
+        headings are touched: the rest are plain rows (a reset clears any span)."""
+        top = self.model_.root.children
+        if not top or top[0].kind != GROUP:
+            return
+        for r in range(len(top)):
+            self.setFirstColumnSpanned(r, QModelIndex(), not self.compact)
 
     def set_messages(self, rows, outgoing: bool) -> None:
         self._rows, self._outgoing = list(rows), outgoing
@@ -914,18 +973,26 @@ class MessageListView(QTreeView):
         scroll = self.verticalScrollBar().value()
         sm = self.selectionModel()
         sm.blockSignals(True)
-        self.model_.set_rows(self._rows, self._outgoing, self.threaded, self._grouping())
+        m = self.model_
+        m.set_rows(self._rows, self._outgoing, self.threaded, self._grouping())
+        # Only the rows that need something: headings (open unless closed), the
+        # conversations you opened, the current and selected rows; not all of them.
         expanded, collapsed = set(self._expanded), set(self._collapsed)
-        for idx in self._walk():
-            node = idx.data(NODE_ROLE)
+        for node in m.root.children:
             if node.kind == GROUP:
-                self.setExpanded(idx, node.key not in collapsed)
-            elif node.kind == THREAD:
-                self.setExpanded(idx, node.key in expanded)
-            if node.key == current:
-                sm.setCurrentIndex(idx, sm.SelectionFlag.NoUpdate)
-            if node.key in keys:
-                sm.select(idx, sm.SelectionFlag.Select | sm.SelectionFlag.Rows)
+                self.setExpanded(self._view_index(node), node.key not in collapsed)
+        for key in expanded:
+            node = m.node_by_key(key)
+            if node is not None and node.kind == THREAD:
+                self.setExpanded(self._view_index(node), True)
+        node = m.node_by_key(current) if current else None
+        if node is not None:
+            sm.setCurrentIndex(self._view_index(node), sm.SelectionFlag.NoUpdate)
+        for key in keys:
+            node = m.node_by_key(key)
+            if node is not None:
+                sm.select(self._view_index(node),
+                          sm.SelectionFlag.Select | sm.SelectionFlag.Rows)
         self._expanded, self._collapsed = expanded, collapsed
         self._apply_spans()
         sm.blockSignals(False)
@@ -969,8 +1036,7 @@ class MessageListView(QTreeView):
     def neighbor_after(self, leaving: set[str]) -> str | None:
         """The message to select once `leaving` is gone from the list: the next one below
         the current row, else the one above."""
-        order = [n.row["id"] for n in (i.data(NODE_ROLE) for i in self._walk())
-                 if n.kind == MESSAGE]
+        order = [n.row["id"] for n in self.model_.walk() if n.kind == MESSAGE]
         cur = self.current_id()
         if cur not in order:
             return None
@@ -980,16 +1046,16 @@ class MessageListView(QTreeView):
         return after[0] if after else (before[-1] if before else None)
 
     def select_id(self, message_id: str) -> None:
-        for idx in self._walk():
-            node = idx.data(NODE_ROLE)
-            if node.kind == MESSAGE and node.row["id"] == message_id:
-                parent = idx.parent()
-                while parent.isValid():  # reveal it inside a closed conversation
-                    self.setExpanded(parent, True)
-                    parent = parent.parent()
-                self.setCurrentIndex(idx)
-                self.scrollTo(idx)
-                return
+        node = self.model_.node_by_key("m:" + message_id)
+        if node is None:
+            return
+        idx = self._view_index(node)
+        parent = idx.parent()
+        while parent.isValid():  # reveal it inside a closed conversation
+            self.setExpanded(parent, True)
+            parent = parent.parent()
+        self.setCurrentIndex(idx)
+        self.scrollTo(idx)
 
     # -- input ------------------------------------------------------------
     def _hit(self, event) -> str | None:

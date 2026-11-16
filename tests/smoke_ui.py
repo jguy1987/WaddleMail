@@ -27,7 +27,7 @@ from waddlemail.mailboxes import MailboxManager  # noqa: E402
 from waddlemail.settings import Settings  # noqa: E402
 from waddlemail.store import Store  # noqa: E402
 from waddlemail.ui.main_window import MainWindow  # noqa: E402
-from waddlemail.ui.message_list import COL, NODE_ROLE  # noqa: E402
+from waddlemail.ui.message_list import COL  # noqa: E402
 from waddlemail.notify import Notifier  # noqa: E402
 import waddlemail.ui.main_window as main_window_module  # noqa: E402
 
@@ -208,7 +208,7 @@ def wait(ms: int):
 
 def nodes():
     """(index, node) for every row of the view, in order."""
-    return [(i, i.data(NODE_ROLE)) for i in view._walk()]
+    return [(view._view_index(n), n) for n in view.model_.walk()]
 
 
 def ids():
@@ -364,6 +364,7 @@ def checks():
     tasks_checks()
     account_checks()
     organize_checks()
+    big_folder_checks()
 
     w.close()
     saved = Settings(str(tmp / "settings.ini"))
@@ -1999,6 +2000,41 @@ def organize_checks():
     check(cv.accounts.isHidden() and page.account_item(
         "jordan@a-very-long-personal-domain-name.example.org") is None,
           "with one account again, no account choices")
+
+
+def big_folder_checks():
+    """A folder of 20,000 messages: the list builds in a moment, headings span the row,
+    sorting and finding a message don't walk the whole view."""
+    import time
+    from PySide6.QtCore import QModelIndex
+    from waddlemail.ui.message_list import MessageListView
+    base = dt.datetime(2026, 11, 15, 12, tzinfo=dt.timezone.utc)
+    rows = [{"id": f"big{i}", "folder_id": "x", "conversation_id": f"c{i // 3}",
+             "subject": f"Report {i}", "sender_name": f"Person {i % 50}", "sender_addr": "",
+             "received": (base - dt.timedelta(minutes=17 * i)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "is_read": i % 4 != 0, "has_attachments": i % 7 == 0, "preview": "",
+             "to_recipients": "[]", "cc_recipients": "[]", "importance": "normal",
+             "flag": "notFlagged", "last_verb": None, "size": i} for i in range(20000)]
+    lv = MessageListView()
+    lv.resize(900, 500)
+    lv.show()
+    for threaded in (False, True):
+        lv.set_options(threaded=threaded, grouped=True)
+        t = time.perf_counter()
+        lv.set_messages(rows, False)
+        app.processEvents()
+        took = time.perf_counter() - t
+        check(took < 3, f"20,000 messages listed in {took:.1f}s (threads {'on' if threaded else 'off'})")
+    check(lv.isFirstColumnSpanned(0, QModelIndex()), "...date headings still span the row")
+    lv.select_id("big19999")
+    check(lv.current_id() == "big19999", "...finding a message (the oldest) is direct")
+    lv.sortByColumn(COL["size"], Qt.SortOrder.AscendingOrder)
+    app.processEvents()
+    first = lv.model_.root.children[0]
+    check(lv.current_id() == "big19999" and first.kind != "group"
+          and (first.row["size"] or 0) <= (lv.model_.root.children[1].row["size"] or 0),
+          "...sorting by another column keeps the selection")
+    lv.deleteLater()
 
 
 def _ink(img, x0: int, x1: int) -> int:

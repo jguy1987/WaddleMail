@@ -102,6 +102,7 @@ class MainWindow(QMainWindow):
         self._current_message: str | None = None  # the one selected message, if exactly one
         self._syncing = False  # one sync/send job at a time
         self._flushing = False  # sending the Outbox
+        self._sync_after: str | None = None  # a sync asked for while one ran ("full"/"folder")
         self._started = False   # the first sync is done (there's an account)
         # Server search for the quick filter: hits per (folder, words), and a generation
         # number so a slow answer to an older query is ignored.
@@ -326,6 +327,7 @@ class MainWindow(QMainWindow):
 
     def _sync_failed(self, _msg: str):
         self._syncing = False
+        self._sync_after = None
 
     # -- startup ------------------------------------------------------
     def _start_initial_sync(self):
@@ -434,7 +436,7 @@ class MainWindow(QMainWindow):
         self.msg_list.clearSelection()
         self._refresh_messages()  # instant, from the local store
         self.msg_list.scrollToTop()
-        self.sync_current()       # then catch up in the background
+        self.sync_current(full=False)  # then this folder catches up in the background
 
     def _favorite_selected(self, fid: str):
         """A favorite opens its folder (the tree shows nothing selected meanwhile)."""
@@ -735,22 +737,31 @@ class MainWindow(QMainWindow):
         self.flush_outbox(everything=True)
         self.sync_current()
 
-    def sync_current(self):
+    def sync_current(self, full: bool = True):
+        """Sync the folder shown. `full` (the timer, Send/Receive, after sending): every
+        account's Inbox and every mailbox's folder list and counts too. Not full (opening a
+        folder): just that folder, so switching folders stays quick in a big mailbox."""
         fid = self._current_folder
         box = self.mailboxes.for_folder(fid) if fid else None
-        if box is None or self._syncing:
+        if box is None:
+            return
+        if self._syncing:  # once this one is done, catch up with where you are now
+            self._sync_after = self._sync_after or (full and "full") or "folder"
             return
         self._syncing = True
 
         max_age_days = self.settings.get("cache/max_age_days")  # read on the UI thread
 
         def job():
+            pending = self.store.pending_count()  # (a change of yours refused: shown undone)
             res = box.sync.sync_folder(fid)
             try:  # sizes come separately (one cheap request, only when some are missing)
                 box.sync.fill_sizes(fid)
             except Exception as exc:
                 log.info("message sizes not fetched: %s", exc)
             new = list(res.new_ids)
+            if not full:
+                return fid, res, new, False, pending != self.store.pending_count()
             # Every account's Inbox too, so new mail is noticed (and announced) wherever
             # you are. Shared mailboxes only get their counts refreshed.
             for other in self.mailboxes.all():
@@ -763,14 +774,14 @@ class MainWindow(QMainWindow):
             self._sync_all_folders()  # refresh unread counts / new folders everywhere
             if max_age_days:
                 self.store.purge_bodies_older_than(max_age_days)
-            return fid, res, new
+            return fid, res, new, True, pending != self.store.pending_count()
 
         self._run(job, self._sync_done, on_failed=self._sync_failed,
-                  activity="Syncing with server…")
+                  activity="Syncing with server…" if full else "Syncing this folder…")
 
     def _sync_done(self, payload):
         self._syncing = False
-        fid, res, new = payload
+        fid, res, new, full, sent_changes = payload
         for box in self.mailboxes.all():  # say it (once) if the server won't give these
             refused = [what for what, why in (("replied/forwarded marks",
                                                box.sync.verbs_refused),
@@ -783,11 +794,18 @@ class MainWindow(QMainWindow):
         self.status.synced()
         self.flush_outbox()  # connected again: what's waiting goes out
         self._notify_new(new)
-        if res.upserted or res.removed:  # new mail may match a search: ask the server again
+        changed = bool(res.upserted or res.removed)
+        if changed:  # new mail may match a search: ask the server again
             self._server_hits = {k: v for k, v in self._server_hits.items() if k[0] != fid}
-        self._populate_folders()
-        if fid == self._current_folder:
-            self._refresh_messages()
+        if full:
+            self._populate_folders()  # (new folders, everyone's counts)
+        else:
+            self._counts_changed()
+        if fid == self._current_folder and (changed or sent_changes):
+            self._refresh_messages()  # (not again for nothing: a big folder takes a moment)
+        later, self._sync_after = self._sync_after, None
+        if later:  # (asked for while this one ran: another folder, or a full sync)
+            self.sync_current(full=later == "full")
 
     def _on_message_selected(self, *_):
         self._update_message_actions()
