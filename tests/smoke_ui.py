@@ -991,7 +991,7 @@ def calendar_checks():
 
     dlg = w._event_editor(row=st.event_row("standup"))
     wait(300)
-    check(dlg.notes.toPlainText() == "Full agenda", "editing loads the full notes")
+    check(dlg.notes.text() == "Full agenda", "editing loads the full notes")
     dlg.title.setText("Daily standup")
     w._save_event(dlg, st.event_row("standup"))
     wait(400)
@@ -1371,8 +1371,9 @@ def attachment_checks():
     wait(500)
     event_items = [i for i, n in atts.added if i.startswith("/me/events/")]
     check(event_items and atts.added[-1][1] == "plan.pdf"
-          and len(server.saved) == saves_before + 2,
-          "event attachment uploaded; the meeting is updated so attendees get it")
+          and len(server.saved) == saves_before + 2 and "attendees" not in server.saved[-2]
+          and list(server.saved[-1]) == ["attendees"],
+          "event attachment uploaded before the attendees are invited (one invitation)")
     eid = event_items[-1].rsplit("/", 1)[1]
     dlg = w._event_editor(row=st.event_row(eid))
     wait(400)
@@ -1448,8 +1449,8 @@ def picture_checks():
 
     # a received message's pictures (cid:) show in the reader and in a reply
     st.put_body("m2", "html", '<p>See <img src="cid:logo@x"></p>', 10 ** 9)
-    graph.GraphClient.inline_images = lambda c, mid, wanted: {"logo@x": ("image/png",
-                                                                         pic.read_bytes())}
+    graph.GraphClient.inline_images = lambda c, item, wanted: {"logo@x": ("image/png",
+                                                                          pic.read_bytes())}
     w._current_message = None
     w._show_in_pane("m2")
     wait(400)
@@ -1464,6 +1465,38 @@ def picture_checks():
     wait(500)
     check(len(atts.inline) == before + 1 and "cid:" in out.updates[-1][1]["body"]["content"],
           "...which sends it along as an inline picture")
+
+    # pictures in an event's notes
+    server = _calendar_server
+    ten = dt.datetime.combine(server.monday + dt.timedelta(days=22), dt.time(10)).astimezone()
+    dlg = w._event_editor(start=ten, end=ten + dt.timedelta(hours=1))
+    dlg.title.setText("Site visit")
+    dlg.notes.edit.textCursor().insertText("Map: ")
+    dlg.notes.insert_picture_file(str(pic))
+    before = len(atts.inline)
+    w._save_event(dlg, None)
+    wait(500)
+    body = server.saved[-1].get("body") or {}
+    check(body.get("contentType") == "html" and "cid:" in body.get("content", "")
+          and "data:image" not in body["content"] and len(atts.inline) == before + 1
+          and atts.added[-1][0].startswith("/me/events/"),
+          "event notes: a picture is saved as an inline attachment the notes link to")
+    eid = atts.added[-1][0].rsplit("/", 1)[1]
+    real_body = graph.GraphClient.event_body
+    graph.GraphClient.event_body = lambda c, e: (
+        "html", '<p>Map: <img src="cid:logo@x"></p>')
+    atts.items[f"/me/events/{eid}"] = [{"id": "e1", "name": "image001.png", "isInline": True}]
+    dlg = w._event_editor(row=st.event_row(eid))
+    wait(400)
+    check("data:image/png" in dlg.notes.html() and dlg.had_pictures,
+          "...opening the event shows the picture")
+    dlg.notes.edit.selectAll()
+    dlg.notes.edit.textCursor().insertText("No map after all")
+    w._save_event(dlg, st.event_row(eid))
+    wait(500)
+    check(atts.items[f"/me/events/{eid}"] == [] and "img" not in server.saved[-1]["body"]["content"],
+          "...and a picture taken out of the notes is removed from the event")
+    graph.GraphClient.event_body = real_body
 
 
 def travel_id():

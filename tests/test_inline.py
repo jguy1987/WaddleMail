@@ -41,7 +41,10 @@ class PictureGraph:
     def get_message_body(self, mid):
         return "html", '<p><img src="cid:a@x"><img src="cid:b@x"></p>'
 
-    def inline_images(self, mid, wanted):
+    def message_path(self, mid):
+        return f"/me/messages/{mid}"
+
+    def inline_images(self, item, wanted):
         self.calls += 1
         return {"a@x": ("image/png", PNG)} if "a@x" in wanted else {}
 
@@ -79,7 +82,7 @@ def test_graph_fetches_inline_pictures():
                                       "contentBytes": base64.b64encode(PNG).decode()})
 
     g = GraphClient(lambda: "t", session=S())
-    found = g.inline_images("M", {"image001.png@01db"})
+    found = g.inline_images(g.message_path("M"), {"image001.png@01db"})
     assert found == {"image001.png@01db": ("image/png", PNG)}
     assert [u.rsplit("/", 1)[1] for u in calls] == ["attachments", "i1"]  # not huge, not pdf
 

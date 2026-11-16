@@ -126,9 +126,13 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   - Event editor: title, attendees (required and optional, completed like To), location,
     start/end or All day, **Teams meeting** (Graph creates it and its join link; offered when
     your account can), **Show as** (Free, Working elsewhere, Tentative, Busy, Out of office),
-    categories, reminder, calendar, private, notes, **attachments** (an existing event's
-    are listed, so you can add or remove). With attendees it is a meeting: Save
-    becomes Send and Exchange sends the invitations; changes send updates.
+    categories, reminder, calendar, private, **attachments** (an existing event's are
+    listed, so you can add or remove), and **notes** with the same formatting bar as mail:
+    pictures can be inserted, pasted, dropped and resized there too (saved as inline
+    attachments, shown again when the event is opened). With attendees it is a meeting: Save
+    becomes Send and Exchange sends the invitations; changes send updates. Attachments and
+    pictures go on first, so the invitation or update carries them: a new meeting is created,
+    given its files, then its attendees are invited.
   - **Scheduling**: everyone's free/busy for the day (getSchedule) in a grid next to the
     meeting; click a time to move the meeting there, or **Find next free time** for the
     first slot (weekdays 8:00-18:00) all attendees are free, optionally avoiding tentative.

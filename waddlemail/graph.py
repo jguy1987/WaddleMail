@@ -577,11 +577,11 @@ class GraphClient:
         return self._request(f"{item}/attachments/{quote(attachment_id, safe='')}/$value",
                              raw=True)
 
-    def inline_images(self, message_id: str, wanted: set[str]) -> dict[str, tuple[str, bytes]]:
-        """The pictures a body links to with cid: (`wanted`, as cid_key()s): {content id:
-        (type, bytes)}. Inline attachments are tried first, then other pictures (some senders
-        don't mark them inline); each is fetched whole, the very large skipped."""
-        item = self.message_path(message_id)
+    def inline_images(self, item: str, wanted: set[str]) -> dict[str, tuple[str, bytes]]:
+        """The pictures the body of `item` (message_path / event_path) links to with cid:
+        (`wanted`, as cid_key()s): {content id: (type, bytes)}. Inline attachments are tried
+        first, then other pictures (some senders don't mark them inline); each is fetched
+        whole, the very large skipped."""
         listed = self.attachments(item)
         candidates = [a for a in listed if a.get("isInline")] + [
             a for a in listed if not a.get("isInline")

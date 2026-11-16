@@ -1,7 +1,8 @@
 """The event editor: an appointment, or a meeting once it has attendees.
 
 Details: title, attendees (required / optional, completed like To), location, start and end
-or all day, Teams meeting, Show as, categories, reminder, calendar, private, notes.
+or all day, Teams meeting, Show as, categories, reminder, calendar, private, attachments,
+notes (formatted, with pictures, like a message).
 Scheduling: everyone's free/busy for the day (Microsoft Graph getSchedule) in a grid; click a
 time to move the meeting there, or "Find next free time" to jump to the first slot all
 attendees are free.
@@ -16,7 +17,7 @@ from PySide6.QtCore import QDate, QRectF, Qt, QTime, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QMenu, QPlainTextEdit, QPushButton, QTabWidget, QTimeEdit,
+    QLabel, QLineEdit, QMenu, QPushButton, QTabWidget, QTimeEdit,
     QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -25,9 +26,12 @@ from ..calendars import (
     find_free_time, make_recurrence, presets,
 )
 from ..contacts import format_address
+from ..inline import extract_inline
 from . import iconset
 from .attachment_bar import AttachmentBar
 from .recipients import RecipientEdit
+from .render import quotable_html
+from .rich_editor import RichEditor
 
 STATUS_COLORS = {"busy": "#4f8cff", "tentative": "#4f8cff", "oof": "#8764b8",
                  "workingElsewhere": "#30c6cc", "unknown": "#a0a0a0"}
@@ -149,11 +153,12 @@ class EventEditor(QDialog):
         self.row = row
         self._schedule, self._me = schedule, me
         self._body_changed = False
+        self.had_pictures = False  # the loaded notes had pictures (saving may remove some)
         self.series, self.tz = series, tz
         self.occurrence = bool(row is not None and not series and row["series_id"])
         self._custom: dict | None = None  # a custom repeat pattern
         self.setWindowTitle("Edit event" if row else "New event")
-        self.resize(720, 620)
+        self.resize(780, 720)
         outer = QVBoxLayout(self)
         self.title = QLineEdit()
         self.title.setPlaceholderText("Add a title")
@@ -250,9 +255,9 @@ class EventEditor(QDialog):
         self.attachments_changed = False  # (only then is anything sent about them)
         self.attachments.changed.connect(lambda: setattr(self, "attachments_changed", True))
         form.addRow("Attachments:", self.attachments)
-        self.notes = QPlainTextEdit()
-        self.notes.setPlaceholderText("Notes, agenda…")
-        self.notes.textChanged.connect(self._notes_edited)
+        self.notes = RichEditor()
+        self.notes.edit.setPlaceholderText("Notes, agenda…")
+        self.notes.edit.textChanged.connect(self._notes_edited)
         form.addRow(self.notes)
         self.tabs.addTab(details, "Details")
 
@@ -352,9 +357,9 @@ class EventEditor(QDialog):
         self.calendar.setCurrentIndex(max(self.calendar.findData(row["calendar_id"]), 0))
         self.calendar.setEnabled(False)  # moving between calendars isn't offered
         self.private.setChecked(row["sensitivity"] == "private")
-        self.notes.blockSignals(True)
-        self.notes.setPlainText(row["preview"] or "")
-        self.notes.blockSignals(False)
+        self.notes.edit.blockSignals(True)
+        self.notes.edit.setPlainText(row["preview"] or "")
+        self.notes.edit.blockSignals(False)
 
     def set_attachments(self, existing: list):
         """The event's attachments as they are on the server (loaded after opening)."""
@@ -362,12 +367,20 @@ class EventEditor(QDialog):
         self.attachments_known = True
         self.attachments_changed = False  # loading them isn't a change
 
-    def set_body(self, text: str):
-        """The full notes, loaded after the dialog opened (unless the user already typed)."""
-        if not self._body_changed:
-            self.notes.blockSignals(True)
-            self.notes.setPlainText(text)
-            self.notes.blockSignals(False)
+    def set_body(self, content_type: str, content: str):
+        """The full notes, loaded after the dialog opened (unless the user already typed);
+        pictures as data: URIs (inline.resolve_cids)."""
+        if self._body_changed:
+            return
+        edit = self.notes.edit
+        edit.blockSignals(True)
+        if content_type == "html":
+            edit.setHtml(quotable_html(content_type, content))
+            self.had_pictures = "data:image" in content
+        else:
+            edit.setPlainText(content)
+        edit.document().clearUndoRedoStacks()
+        edit.blockSignals(False)
 
     def _notes_edited(self):
         self._body_changed = True
@@ -580,10 +593,22 @@ class EventEditor(QDialog):
             required=tuple(req), optional=tuple(opt), teams=self.teams.isChecked(),
             show_as=self.show_as.currentData(), categories=tuple(self.categories()),
             reminder=self.reminder.currentData(),
-            body=self.notes.toPlainText() if (self._body_changed or self.row is None) else None,
+            **self._notes(),
             private=self.private.isChecked(),
             recurrence=None if self.occurrence else self.recurrence(),
             stop_repeating=self.series and self.recurrence() is None, tz=self.tz)
+
+
+    def _notes(self) -> dict:
+        """body, body_html, inline for the draft: HTML (pictures as cid: links), or plain
+        text when there's no formatting to keep. Left out if they weren't touched."""
+        if not (self._body_changed or self.row is None):
+            return {}
+        html = self.notes.html()
+        if not self.notes.text().strip() and "<img" not in html:
+            return {"body": ""}
+        body, inline = extract_inline(html)
+        return {"body": body, "body_html": True, "inline": tuple(inline)}
 
 
 def _next_half_hour() -> dt.datetime:

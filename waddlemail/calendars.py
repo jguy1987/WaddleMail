@@ -211,6 +211,8 @@ class EventDraft:
     categories: tuple = ()
     reminder: int | None = 15
     body: str | None = None       # None: leave the body as it is
+    body_html: bool = False       # body is HTML (with cid: links to `inline`)
+    inline: tuple = ()            # InlineImage: pictures in the body, uploaded after saving
     private: bool = False
     recurrence: dict | None = None  # make_recurrence(...): a series
     stop_repeating: bool = False    # editing a series and choosing "Does not repeat"
@@ -247,7 +249,8 @@ class EventDraft:
             out["isOnlineMeeting"] = True
             out["onlineMeetingProvider"] = "teamsForBusiness"
         if self.body is not None:
-            out["body"] = {"contentType": "text", "content": self.body}
+            out["body"] = {"contentType": "html" if self.body_html else "text",
+                           "content": self.body}
         if self.recurrence:
             rec = json.loads(json.dumps(self.recurrence))  # (a copy)
             rec["range"]["startDate"] = self.start.date().isoformat()

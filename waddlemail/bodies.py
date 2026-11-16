@@ -51,7 +51,8 @@ class BodyService:
         missing = wanted - images.keys()
         if missing and message_id not in self._asked:  # once a session: some never resolve
             try:
-                fetched = self.graph.inline_images(message_id, missing)
+                fetched = self.graph.inline_images(self.graph.message_path(message_id),
+                                                   missing)
             except Exception as exc:  # offline, say: show what we have; try again next time
                 log.info("pictures of %s not fetched: %s", message_id, exc)
             else:

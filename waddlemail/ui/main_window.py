@@ -24,12 +24,11 @@ from ..calendars import event_row as calendar_event_row
 from ..calendars import event_span
 from ..contacts import personal_row, removal_payload, suggestions
 from ..graph import NO_SUBFOLDERS
-from ..inline import cid_refs
+from ..inline import cid_refs, resolve_cids
 from ..mailboxes import MailboxManager
 from ..notify import make_notifier
 from ..settings import Settings
 from ..store import Store
-from ..text import body_text as _plain
 from . import iconset
 from .contacts_view import ContactsView
 from .calendar_view import CalendarPage
@@ -1864,8 +1863,19 @@ class MainWindow(QMainWindow):
                           tz=self._time_zone(), **kwargs)
         if row is not None and box is not None:  # the full notes (the list has a preview)
             event_id = row["id"]
-            self._run(lambda: box.graph.event_body(event_id),
-                      lambda body: dlg.set_body(_plain(*body)))
+
+            def load_body():
+                content_type, content = box.graph.event_body(event_id)
+                wanted = cid_refs(content) if content_type == "html" else set()
+                if wanted:  # its pictures, as data: URIs the editor can show
+                    try:
+                        content = resolve_cids(content, box.graph.inline_images(
+                            box.graph.event_path(event_id), wanted))
+                    except Exception:  # (the notes without pictures, then)
+                        log.exception("pictures of event %s", event_id)
+                return content_type, content
+
+            self._run(load_body, lambda body: dlg.set_body(*body))
             self._run(lambda: [Attachment.from_server(a) for a in box.graph.attachments(
                 box.graph.event_path(event_id)) if not a.get("isInline")],
                 dlg.set_attachments)
@@ -1984,18 +1994,36 @@ class MainWindow(QMainWindow):
         files = dlg.attachments.items()
         known = dlg.attachments_known
         attachments_changed = dlg.attachments_changed
-        notes = dlg.notes.toPlainText()
+        # pictures in the notes: inline attachments (also to remove ones taken out)
+        pictures = draft.body is not None and bool(draft.inline or dlg.had_pictures)
+        extra = attachments_changed or pictures
+
+        def upload(event_id: str):
+            path = box.graph.event_path(event_id)
+            if attachments_changed:  # add the new files, remove the ones taken out
+                reconcile(box.graph, path, files, remove_others=known)
+            if pictures:
+                ours = {i.content_id.lower() for i in draft.inline}
+                reconcile_inline(box.graph, path, list(draft.inline),
+                                 keep_others=bool(cid_refs(draft.body) - ours))
 
         def job():
-            item = box.graph.save_event(fields, row["id"] if row else None, calendar_id)
-            if attachments_changed:  # add the new files, remove the ones taken out
-                changed = reconcile(box.graph, box.graph.event_path(item["id"]), files,
-                                    remove_others=known)
-                if meeting and (changed.uploaded or changed.removed):
-                    # Attendees got the invitation as it was saved; changing the event once
-                    # more sends them an update that carries the attachments.
-                    item = box.graph.save_event({"body": {"contentType": "text",
-                                                          "content": notes}}, item["id"])
+            # Attachments and pictures go on before attendees hear about it, so the one
+            # invitation or update they get has them: an existing event gets them first, a
+            # new meeting is created without attendees, given them, then invited.
+            if row is not None:
+                if extra:
+                    upload(row["id"])
+                item = box.graph.save_event(fields, row["id"])
+            elif meeting and extra:
+                item = box.graph.save_event({k: v for k, v in fields.items()
+                                             if k != "attendees"}, None, calendar_id)
+                upload(item["id"])
+                item = box.graph.save_event({"attendees": fields["attendees"]}, item["id"])
+            else:
+                item = box.graph.save_event(fields, None, calendar_id)
+                if extra:
+                    upload(item["id"])
             if not series:
                 self.store.upsert_event(calendar_event_row(item, box.account_id, calendar_id))
             return item["id"]

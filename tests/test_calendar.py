@@ -61,6 +61,10 @@ def test_drafts_become_graph_events():
     assert (allday["start"]["dateTime"], allday["end"]["dateTime"]) == (
         "2026-12-24T00:00:00", "2026-12-25T00:00:00")  # at least one whole day
     assert allday["isAllDay"] and "body" not in allday
+    rich = EventDraft("Visit", local(2026, 11, 16, 9), local(2026, 11, 16, 10),
+                      body='<p>Map <img src="cid:image-1@waddlemail"></p>', body_html=True,
+                      inline=("picture",)).fields()
+    assert rich["body"]["contentType"] == "html" and "inline" not in rich
 
 
 def test_overlap_columns():
