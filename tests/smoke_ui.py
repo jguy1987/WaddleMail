@@ -1689,6 +1689,12 @@ class FakeToDo:
             self.tasks[tid] = {"id": tid, "_list": lid}
         t = self.tasks[tid]
         t.update({k: v for k, v in fields.items() if k != "linkedResources"})
+        if fields.get("status") == "completed" and t.get("recurrence"):  # To Do: the next one
+            due = dt.date.fromisoformat(t["dueDateTime"]["dateTime"][:10]) + dt.timedelta(7)
+            self.n += 1
+            nxt = dict(t, id=f"n{self.n}", status="notStarted",
+                       dueDateTime={"dateTime": f"{due}T00:00:00", "timeZone": "UTC"})
+            self.tasks[nxt["id"]] = nxt
         return dict(t)
 
 
@@ -1792,6 +1798,33 @@ def tasks_checks():
     w.delete_tasks(["t2"])
     wait(400)
     check(st.task("t2") is None and ("delete", "t2") in todo.sent, "a task can be deleted")
+
+    # repeating: weekly from the due date; completing it brings the next one
+    dlg = w._task_editor(list_id="L1", title="Timesheet")
+    labels = [dlg.repeat.combo.itemText(i) for i in range(dlg.repeat.combo.count())]
+    weekday = dt.date.today().strftime("%A")
+    dlg.repeat.combo.setCurrentIndex(labels.index(f"Weekly on {weekday}"))
+    dlg.repeat._chosen(dlg.repeat.combo.currentIndex())
+    check(dlg.has_due.isChecked(), "choosing a repeat makes the task due (it repeats from it)")
+    w._save_task(dlg, None)
+    wait(500)
+    rec = todo.sent[-1][1].get("recurrence") or {}
+    check(rec.get("pattern", {}).get("daysOfWeek") == [weekday.lower()]
+          and rec["range"]["startDate"] == dt.date.today().isoformat(),
+          "a weekly task is saved with its pattern, from its due date")
+    tid = next(k for k, t in todo.tasks.items() if t.get("title") == "Timesheet")
+    page.reload_tasks()
+    item = next(i for i in page._task_items() if i.data(0, Qt.ItemDataRole.UserRole) == tid)
+    check(item.toolTip(3).startswith("Every week") or item.toolTip(3).startswith("Weekly")
+          or "week" in item.toolTip(3).lower(), "...and shows that it repeats")
+    w.complete_tasks([tid], True)
+    wait(1200)
+    nxt = (dt.date.today() + dt.timedelta(days=7)).isoformat()
+    check(any(r["title"] == "Timesheet" and r["due"] == nxt and r["status"] == "notStarted"
+              for r in st.tasks()), "completing it brings the next one, a week on")
+    dlg = w._task_editor(st.task(tid))
+    check(dlg.repeat.combo.currentText() == f"Weekly on {weekday}",
+          "editing shows its repeat")
     w.show_page("mail")
 
 

@@ -4,6 +4,10 @@ The same tasks as Outlook and the To Do app. Each list is kept in step with a de
 Tasks page groups what's open by when it's due (Overdue, Today, Tomorrow, This week, ...), as
 Outlook 2010's To-Do List did. Due and start dates are days; a reminder is a moment (UTC).
 Mail flagged in Outlook shows up in To Do's "Flagged email" list.
+
+A repeating task has a recurrence (the same patternedRecurrence as events) starting on its
+due date. Completing it makes To Do create the next one, due on the next date of the pattern;
+the completed one stays as it was.
 """
 from __future__ import annotations
 
@@ -148,17 +152,28 @@ class TaskDraft:
     categories: tuple = ()
     body: str = ""
     links: list = field(default_factory=list)  # [(name, web url, external id)]: new tasks
+    recurrence: dict | None = None        # make_recurrence(...) from the due date; needs one
     tz: str = "UTC"                       # your time zone (Windows name), for the dates
 
     def _day(self, day: dt.date | None):
         return {"dateTime": f"{day.isoformat()}T00:00:00", "timeZone": self.tz} if day else None
+
+    def _recurrence(self) -> dict | None:
+        """The pattern, starting on the due date (To Do wants one, and its time zone)."""
+        if not self.recurrence or self.due is None:
+            return None
+        rec = json.loads(json.dumps(self.recurrence))  # (a copy)
+        rec["range"]["startDate"] = self.due.isoformat()
+        rec["range"]["recurrenceTimeZone"] = self.tz
+        return rec
 
     def fields(self, new: bool = False) -> dict:
         out = {"title": self.title, "importance": self.importance, "status": self.status,
                "categories": list(self.categories),
                "body": {"contentType": "text", "content": self.body},
                "dueDateTime": self._day(self.due), "startDateTime": self._day(self.start),
-               "isReminderOn": self.reminder is not None}
+               "isReminderOn": self.reminder is not None,
+               "recurrence": self._recurrence()}
         if self.reminder is not None:
             out["reminderDateTime"] = {"dateTime": utc_iso(self.reminder).rstrip("Z"),
                                        "timeZone": "UTC"}

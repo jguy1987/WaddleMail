@@ -181,9 +181,13 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
     **Overdue tasks are red**, and the rail shows how many there are. Search, Show completed.
   - Type a task in the box at the top and press Enter: it's added due today. Tick one to
     complete it. Right-click: Follow up (Today, Tomorrow, This week, Next week, No date),
-    Mark complete, Open email, Delete (Del). Double-click or Enter opens it.
+    Mark complete, Open email, Delete (Del). Double-click or Enter opens it. A repeating task
+    has a repeat icon by its due date; completing it makes To Do create the next one, which
+    is fetched straight away.
   - The task editor (New > Task, Ctrl+Shift+T): subject, list (moving it to another list
-    works), start and due dates (with the Follow up dates), status (Not started, In progress,
+    works), start and due dates (with the Follow up dates), **Repeat** (as for events: Daily,
+    Every weekday, Weekly, Monthly, Yearly on the due date, or Custom…; it repeats from the
+    due date, so choosing one without a due date makes it due today), status (Not started, In progress,
     Waiting on someone else, Deferred, Completed), priority, **reminder** (8:00 on the due
     date by default), categories, notes.
   - **Create task from message** (Message menu, right-click, the message window's Task
@@ -414,6 +418,5 @@ waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
    device aren't noticed here until they'd fire (Graph's reminderView could tell).
 3. Search across all folders; optional background download of
    bodies so local search covers everything offline.
-4. Tasks: repeating tasks (To Do has them; the editor doesn't set them yet), checklist steps,
-   and a To-Do Bar / daily task list beside the calendar.
+4. Tasks: checklist steps, and a To-Do Bar / daily task list beside the calendar.
 5. Publisher verification of the app registration before sharing with other organizations.

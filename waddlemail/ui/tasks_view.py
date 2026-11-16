@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
+from ..calendars import describe_recurrence
 from ..store import Store
 from ..tasks import GROUPS, QUICK, due_group
 from . import iconset
@@ -217,6 +218,9 @@ class TasksPage(QWidget):
             item.setIcon(2, iconset.load("bell"))
         elif self._has_email(r):
             item.setIcon(2, iconset.load("mail"))
+        if r["recurrence"]:
+            item.setIcon(3, iconset.load("repeat"))
+            item.setToolTip(3, describe_recurrence(json.loads(r["recurrence"])))
         if cats:
             item.setIcon(5, color_icon(colors.get(cats[0], "#a0a0a0")))
         tip = [r["title"] or ""]

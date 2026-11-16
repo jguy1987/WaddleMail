@@ -1,6 +1,7 @@
 """The task editor, as Outlook 2010's task form: subject, list, start and due dates (with the
-quick follow-up dates), status, priority, reminder, categories, notes, and the email a task
-was made from."""
+quick follow-up dates), repeat, status, priority, reminder, categories, notes, and the email
+a task was made from. A repeating task repeats from its due date (choosing a repeat without
+one makes it due today)."""
 from __future__ import annotations
 
 import datetime as dt
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
 from ..tasks import IMPORTANCE, QUICK, STATUS, TaskDraft, quick_due
 from . import iconset
 from .event_editor import color_icon
+from .recurrence_dialog import RepeatPicker
 
 REMINDER_TIME = QTime(8, 0)  # Outlook's: 8:00 on the due date
 
@@ -26,7 +28,8 @@ class TaskEditor(QDialog):
 
     def __init__(self, lists: list, categories: dict[str, str], row=None,
                  list_id: str | None = None, title: str = "", body: str = "",
-                 due: dt.date | None = None, links: list | None = None, parent=None):
+                 due: dt.date | None = None, links: list | None = None, tz: str = "UTC",
+                 parent=None):
         """`lists`: task_lists rows to choose from; `row`: the task to edit (else a new one,
         in `list_id`, filled with `title`, `body`, `due` and `links`: [(name, url, id)])."""
         super().__init__(parent)
@@ -78,6 +81,12 @@ class TaskEditor(QDialog):
         line.addWidget(self.quick)
         line.addStretch()
         form.addRow("Start:", line)
+
+        self.repeat = RepeatPicker(self._repeat_from, tz)
+        self.repeat.changed.connect(self._repeat_chosen)
+        self.due.dateChanged.connect(lambda _: self.repeat.refresh())
+        self.has_due.toggled.connect(self._due_ticked)
+        form.addRow("Repeat:", self.repeat)
 
         self.status, self.importance = QComboBox(), QComboBox()
         for key, label in STATUS:
@@ -180,6 +189,7 @@ class TaskEditor(QDialog):
                 self._category_actions[name].setChecked(True)
         self.notes.setPlainText(row["body"] or "")
         self.links = json.loads(row["links"]) if row["links"] else []
+        self.repeat.load(json.loads(row["recurrence"]) if row["recurrence"] else None)
 
     def show_links(self, links: list):
         """The email the task came from (links: [(name, url, external id)])."""
@@ -197,6 +207,18 @@ class TaskEditor(QDialog):
         self.has_due.setChecked(day is not None)
         if day is not None:
             self.due.setDate(QDate(day.year, day.month, day.day))
+
+    def _repeat_from(self) -> dt.date:
+        return self.due.date().toPython() if self.has_due.isChecked() else dt.date.today()
+
+    def _repeat_chosen(self):
+        if self.repeat.recurrence() and not self.has_due.isChecked():  # (it repeats from it)
+            self.set_due(dt.date.today())
+
+    def _due_ticked(self, on: bool):
+        if not on and self.repeat.recurrence():  # no due date, nothing to repeat from
+            self.repeat.refresh(keep=False)
+        self.repeat.refresh()
 
     def _reminder_ticked(self, on: bool):
         if on:  # Outlook's default: 8:00 on the due date (or today)
@@ -237,4 +259,4 @@ class TaskEditor(QDialog):
             status=self.status.currentData(), categories=tuple(self.categories()),
             body=self.notes.toPlainText(),
             links=[] if self.row is not None else [(n, u, e) for n, u, e in self.links],
-            tz=tz)
+            recurrence=self.repeat.recurrence() if self.has_due.isChecked() else None, tz=tz)

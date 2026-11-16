@@ -1,17 +1,21 @@
-"""Custom repeat pattern: every N days / weeks (on chosen weekdays) / months (on a day, or on
-the Nth weekday) / years, ending never, on a date, or after a number of times."""
+"""Repeating: RepeatPicker, the "Repeat" choice of the event and task editors (Does not repeat,
+Outlook's presets for the day, Custom…), and RecurrenceDialog, the custom pattern: every N
+days / weeks (on chosen weekdays) / months (on a day, or on the Nth weekday) / years, ending
+never, on a date, or after a number of times."""
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Callable
 
-from PySide6.QtCore import QDate
+from PySide6.QtCore import QDate, Signal
+from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFormLayout,
     QHBoxLayout, QLabel, QRadioButton, QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from ..calendars import (
-    MONTHS, ORDINALS, WEEKDAYS, describe_recurrence, make_recurrence, ordinal_of,
+    MONTHS, ORDINALS, WEEKDAYS, describe_recurrence, make_recurrence, ordinal_of, presets,
 )
 
 KINDS = [("daily", "Daily", "day"), ("weekly", "Weekly", "week"),
@@ -225,3 +229,89 @@ class RecurrenceDialog(QDialog):
         end = self.end_date.date().toPython() if self.end_on.isChecked() else None
         count = self.count.value() if self.end_after.isChecked() else None
         return make_recurrence(self.pattern(), self.start, end, count, self.tz)
+
+
+def same_pattern(a: dict, b: dict) -> bool:
+    """Equal repeat patterns, ignoring fields that don't apply (Graph fills them with 0s)."""
+    def norm(p: dict) -> tuple:
+        relative = p.get("type", "").startswith("relative")
+        return (p.get("type"), p.get("interval") or 1,
+                sorted(d.lower() for d in p.get("daysOfWeek") or []),
+                None if relative else (p.get("dayOfMonth") or None),
+                p.get("month") or None, (p.get("index") or "first") if relative else None)
+    return norm(a) == norm(b)
+
+
+class RepeatPicker(QWidget):
+    """"Does not repeat", the presets for the day it starts ("Weekly on Monday", ...), and
+    Custom… (RecurrenceDialog), with a note beside it. `start()` gives the day the pattern
+    starts on: call refresh() when it changes, so the presets follow it."""
+    changed = Signal()
+
+    def __init__(self, start: Callable[[], dt.date], tz: str = "UTC", parent=None):
+        super().__init__(parent)
+        self._start, self.tz = start, tz
+        self._custom: dict | None = None  # a custom pattern
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.combo = QComboBox()
+        self.combo.setMinimumContentsLength(28)
+        self.combo.activated.connect(self._chosen)
+        self.note = QLabel()
+        self.note.setForegroundRole(QPalette.ColorRole.PlaceholderText)
+        lay.addWidget(self.combo)
+        lay.addWidget(self.note, 1)
+        self._index = 0
+        self.refresh(keep=False)
+
+    def refresh(self, keep: bool = True):
+        index = self.combo.currentIndex() if keep else 0
+        self.combo.blockSignals(True)
+        self.combo.clear()
+        self.combo.addItem("Does not repeat")
+        for label, _ in presets(self._start()):
+            self.combo.addItem(label)
+        self.combo.addItem(describe_recurrence(self._custom) if self._custom else "Custom…")
+        self.combo.setCurrentIndex(max(index, 0))
+        self.combo.blockSignals(False)
+        self._index = self.combo.currentIndex()
+
+    def _chosen(self, index: int):
+        if index == self.combo.count() - 1:  # Custom…: open the full pattern editor
+            dlg = RecurrenceDialog(self._start(), self._custom or self.recurrence(), self.tz,
+                                   self)
+            if dlg.exec():
+                self._custom = dlg.recurrence()
+                self.refresh(keep=False)
+                self.combo.setCurrentIndex(self.combo.count() - 1)
+            else:
+                self.combo.setCurrentIndex(self._index)
+        self._index = self.combo.currentIndex()
+        self.changed.emit()
+
+    def load(self, rec: dict | None):
+        """Show a pattern: as a preset if it is one (repeating forever), else as custom."""
+        if not rec:
+            self.refresh(keep=False)
+            return
+        pattern = rec.get("pattern") or {}
+        endless = (rec.get("range") or {}).get("type") == "noEnd"
+        for i, (_, preset) in enumerate(presets(self._start())):
+            if endless and same_pattern(preset, pattern):
+                self.refresh(keep=False)
+                self.combo.setCurrentIndex(i + 1)
+                self._index = i + 1
+                return
+        self._custom = rec
+        self.refresh(keep=False)
+        self.combo.setCurrentIndex(self.combo.count() - 1)
+        self._index = self.combo.count() - 1
+
+    def recurrence(self) -> dict | None:
+        """The chosen pattern (a Graph recurrence starting on start()), or None."""
+        index = self.combo.currentIndex()
+        if index <= 0:
+            return None
+        if index == self.combo.count() - 1:
+            return self._custom
+        return make_recurrence(presets(self._start())[index - 1][1], self._start(), tz=self.tz)

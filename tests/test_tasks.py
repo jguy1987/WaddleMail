@@ -119,3 +119,18 @@ def test_sync_lists_and_tasks(tmp_path):
     assert st.task("t2") is None and len(st.task_lists()) == 1
     made = s.save("L1", TaskDraft("New", links=[("mail", "https://x", "m1")]))
     assert json.loads(st.task(made["id"])["links"])[0][2] == "m1"
+
+
+def test_repeating_tasks_repeat_from_the_due_date():
+    from waddlemail.calendars import make_recurrence
+    weekly = make_recurrence({"type": "weekly", "interval": 1, "daysOfWeek": ["friday"]},
+                             dt.date(2026, 1, 1))
+    d = TaskDraft("Timesheet", due=dt.date(2026, 11, 20), recurrence=weekly,
+                  tz="Eastern Standard Time")
+    rec = d.fields(new=True)["recurrence"]
+    assert rec["pattern"]["daysOfWeek"] == ["friday"]
+    assert rec["range"]["startDate"] == "2026-11-20"
+    assert rec["range"]["recurrenceTimeZone"] == "Eastern Standard Time"
+    assert weekly["range"]["startDate"] == "2026-01-01"  # (the original isn't changed)
+    assert "recurrence" not in TaskDraft("x", recurrence=weekly).fields(new=True)  # no due
+    assert TaskDraft("x", due=dt.date(2026, 11, 20)).fields()["recurrence"] is None  # stops

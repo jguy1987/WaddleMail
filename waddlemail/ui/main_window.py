@@ -2374,7 +2374,7 @@ class MainWindow(QMainWindow):
     def _task_editor(self, row=None, **kwargs) -> TaskEditor:
         """The editor for a task (`row`) or a new one; for an email's task, which email."""
         dlg = TaskEditor(self.store.task_lists(), self.store.category_colors(), row=row,
-                         parent=self, **kwargs)
+                         tz=self._time_zone(), parent=self, **kwargs)
         dlg.openEmailRequested.connect(self.open_task_email)
         if row is None:
             return dlg
@@ -2431,8 +2431,9 @@ class MainWindow(QMainWindow):
                   activity="Saving task…", on_failed=lambda msg: QMessageBox.warning(
                       self, "Tasks", f"The task wasn't added.\n\n{msg}"))
 
-    def _task_changes(self, ids: list[str], fields: dict, local: dict):
-        """Change some tasks: here at once, then on the server (put back if it fails)."""
+    def _task_changes(self, ids: list[str], fields: dict, local: dict, then=None):
+        """Change some tasks: here at once, then on the server (put back if it fails);
+        `then()` after that."""
         rows = [r for r in map(self.store.task, ids) if r is not None]
         for r in rows:
             self.store.update_task(r["id"], **local)
@@ -2448,14 +2449,23 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Tasks", f"The change didn't reach the server.\n\n{msg}")
             self.refresh_tasks()  # (back as the server has it)
 
-        self._run(job, lambda _: self._tasks_changed(), on_failed=failed,
-                  activity="Saving tasks…")
+        def done(_):
+            self._tasks_changed()
+            if then is not None:
+                then()
+
+        self._run(job, done, on_failed=failed, activity="Saving tasks…")
 
     def complete_tasks(self, ids: list[str], done: bool):
+        """Mark complete (or not). Completing a repeating task makes To Do create the next
+        one: it's fetched once the change has gone through."""
         now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         status = "completed" if done else "notStarted"
+        repeating = done and any(r is not None and r["recurrence"]
+                                 for r in map(self.store.task, ids))
         self._task_changes(ids, {"status": status},
-                           {"status": status, "completed": now if done else None})
+                           {"status": status, "completed": now if done else None},
+                           then=self.refresh_tasks if repeating else None)
         self.statusBar().showMessage("Marked complete" if done else "Marked not complete",
                                      3000)
 
