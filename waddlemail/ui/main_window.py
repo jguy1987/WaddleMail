@@ -27,6 +27,7 @@ from ..calendars import event_row as calendar_event_row
 from ..calendars import event_span
 from ..contacts import personal_row, removal_payload, suggestions
 from ..graph import NO_SUBFOLDERS
+from ..invites import Invite, parse_invite
 from ..inline import cid_refs, resolve_cids
 from ..mailboxes import MailboxManager
 from ..notify import make_notifier
@@ -119,6 +120,7 @@ class MainWindow(QMainWindow):
         self.status.clicked.connect(self.sync_current)
         self.statusBar().addPermanentWidget(self.status)
         graph.status_hook = self.status.report
+        self.mailboxes.progress = self.status.progress
 
         # folders
         self.folder_tree = FolderPane(store)
@@ -187,6 +189,10 @@ class MainWindow(QMainWindow):
         self.msg_view = MessageView()
         self._connect_attachments(self.msg_view)
         self._save_dir: str | None = None  # where attachments were last saved
+        # meeting invitations seen this session: message id -> Invite (None: not an invitation)
+        self._invites: dict[str, Invite | None] = {}
+        self._invite_failed = False
+        self._answering: set[str] = set()  # messages whose invitation is being answered
 
         self.content = QSplitter()
         self.content.addWidget(list_box)
@@ -416,6 +422,30 @@ class MainWindow(QMainWindow):
         self.tasks_timer.start()
         self.refresh_tasks()
         self.reminders.start()
+        QTimer.singleShot(3000, self._backfill_meetings)  # (after the first screen is up)
+
+    def _backfill_meetings(self):
+        """Once per folder: mark the stored messages that are meeting messages (mail from
+        before WaddleMail asked for it). A job of its own, so a sync never waits for it."""
+        boxes = list(self.mailboxes.all())
+
+        def job():
+            marked = 0
+            for box in boxes:
+                folders = sorted(self.store.folder_rows(box.id),
+                                 key=lambda f: (f["well_known"] != "inbox", f["name"]))
+                for f in folders:
+                    if not self.store.message_count(f["id"]):
+                        continue
+                    try:
+                        marked += box.sync.backfill_meetings(f["id"])
+                    except Exception as exc:  # offline, say: the next start tries again
+                        log.info("meeting messages in %s not marked: %s", f["name"], exc)
+                        break
+            return marked
+
+        self._run(job, lambda marked: marked and self._refresh_messages(),
+                  activity="Marking meeting messages…")
 
     # -- folders ------------------------------------------------------
     def _populate_folders(self):
@@ -838,6 +868,7 @@ class MainWindow(QMainWindow):
             return
         self.msg_view.show_message(row)
         self._load_attachments(box, row, lambda items: self.msg_view.set_attachments(mid, items))
+        self._load_invite(box, row)
         self._run(lambda: (mid, box.bodies.get(mid)), self._body_ready,
                   on_failed=lambda msg: self._body_failed(mid, msg),
                   activity=None if self.store.has_body(mid) else "Downloading message…")
@@ -881,9 +912,10 @@ class MainWindow(QMainWindow):
         delete.triggered.connect(lambda: self.delete_messages([mid], parent=win) and win.close())
         self._windows.add(win)
         win.destroyed.connect(lambda *_: self._windows.discard(win))
-        self._connect_attachments(win.view)
+        self._connect_attachments(win.view)  # (this connects the invitation's buttons too)
         win.show()
         self._load_attachments(box, row, win.set_attachments)
+        self._load_invite(box, row)
         self._run(lambda: box.bodies.get(mid),
                   lambda body: win.set_body(body.content_type, body.content),
                   activity=None if self.store.has_body(mid) else "Downloading message…",
@@ -894,6 +926,75 @@ class MainWindow(QMainWindow):
     def _connect_attachments(self, view: MessageView):
         view.attachments.open_requested.connect(self.open_attachments)
         view.attachments.save_requested.connect(self.save_attachments)
+        view.invite.respond_requested.connect(self.respond_invite)
+
+    # -- meeting invitations ----------------------------------------------------
+    def _load_invite(self, box, row):
+        """If the message is a meeting invitation, show it with Accept / Tentative / Decline.
+        Asks the server (one request per message viewed; ordinary mail comes back with no
+        event and is remembered as such), and never reports a failure: it's only a bonus."""
+        mid = row["id"]
+        if box.shared or self.outbox_id(mid) is not None:  # (not someone else's calendar)
+            return
+        if mid in self._invites:
+            if self._invites[mid] is None:
+                return
+            self._show_invite(mid, self._invites[mid])  # at once; refreshed below
+
+        def job():
+            try:
+                return parse_invite(box.graph.message_event(mid))
+            except Exception as exc:
+                # (the first is logged where it shows; a mailbox that is offline would repeat)
+                first = not self._invite_failed
+                self._invite_failed = True
+                log.log(logging.INFO if first else logging.DEBUG,
+                        "invitation check of %s failed: %s", mid, exc)
+                return False  # unknown: try again next time
+
+        def done(inv):
+            if inv is not False:
+                self._show_invite(mid, inv)
+
+        self._run(job, done)
+
+    def _show_invite(self, mid: str, inv: Invite | None):
+        self._invites[mid] = inv
+        if inv is not None:  # (for the list's calendar icon: it knows from now on)
+            self.store.set_meeting(mid, "eventMessage" if inv.cancelled
+                                   else "eventMessageRequest")
+        self.msg_view.set_invite(mid, inv)
+        for win in self._windows:
+            if win.message_id == mid:
+                win.set_invite(mid, inv)
+
+    def respond_invite(self, mid: str, event_id: str, response: str):
+        """Accept / tentatively accept / decline the meeting a message invites you to (the
+        organizer is told); then show your answer."""
+        row = self.store.message_row(mid)
+        box = self.mailboxes.for_folder(row["folder_id"]) if row else None
+        old = self._invites.get(mid)
+        if box is None or old is None or mid in self._answering:
+            return  # (an answer already on its way is never sent twice: the organizer is told)
+        self._answering.add(mid)
+        words = {"accept": "Accepted", "tentativelyAccept": "Tentatively accepted",
+                 "decline": "Declined"}
+
+        def job():
+            box.graph.respond_event(event_id, response)
+
+        def done(_):
+            self._answering.discard(mid)
+            self._show_invite(mid, old.answered(response))
+            self.statusBar().showMessage(f"{words[response]}: {old.subject}", 4000)
+            self.refresh_calendar()  # the event is now accepted (or gone, if declined)
+
+        def failed(msg):
+            self._answering.discard(mid)
+            self._show_invite(mid, old)  # buttons back
+            QMessageBox.warning(self, "Meeting", f"Couldn't send the response.\n\n{msg}")
+
+        self._run(job, done, activity="Sending response…", on_failed=failed)
 
     def _load_attachments(self, box, row, show):
         """List a message's attachments (not the pictures in its body) for `show`."""
@@ -2873,6 +2974,7 @@ class MainWindow(QMainWindow):
         self.mailboxes.configure(s.download_days() or 36500,
                                  s.get("cache/max_mb") * 1024 * 1024)
         self.timer.setInterval(s.get("sync/interval_min") * 60_000)
+        self.tray.set_mode(s.get("tray/icon"))
         self.tray.setVisible(s.get("tray/show") and QSystemTrayIcon.isSystemTrayAvailable())
         # With close-to-tray, closing the window mustn't end the program.
         QApplication.instance().setQuitOnLastWindowClosed(not self.close_to_tray())

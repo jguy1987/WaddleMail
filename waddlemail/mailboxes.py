@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Callable
 
 from .auth import Authenticator
 from .bodies import BodyService
@@ -50,6 +51,8 @@ class MailboxManager:
         # Applied to every mailbox, including ones added later (see MainWindow._apply_settings).
         self.initial_days: int | None = None
         self.max_bytes: int | None = None
+        # What the mailboxes' syncs are doing, for the status bar (see SyncEngine.progress).
+        self.progress: Callable[[str], None] | None = None
         self.reload()
 
     def reload(self) -> None:
@@ -64,6 +67,7 @@ class MailboxManager:
         account_id = r["account_id"]
         graph = GraphClient(lambda: self.auth.get_token(account_id), user=r["address"])
         sync = SyncEngine(self.store, graph, r["id"])
+        sync.progress = lambda text: self.progress(text) if self.progress else None
         bodies = BodyService(self.store, graph)
         if self.initial_days is not None:
             sync.initial_days = self.initial_days

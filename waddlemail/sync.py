@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 from dataclasses import dataclass, field
+from typing import Callable
 
 from . import config
 from .graph import VERBS, DeltaResetError, GraphClient, GraphError
@@ -32,6 +33,19 @@ class SyncEngine:
         self.initial_days = initial_days
         self.sizes_refused = ""  # set if the server won't send message sizes
         self.verbs_refused = ""  # ... or replied/forwarded marks
+        # Called (from whatever thread syncs) with what is happening, for the status bar.
+        self.progress: Callable[[str], None] | None = None
+
+    def _say(self, text: str) -> None:
+        if self.progress is not None:
+            try:
+                self.progress(text)
+            except Exception:  # reporting must never stop a sync
+                log.debug("progress hook failed", exc_info=True)
+
+    def _folder_name(self, folder_id: str) -> str:
+        row = self.store.folder_row(folder_id)
+        return row["name"] if row else "folder"
 
     def sync_folders(self) -> None:
         self.store.upsert_folders(self.mailbox_id, self.graph.list_folders())
@@ -90,8 +104,28 @@ class SyncEngine:
             self.store.delete_state(key)
             result = self._run(folder_id, key, None)
         self.store.purge_orphan_bodies()
+        if result.full:
+            # a full sync labelled every message it brought (see store.meeting_kind)
+            self.store.set_state(f"meetings:{folder_id}", "1")
         self._update_verbs(folder_id, result)
         return result
+
+    # -- meeting messages ----------------------------------------------------------
+    def backfill_meetings(self, folder_id: str) -> int:
+        """Learn which of the folder's stored messages are meeting messages (mail that
+        arrived before WaddleMail knew to ask). Once per folder: ids and types only, 500 to
+        a request. Returns how many were marked."""
+        key = f"meetings:{folder_id}"
+        if self.store.get_state(key) is not None:
+            return 0
+        marked, seen = 0, 0
+        name = self._folder_name(folder_id)
+        for page in self.graph.message_types(folder_id):
+            seen += 500
+            marked += self.store.set_meetings(page)
+            self._say(f"Marking meeting messages in {name}… ({seen:,})")
+        self.store.set_state(key, "1")
+        return marked
 
     # -- replied / forwarded ---------------------------------------------------------
     def _update_verbs(self, folder_id: str, result: SyncResult) -> None:
@@ -101,6 +135,7 @@ class SyncEngine:
         key = f"verbs:{folder_id}"
         try:
             if result.full or self.store.get_state(key) is None:
+                self._say(f"Checking replied and forwarded mail in {self._folder_name(folder_id)}…")
                 self.backfill_verbs(folder_id)
                 self.store.set_state(key, "1")
             elif result.changed_ids:
@@ -172,7 +207,10 @@ class SyncEngine:
         result = SyncResult(full=full)
         seen: set[str] = set()
         final_link: str | None = None
+        name = self._folder_name(folder_id) if full else ""
         for items, delta_link in self.graph.messages_delta(folder_id, link, since):
+            if full:  # a first sync of a big folder takes a while: say how far it is
+                self._say(f"Syncing {name}… {result.upserted + len(items):,} messages")
             up, rm = self.store.apply_message_changes(
                 folder_id, items, None if full else result.new_ids,
                 None if full else result.changed_ids)
