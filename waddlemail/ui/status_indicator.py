@@ -74,6 +74,7 @@ class _Spinner(QWidget):
 class StatusIndicator(QWidget):
     clicked = Signal()
     _reported = Signal(str, str)  # from any thread -> UI thread
+    _progressed = Signal(str)
 
     def __init__(self, pending_count: Callable[[], int], parent=None):
         super().__init__(parent)
@@ -81,6 +82,7 @@ class StatusIndicator(QWidget):
         self.state, self.detail = CONNECTING, ""
         self.last_sync: dt.datetime | None = None
         self._activities: dict[int, str] = {}
+        self._progress = ""  # how far the running job is ("Syncing Inbox… 1,200 messages")
         self._next = 0
         lay = QHBoxLayout(self)
         lay.setContentsMargins(6, 0, 6, 0)
@@ -90,12 +92,23 @@ class StatusIndicator(QWidget):
             lay.addWidget(w)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._reported.connect(self._set_connection)
+        self._progressed.connect(self._set_progress)
         self.refresh()
 
     # -- inputs ---------------------------------------------------------------
     def report(self, state: str, detail: str = "") -> None:
         """graph.status_hook: safe to call from worker threads."""
         self._reported.emit(state, detail)
+
+    def progress(self, text: str) -> None:
+        """What the running job is doing, in more detail than its name ("Connecting…" is
+        often a first sync of a big folder): safe to call from worker threads."""
+        self._progressed.emit(text)
+
+    def _set_progress(self, text: str) -> None:
+        if self._activities:  # (a late report from a job that has just ended is dropped)
+            self._progress = text
+            self.refresh()
 
     def begin(self, label: str) -> int:
         """Something started ("Syncing with server…"); returns a token for end()."""
@@ -106,6 +119,7 @@ class StatusIndicator(QWidget):
 
     def end(self, token: int) -> None:
         self._activities.pop(token, None)
+        self._progress = ""  # (the next report names what is still running)
         self.refresh()
 
     def synced(self) -> None:
@@ -124,7 +138,7 @@ class StatusIndicator(QWidget):
     # -- display ----------------------------------------------------------------
     def text(self) -> str:
         if self._activities:
-            return list(self._activities.values())[-1]
+            return self._progress or list(self._activities.values())[-1]
         pending = self._pending_count()
         waiting = (f"{pending} change{'s' if pending != 1 else ''} waiting" if pending else "")
         if self.state == graph.OFFLINE:

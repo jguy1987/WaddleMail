@@ -68,6 +68,16 @@ CALENDAR_FIELDS = ("id,name,hexColor,color,isDefaultCalendar,canEdit,"
 PROP_LAST_VERB = "Integer 0x1081"
 PROP_SIZE = "Integer 0x0E08"
 VERBS = (102, 103, 104)
+
+
+def meeting_kind(odata_type: str | None) -> str | None:
+    """'#microsoft.graph.eventMessageRequest' -> 'eventMessageRequest': Graph marks a meeting
+    invitation, cancellation or response as an event message (a plain message has no such
+    type). None for anything else."""
+    name = (odata_type or "").rsplit(".", 1)[-1]
+    return name if name.startswith("eventMessage") else None
+
+
 # Delta cursors remember the query they were made with: when it changes, they are made again.
 DELTA_QUERY_VERSION = "2"  # 2: reply state with a single "id eq" filter
 
@@ -313,6 +323,13 @@ class GraphClient:
                              params={"$select": EVENT_FIELDS + ",recurrence"},
                              headers=_prefer('outlook.timezone="UTC"'))
 
+    def message_event(self, message_id: str) -> dict:
+        """The message with the calendar event it is about expanded into "event" (present for
+        a meeting invitation or cancellation; an ordinary message has none)."""
+        return self._request(f"{self._root}/messages/{quote(message_id, safe='')}",
+                             params={"$expand": "microsoft.graph.eventMessage/event"},
+                             headers=_prefer('outlook.timezone="UTC"'))
+
     def dismiss_reminder(self, event_id: str) -> None:
         self._request(f"{self._root}/events/{quote(event_id, safe='')}/dismissReminder",
                       method="POST")
@@ -346,8 +363,11 @@ class GraphClient:
 
     def respond_event(self, event_id: str, response: str, comment: str = "") -> None:
         """`response`: accept / tentativelyAccept / decline (the organizer is told)."""
+        # once: an answer is mail to the organizer, so a retry after an unclear failure (a
+        # timeout, a server error) must not send it again
         self._request(f"{self._root}/events/{quote(event_id, safe='')}/{response}",
-                      method="POST", json={"comment": comment, "sendResponse": True})
+                      method="POST", json={"comment": comment, "sendResponse": True},
+                      once=True)
 
     def schedule(self, addresses: list[str], start: str, end: str,
                  interval: int = 30) -> list[dict]:
@@ -505,6 +525,18 @@ class GraphClient:
             if not nxt:
                 return
             url, params = nxt, None
+
+    def message_types(self, folder_id: str) -> Iterator[dict[str, str]]:
+        """{message id: type} of the folder's meeting messages, a page (500 messages) at a
+        time. Asks for ids only: Graph still labels the event messages (see meeting_kind), so
+        this is the cheap way to learn which stored messages are invitations."""
+        url = f"{self._root}/mailFolders/{quote(folder_id, safe='')}/messages"
+        params = {"$select": "id", "$top": 500}
+        while url:
+            data = self._request(url, params=params, headers=_prefer())
+            yield {m["id"]: kind for m in data.get("value", [])
+                   if (kind := meeting_kind(m.get("@odata.type")))}
+            url, params = data.get("@odata.nextLink"), None
 
     def messages_with_verb(self, folder_id: str, verb: int) -> list[str]:
         """Ids of the folder's messages last replied (102) / replied to all (103) /

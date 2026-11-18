@@ -53,12 +53,15 @@ def load(name: str) -> QIcon:
 
 
 @cache
-def load_colored(name: str, color: str) -> QIcon:
-    """An icon in a fixed colour (`color` like "#d64545") rather than the text colour."""
+def load_colored(name: str, color: str, stroke: str | None = None) -> QIcon:
+    """An icon in a fixed colour (`color` like "#d64545") rather than the text colour;
+    `stroke` (such as "3") draws it with a heavier line than the usual 2."""
     path = ICON_DIR / f"{name}.svg"
     if not path.exists():
         return QIcon()
     svg = path.read_text(encoding="utf-8")
+    if stroke:
+        svg = svg.replace('stroke-width="2"', f'stroke-width="{stroke}"')
     selected = QApplication.palette().color(QPalette.ColorGroup.Active,
                                             QPalette.ColorRole.HighlightedText)
     icon = QIcon()

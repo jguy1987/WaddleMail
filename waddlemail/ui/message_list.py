@@ -44,6 +44,18 @@ OUTGOING = {"sentitems", "drafts", "outbox"}
 
 VERB_REPLIED, VERB_REPLIED_ALL, VERB_FORWARDED = 102, 103, 104
 GROUP, THREAD, MESSAGE = "group", "thread", "message"
+# Graph's event message types (store.meeting_kind), as the tooltip names them
+MEETING_KINDS = {"eventMessageRequest": "Meeting invitation",
+                 "eventMessage": "Meeting message",
+                 "eventMessageResponse": "Meeting response"}
+
+
+def _meeting(r) -> str | None:
+    """The row's meeting message type, or None (also for rows that have no such field)."""
+    try:
+        return r["meeting"]
+    except (KeyError, IndexError):
+        return None
 
 
 @dataclass(frozen=True)
@@ -205,6 +217,7 @@ def _summary(msgs: list[dict], outgoing: bool) -> dict:
         "sender_name": newest["sender_name"], "sender_addr": newest["sender_addr"],
         "to_recipients": newest["to_recipients"], "preview": newest["preview"],
         "received": newest["received"], "last_verb": newest["last_verb"],
+        "meeting": next((k for k in map(_meeting, msgs) if k), None),
         "is_read": int(all(m["is_read"] for m in msgs)),
         "unread_count": sum(1 for m in msgs if not m["is_read"]),
         "has_attachments": int(any(m["has_attachments"] for m in msgs)),
@@ -232,6 +245,12 @@ class MessageModel(QAbstractItemModel):
             VERB_FORWARDED: iconset.load("forward"), "attach": iconset.load("paperclip"),
             "flagged": iconset.load_colored("flag", "#d64545"),
             "complete": iconset.load_colored("check", "#2f9e44"),
+            # the message column: an envelope for mail, a calendar for meeting messages;
+            # heavy and in the accent colour when unread, light and dim once read
+            ("mail", False): iconset.load_colored("mail", self._dim.name()),
+            ("mail", True): iconset.load_colored("mail", self._accent.name(), "3"),
+            ("meeting", False): iconset.load_colored("calendar", self._dim.name()),
+            ("meeting", True): iconset.load_colored("calendar", self._accent.name(), "3"),
         }
         self._bold = QFont()
         self._bold.setBold(True)
@@ -470,9 +489,12 @@ class MessageModel(QAbstractItemModel):
             return {"high": "!", "low": "↓"}.get(r["importance"] or "", "")
         return None
 
+    def message_icon(self, r) -> QIcon:
+        return self._icons[("meeting" if _meeting(r) else "mail", not r["is_read"])]
+
     def _icon(self, r, key):
         if key == "read":
-            return self._icons["read" if r["is_read"] else "unread"]
+            return self.message_icon(r)
         if key == "status":
             return self._icons.get(r["last_verb"])
         if key == "attach" and r["has_attachments"]:
@@ -501,7 +523,9 @@ class MessageModel(QAbstractItemModel):
     @staticmethod
     def _tip(r, key):
         if key == "read":
-            return ("Read" if r["is_read"] else "Unread") + " (click or press M to toggle)"
+            what = MEETING_KINDS.get(_meeting(r) or "", "")
+            return (f"{what}: " if what else "") + ("Read" if r["is_read"] else "Unread") + \
+                " (click or press M to toggle)"
         if key == "flag":
             return {"flagged": "Flagged", "complete": "Completed"}.get(
                 r["flag"] or "", "Not flagged") + " (click or press S to toggle)"
@@ -681,7 +705,11 @@ class CompactDelegate(QStyledItemDelegate):
         bottom = top.translated(0, line_h)
         painter.save()
 
-        if unread:  # the dot, vertically centred on the first line
+        if _meeting(r):  # a meeting message: a calendar where the dot goes
+            self.model.message_icon(r).paint(
+                painter, QRect(rect.left() + self.PAD - 2, top.center().y() - 7, 14, 14),
+                Qt.AlignmentFlag.AlignCenter, mode)
+        elif unread:  # the dot, vertically centred on the first line
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(accent)

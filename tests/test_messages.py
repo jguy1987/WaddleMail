@@ -378,3 +378,109 @@ def test_reply_marks_never_fail_the_sync(tmp_path):
     eng = SyncEngine(st, Broken([([msg("m1")], "L1")]), "a")
     assert eng.sync_folder("F").upserted == 1 and eng.verbs_refused
     assert st.get_state("verbs:F") is None  # tried again next time
+
+
+def test_meeting_messages_are_marked_by_graphs_type(tmp_path):
+    from waddlemail.store import meeting_kind
+    assert meeting_kind("#microsoft.graph.eventMessageRequest") == "eventMessageRequest"
+    assert meeting_kind("#microsoft.graph.eventMessage") == "eventMessage"
+    assert meeting_kind("#microsoft.graph.eventMessageResponse") == "eventMessageResponse"
+    assert meeting_kind("#microsoft.graph.message") is None and meeting_kind(None) is None
+    st = make_store(tmp_path, msg("m1", **{"@odata.type": "#microsoft.graph.eventMessageRequest"}),
+                    msg("m2"))
+    assert st.message_row("m1")["meeting"] == "eventMessageRequest"
+    assert st.message_row("m2")["meeting"] is None
+    st.apply_message_changes("F", [{"id": "m1", "isRead": True}])  # a later partial update
+    assert st.message_row("m1")["meeting"] == "eventMessageRequest"
+    st.set_meeting("m2", "eventMessage")  # learned by opening it
+    assert st.message_row("m2")["meeting"] == "eventMessage"
+
+
+def test_adding_the_meeting_column_keeps_the_sync_cursors(tmp_path):
+    """An upgrade that only adds a column must not make everything download again."""
+    import sqlite3
+    st = make_store(tmp_path, msg("m1"), msg("m2"))
+    st.set_state("delta:F", "CURSOR")
+    st.set_state("window:F", "2026-05-01T00:00:00Z")
+    st.conn.commit()
+    st.conn.close()
+    raw = sqlite3.connect(tmp_path / "m.db")
+    try:
+        raw.execute("ALTER TABLE messages DROP COLUMN meeting")  # a database from before
+    except sqlite3.OperationalError:
+        import pytest
+        pytest.skip("this SQLite can't drop a column")
+    raw.commit()
+    raw.close()
+    st2 = Store(tmp_path / "m.db")
+    assert "meeting" in {r["name"] for r in st2.conn.execute("PRAGMA table_info(messages)")}
+    assert st2.get_state("delta:F") == "CURSOR" and st2.get_state("window:F")  # kept
+    assert st2.message_row("m1")["meeting"] is None
+
+
+class TypesGraph:
+    """message_types replays fixed pages."""
+
+    def __init__(self, *pages):
+        self.pages, self.asked = pages, 0
+
+    def message_types(self, folder_id):
+        self.asked += 1
+        yield from self.pages
+
+
+def test_meeting_messages_are_learned_once_per_folder(tmp_path):
+    st = make_store(tmp_path, msg("m1"), msg("m2"), msg("m3"))
+    said = []
+    g = TypesGraph({"m1": "eventMessageRequest"}, {"m3": "eventMessage", "gone": "eventMessage"})
+    eng = SyncEngine(st, g, "a")
+    eng.progress = said.append
+    assert eng.backfill_meetings("F") == 2  # ("gone" isn't stored: nothing to mark)
+    assert [st.message_row(m)["meeting"] for m in ("m1", "m2", "m3")] == [
+        "eventMessageRequest", None, "eventMessage"]
+    assert said and "Inbox" in said[-1]
+    assert eng.backfill_meetings("F") == 0 and g.asked == 1  # not asked again
+
+
+def test_a_full_sync_already_knows_the_types(tmp_path):
+    st = make_store(tmp_path)
+    g = PagesGraph([([msg("m1", **{"@odata.type": "#microsoft.graph.eventMessageRequest"})],
+                     "L1")])
+    eng = SyncEngine(st, g, "a")
+    eng.sync_folder("F")
+    assert st.message_row("m1")["meeting"] == "eventMessageRequest"
+    assert eng.backfill_meetings("F") == 0  # (no graph.message_types: it never asks)
+
+
+def test_a_sync_says_how_far_it_has_got(tmp_path):
+    st = make_store(tmp_path)
+    g = PagesGraph([([msg("m1"), msg("m2")], None), ([msg("m3")], "L1")])
+    eng = SyncEngine(st, g, "a")
+    said = []
+    eng.progress = said.append
+    eng.sync_folder("F")
+    assert said[0] == "Syncing Inbox… 2 messages" and said[1] == "Syncing Inbox… 3 messages"
+    eng.progress = lambda text: 1 / 0  # a broken status bar never stops a sync
+    eng.sync_folder("F")
+
+
+def test_message_types_asks_for_ids_only_and_keeps_the_meeting_ones():
+    from tests.test_mailboxes import FakeResponse
+
+    class S:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, method, url, params=None, **kw):
+            self.calls.append((url.split("v1.0")[1], params))
+            if len(self.calls) == 1:
+                return FakeResponse(200, {"value": [
+                    {"id": "a", "@odata.type": "#microsoft.graph.eventMessageRequest"},
+                    {"id": "b"}], "@odata.nextLink": "https://graph.microsoft.com/v1.0/next"})
+            return FakeResponse(200, {"value": [
+                {"id": "c", "@odata.type": "#microsoft.graph.eventMessage"}]})
+
+    s = S()
+    pages = list(GraphClient(lambda: "t", session=s).message_types("F"))
+    assert pages == [{"a": "eventMessageRequest"}, {"c": "eventMessage"}]
+    assert s.calls[0] == ("/me/mailFolders/F/messages", {"$select": "id", "$top": 500})

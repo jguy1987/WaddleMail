@@ -153,6 +153,14 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
   - Preferences > Compose: write new mail in HTML or plain text; default font, size and
     colour (a font that isn't installed, such as Calibri on Linux, is shown as its stand-in
     but mail keeps naming it).
+- **Meeting invitations**: a message that invites you to a meeting shows a card above its text
+  with the time, place, who invited you and your answer, and **Accept**, **Tentative** and
+  **Decline** buttons (the organizer is told; the meeting appears on, or leaves, your
+  calendar). You can change your answer later. An update to a meeting says what changed
+  (the time or place it had before); a cancelled meeting says so. Not shown for shared
+  mailboxes or meetings you organized. In the message list, the first column shows an
+  envelope for mail and a calendar for meeting messages, heavy and blue while unread, light
+  once read (compact rows put the calendar where the unread dot goes).
 - **Calendar** (the rail, or Ctrl+2):
   - Day, Work week, Week and Month views; Today and back/forward; a mini month and your
     calendars (tick to show/hide) on the left; the selected event's details on the right.
@@ -270,7 +278,9 @@ A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
     Clicking one opens the message. On Linux they go through the freedesktop notification
     service (KDE, GNOME, ...) with the app icon, a sound and, on KDE, the mailbox name; on
     Windows/macOS through the tray icon. Every account's Inbox is checked on each sync.
-  - **Tray icon**: the penguin in the panel's colour, with a red dot while there is unread
+  - **Tray icon**: the penguin, light on a dark theme and dark on a light one (it changes
+    when you switch theme; Preferences > General > Tray icon can force light or dark, or hand
+    the choice to the desktop's icon theme), with a red dot while there is unread
     Inbox mail; left-click shows or hides the window; menu: Open, Check for new mail, Quit.
     Optionally keep running in the tray when the window is closed (Preferences > General).
   - **Unread badge** on the task manager icon (KDE Plasma, and docks that support the Unity
@@ -380,6 +390,7 @@ waddlemail/notify.py       desktop notifications and the task manager unread bad
 waddlemail/contacts.py     contacts/directory/contact group sync, To/Cc suggestions
 waddlemail/tasks.py        Microsoft To Do: lists and tasks, due groups, follow-up dates, sync
 waddlemail/calendars.py    calendars, events, categories, free/busy, layout and free-time search
+waddlemail/invites.py      meeting invitations in the mailbox: reading them, your answer
 waddlemail/compose.py      replies: recipients, subjects, quoted header; the message to send
 waddlemail/outbox.py       sending (directly or through a draft), and the Outbox
 waddlemail/attachments.py  attachments being written (reconcile an item's with the list); safe names to save

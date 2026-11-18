@@ -21,6 +21,7 @@ DEFAULTS = {
     "notify/new_mail": True,       # desktop notification when mail arrives in an Inbox
     "tray/show": True,             # icon in the system tray / status area
     "tray/close_to_tray": False,   # closing the window keeps WaddleMail running in the tray
+    "tray/icon": "auto",           # its colour: auto (follow the theme) / light / dark / system
     "view/splash": True,           # splash screen while starting
     "reminders/enabled": True,     # event reminders (window + notification)
     "compose/html": True,          # write new mail in HTML (else plain text)

@@ -13,11 +13,12 @@ from PySide6.QtGui import QAction, QDesktopServices, QFont, QKeySequence, QPalet
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
-    QAbstractItemView, QFrame, QLabel, QListWidget, QListWidgetItem, QMainWindow, QMenu,
-    QToolBar, QVBoxLayout, QWidget,
+    QAbstractItemView, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
+    QMenu, QPushButton, QToolBar, QVBoxLayout, QWidget,
 )
 
 from ..attachments import human_size
+from ..invites import Invite
 from ..store import recipients
 from . import iconset
 from .render import placeholder, render_body
@@ -166,6 +167,113 @@ class AttachmentStrip(QListWidget):
         menu.exec(self.viewport().mapToGlobal(pos))
 
 
+def _time_text(t: dt.datetime) -> str:
+    return QLocale.system().toString(QTime(t.hour, t.minute), QLocale.FormatType.ShortFormat)
+
+
+def _day_text(t: dt.datetime) -> str:
+    return QLocale.system().toString(QDate(t.year, t.month, t.day),
+                                     QLocale.FormatType.LongFormat)
+
+
+def span_text(start: dt.datetime, end: dt.datetime, all_day: bool = False) -> str:
+    """'Thu, Nov 19, 2026  3:00 PM - 4:00 PM' (all-day: the day or days)."""
+    if all_day:
+        last = end - dt.timedelta(days=1)
+        return _day_text(start) + ("" if last.date() <= start.date()
+                                   else f" - {_day_text(last)}")
+    if start.date() == end.date():
+        return f"{_day_text(start)}   {_time_text(start)} - {_time_text(end)}"
+    return f"{_day_text(start)} {_time_text(start)} - {_day_text(end)} {_time_text(end)}"
+
+
+def when_text(inv: Invite) -> str:
+    return span_text(inv.start, inv.end, inv.all_day)
+
+
+def changes_text(inv: Invite) -> str:
+    """What an update changed ('Time changed. Was: ...'), one per line; empty for a new invite."""
+    out = []
+    if inv.time_changed:
+        out.append("Time changed. Was: " + span_text(inv.was_start, inv.was_end or inv.was_start,
+                                                     inv.all_day))
+    if inv.location_changed:
+        out.append(f"Location changed. Was: {inv.was_location or 'none'}")
+    return "\n".join(out)
+
+
+class InviteBar(QFrame):
+    """What a meeting invitation says (when, where, who, your answer) with Accept, Tentative
+    and Decline. The owner answers: respond_requested carries the message id, the event id and
+    the response (accept / tentativelyAccept / decline)."""
+    respond_requested = Signal(str, str, str)
+
+    BUTTONS = (("accept", "Accept", "check", "accepted"),
+               ("tentativelyAccept", "Tentative", "circle-help", "tentativelyAccepted"),
+               ("decline", "Decline", "x", "declined"))
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(3)
+        self.when = QLabel()
+        font = QFont(self.font())
+        font.setBold(True)
+        self.when.setFont(font)
+        self.where = QLabel()
+        self.changes = QLabel()  # what an update changed
+        self.changes.setForegroundRole(QPalette.ColorRole.PlaceholderText)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        for w in (self.when, self.changes, self.where, self.status):
+            w.setTextFormat(Qt.TextFormat.PlainText)  # (the texts come from the server)
+            w.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            lay.addWidget(w)
+        row = QHBoxLayout()
+        self.buttons: dict[str, QPushButton] = {}
+        for response, text, icon, _answered in self.BUTTONS:
+            b = QPushButton(iconset.load(icon), text)
+            b.clicked.connect(lambda _=False, r=response: self._clicked(r))
+            row.addWidget(b)
+            self.buttons[response] = b
+        row.addStretch(1)
+        self.buttons_row = row
+        lay.addLayout(row)
+        self.message_id: str | None = None
+        self.invite: Invite | None = None
+        self.hide()
+
+    def show_invite(self, message_id: str, inv: Invite) -> None:
+        self.message_id, self.invite = message_id, inv
+        self.when.setText(when_text(inv))
+        changes = changes_text(inv)
+        self.changes.setText(changes)
+        self.changes.setVisible(bool(changes))
+        self.where.setText(inv.location)
+        self.where.setVisible(bool(inv.location))
+        self.status.setText(inv.status_text())
+        for response, _text, _icon, answered in self.BUTTONS:
+            b = self.buttons[response]
+            b.setVisible(inv.can_respond)
+            b.setEnabled(inv.response != answered)  # (you can change your answer)
+        self.show()
+
+    def set_busy(self, busy: bool) -> None:
+        for b in self.buttons.values():
+            b.setEnabled(not busy and self.invite is not None)
+
+    def forget(self) -> None:
+        self.message_id = self.invite = None
+        self.hide()
+
+    def _clicked(self, response: str) -> None:
+        if self.message_id and self.invite:
+            self.set_busy(True)  # until the answer is in (show_invite then sets them again)
+            self.respond_requested.emit(self.message_id, self.invite.event_id, response)
+
+
 class MessageView(QWidget):
     """Header + body. The owner loads the body and hands it over with set_body()."""
 
@@ -175,6 +283,8 @@ class MessageView(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         self.header = MessageHeader()
+        self.invite = InviteBar()
+        self.header.layout().addWidget(self.invite)
         self.attachments = AttachmentStrip()
         self.header.layout().addWidget(self.attachments)
         line = QFrame()
@@ -193,6 +303,7 @@ class MessageView(QWidget):
         self.message_id = None
         self._body = None
         self.attachments.forget()
+        self.invite.forget()
         self.header.hide()
         self._line.hide()
         self.reader.setHtml(placeholder(text))
@@ -202,6 +313,7 @@ class MessageView(QWidget):
         self.message_id = row["id"]
         self._body = None
         self.attachments.forget()
+        self.invite.forget()
         self.header.show_message(row)
         self.header.show()
         self._line.show()
@@ -214,6 +326,10 @@ class MessageView(QWidget):
     def set_attachments(self, message_id: str, items: list[dict]) -> None:
         if message_id == self.message_id:  # (not if the user has moved on)
             self.attachments.show_attachments(message_id, items)
+
+    def set_invite(self, message_id: str, inv: Invite | None) -> None:
+        if message_id == self.message_id and inv is not None:
+            self.invite.show_invite(message_id, inv)
 
     def rerender(self, remote_images: bool) -> None:
         if self._body:
@@ -292,6 +408,10 @@ class MessageWindow(QMainWindow):
     def set_attachments(self, items: list[dict]) -> None:
         if not self.closed:
             self.view.set_attachments(self.view.message_id, items)
+
+    def set_invite(self, message_id: str, inv: Invite | None) -> None:
+        if not self.closed:
+            self.view.set_invite(message_id, inv)
 
     def set_body(self, content_type: str, content: str) -> None:
         if not self.closed:

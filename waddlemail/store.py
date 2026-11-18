@@ -9,7 +9,7 @@ import time
 from email.utils import parseaddr
 from pathlib import Path
 
-from .graph import DELTA_QUERY_VERSION, PROP_LAST_VERB, PROP_SIZE
+from .graph import DELTA_QUERY_VERSION, PROP_LAST_VERB, PROP_SIZE, meeting_kind
 from .text import body_text
 
 SCHEMA = """
@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS messages(
     importance TEXT,                -- low / normal / high
     flag TEXT,                      -- notFlagged / flagged / complete
     last_verb INTEGER,              -- 102 replied, 103 replied all, 104 forwarded
-    size INTEGER
+    size INTEGER,
+    meeting TEXT                    -- eventMessageRequest / eventMessage / eventMessageResponse
 );
 CREATE INDEX IF NOT EXISTS idx_messages_folder_received
     ON messages(folder_id, received DESC);
@@ -245,10 +246,10 @@ _NEW_MESSAGE_COLUMNS = {
 _UPSERT_MESSAGE = """
 INSERT INTO messages(id, folder_id, conversation_id, subject, sender_name, sender_addr,
                      received, is_read, has_attachments, preview, to_recipients, cc_recipients,
-                     importance, flag, last_verb, size)
+                     importance, flag, last_verb, size, meeting)
 VALUES(:id, :folder_id, :conversation_id, :subject, :sender_name, :sender_addr,
        :received, COALESCE(:is_read, 0), COALESCE(:has_attachments, 0), :preview,
-       :to_recipients, :cc_recipients, :importance, :flag, :last_verb, :size)
+       :to_recipients, :cc_recipients, :importance, :flag, :last_verb, :size, :meeting)
 ON CONFLICT(id) DO UPDATE SET
     folder_id       = CASE WHEN EXISTS(SELECT 1 FROM pending p
                                        WHERE p.message_id = :id AND p.field = 'move')
@@ -271,7 +272,8 @@ ON CONFLICT(id) DO UPDATE SET
     cc_recipients   = COALESCE(excluded.cc_recipients, cc_recipients),
     importance      = COALESCE(excluded.importance, importance),
     last_verb       = COALESCE(excluded.last_verb, last_verb),
-    size            = COALESCE(excluded.size, size)
+    size            = COALESCE(excluded.size, size),
+    meeting         = COALESCE(excluded.meeting, meeting)
 """
 
 
@@ -324,6 +326,7 @@ def _row_from_item(item: dict, folder_id: str) -> dict:
         "flag": (item.get("flag") or {}).get("flagStatus") if "flag" in item else None,
         "last_verb": prop(PROP_LAST_VERB),
         "size": prop(PROP_SIZE),
+        "meeting": meeting_kind(item.get("@odata.type")),
     }
 
 
@@ -388,6 +391,11 @@ class Store:
             if col not in cols:
                 self.conn.execute(f"ALTER TABLE contacts ADD COLUMN {col} TEXT")
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(messages)")}
+        if "meeting" not in cols:
+            # Unlike the columns below, this one needs no fresh sync of everything: mail that
+            # arrives or changes brings it, and SyncEngine.backfill_meetings() reads it for
+            # the mail already stored (a few small requests, in the background).
+            self.conn.execute("ALTER TABLE messages ADD COLUMN meeting TEXT")
         missing = {c: t for c, t in _NEW_MESSAGE_COLUMNS.items() if c not in cols}
         for col, sqltype in missing.items():
             self.conn.execute(f"ALTER TABLE messages ADD COLUMN {col} {sqltype}")
@@ -674,6 +682,18 @@ class Store:
 
     def message_row(self, message_id: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
+
+    def set_meetings(self, kinds: dict[str, str]) -> int:
+        """Mark stored messages as meeting messages ({id: type}); returns how many changed."""
+        with self.conn as c:
+            return sum(c.execute("UPDATE messages SET meeting=? WHERE id=? AND meeting IS NOT ?",
+                                 (kind, mid, kind)).rowcount for mid, kind in kinds.items())
+
+    def set_meeting(self, message_id: str, kind: str) -> None:
+        """Remember that a message is a meeting message (learned by opening it)."""
+        with self.conn as c:
+            c.execute("UPDATE messages SET meeting=? WHERE id=? AND meeting IS NOT ?",
+                      (kind, message_id, kind))
 
     # -- local changes, queued for the server ---------------------------
     def set_read(self, mailbox_id: str, message_ids: list[str], read: bool) -> list[str]:

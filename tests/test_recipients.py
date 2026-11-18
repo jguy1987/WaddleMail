@@ -11,7 +11,6 @@ pytest.importorskip("PySide6")
 
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from waddlemail.contacts import Suggestion  # noqa: E402
 from waddlemail.ui.recipients import RecipientEdit  # noqa: E402
@@ -28,8 +27,7 @@ def _choose(field: RecipientEdit, typed: str) -> None:
     QTest.qWait(50)
 
 
-def test_choosing_a_suggestion_inserts_it_once():
-    app = QApplication.instance() or QApplication([])
+def test_choosing_a_suggestion_inserts_it_once(qapp):
     field = RecipientEdit([Suggestion(ANN, [ANN], "personal", "ann lee ann@x.com"),
                            Suggestion(BOB, [BOB], "personal", "bob ray bob@x.com")])
     field.show()
@@ -42,4 +40,3 @@ def test_choosing_a_suggestion_inserts_it_once():
     assert field.text() == f"{ANN}; {BOB}; "
     assert field.addresses() == [ANN, BOB]
     field.close()
-    del app

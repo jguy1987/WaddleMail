@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..settings import Settings
+from .tray import MODES
 
 
 class PeriodEdit(QWidget):
@@ -72,12 +73,23 @@ class PreferencesDialog(QDialog):
         self.close_to_tray.setChecked(settings.get("tray/close_to_tray"))
         self.tray.toggled.connect(self.close_to_tray.setEnabled)
         self.close_to_tray.setEnabled(self.tray.isChecked())
+        self.tray_icon = QComboBox()
+        for key, text in MODES:
+            self.tray_icon.addItem(text, key)
+        self.tray_icon.setCurrentIndex(max(self.tray_icon.findData(settings.get("tray/icon")), 0))
+        self.tray_icon.setToolTip("Which colour the tray icon is drawn in. \"Match the theme\" "
+                                  "suits most desktops; pick light or dark if the panel "
+                                  "doesn't follow the theme.")
+        self.tray.toggled.connect(self.tray_icon.setEnabled)
+        self.tray_icon.setEnabled(self.tray.isChecked())
         self.splash = QCheckBox("Show the splash screen while starting")
         self.splash.setChecked(settings.get("view/splash"))
         self.reminders = QCheckBox("Show event reminders")
         self.reminders.setChecked(settings.get("reminders/enabled"))
-        for box in (self.notify, self.reminders, self.tray, self.close_to_tray, self.splash):
+        for box in (self.notify, self.reminders, self.tray, self.close_to_tray):
             f.addRow(box)
+        f.addRow("Tray icon:", self.tray_icon)
+        f.addRow(self.splash)
         tabs.addTab(general, "General")
 
         mail = QWidget()
@@ -269,6 +281,7 @@ class PreferencesDialog(QDialog):
         s.set("notify/new_mail", self.notify.isChecked())
         s.set("tray/show", self.tray.isChecked())
         s.set("tray/close_to_tray", self.close_to_tray.isChecked())
+        s.set("tray/icon", self.tray_icon.currentData())
         s.set("view/splash", self.splash.isChecked())
         s.set("reminders/enabled", self.reminders.isChecked())
         s.set("sync/window_days", self.sync_window.days())
