@@ -96,6 +96,28 @@ def test_reconcile_a_forward(tmp_path):
     assert g.deleted[-1] == "new1"
 
 
+def test_forward_copies_match_by_name_when_the_size_differs():
+    # the draft's copies report other sizes than the originals: they must still be kept
+    g = FakeItems([{"id": "c1", "name": "plan.pdf", "size": 1371},
+                   {"id": "c2", "name": "voice.wav", "size": 2_000_004},
+                   {"id": "c3", "name": "old.doc", "size": 50}])
+    plan = Attachment.from_server({"id": "o1", "name": "plan.pdf", "size": 1024}, original=True)
+    wav = Attachment.from_server({"id": "o2", "name": "voice.wav", "size": 1_500_000},
+                                 original=True)  # (old.doc was taken out)
+    r = reconcile(g, "item", [plan, wav])
+    assert (plan.remote_id, wav.remote_id) == ("c1", "c2")
+    assert g.deleted == ["c3"] and r.removed == ["old.doc"]
+
+
+def test_forward_copies_are_never_dropped_when_one_cant_be_found():
+    g = FakeItems([{"id": "c1", "name": "Plan (1).pdf", "size": 10},
+                   {"id": "c2", "name": "photo.jpg", "size": 20}])
+    plan = Attachment.from_server({"id": "o1", "name": "plan.pdf", "size": 10}, original=True)
+    photo = Attachment.from_server({"id": "o2", "name": "photo.jpg", "size": 20}, original=True)
+    reconcile(g, "item", [plan, photo])
+    assert g.deleted == []  # plan.pdf's copy may be "Plan (1).pdf": nothing is deleted
+
+
 def test_reconcile_keeps_unknown_when_the_list_wasnt_loaded():
     g = FakeItems([{"id": "c1", "name": "plan.pdf", "size": 10}])
     reconcile(g, "item", [], remove_others=False)

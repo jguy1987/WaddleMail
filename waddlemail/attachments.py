@@ -4,12 +4,15 @@ match the list: it removes what you took out and uploads what you added (no Qt i
 unit-testable)."""
 from __future__ import annotations
 
+import logging
 import mimetypes
 import os
 from dataclasses import dataclass, field
 
 from .graph import GraphClient
 from .inline import InlineImage
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -80,16 +83,26 @@ def reconcile(graph: GraphClient, item: str, wanted: list[Attachment],
     result = ReconcileResult()
     remote = [a for a in graph.attachments(item) if not a.get("isInline")]
     known = {a.remote_id for a in wanted if a.remote_id}
-    for att in wanted:  # a forward's copies: one each, by name and size
-        if att.remote_id is None and att.original:
-            match = next((r for r in remote if r["id"] not in known
-                          and r.get("name") == att.name and int(r.get("size") or 0) == att.size),
-                         None)
+    pending = [a for a in wanted if a.remote_id is None and a.original]
+    # A forward's copies: one each. By name and size first; then by name alone, since the
+    # server's size for a copy needn't equal the original's.
+    for same_size in (True, False):
+        for att in list(pending):
+            match = next((r for r in remote if r["id"] not in known and r.get("name") == att.name
+                          and (not same_size or int(r.get("size") or 0) == att.size)), None)
             if match is not None:
                 att.remote_id = match["id"]
                 known.add(match["id"])
+                pending.remove(att)
+    if pending and remove_others:
+        # Some original has no copy we can recognise, so an unmatched one might be it:
+        # better to leave a file you removed on the draft than to drop one you kept.
+        log.warning("not removing attachments: no copy found for %s (draft has %s)",
+                    [a.name for a in pending], [(r.get("name"), r.get("size")) for r in remote])
+        remove_others = False
     for r in remote if remove_others else []:
         if r["id"] not in known:  # taken out of the list
+            log.info("removing attachment %s from the draft", r.get("name"))
             graph.delete_attachment(item, r["id"])
             result.removed.append(r.get("name") or r["id"])
     for att in wanted:
