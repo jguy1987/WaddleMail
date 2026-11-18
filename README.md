@@ -2,6 +2,11 @@
 
 A Linux mail client for Microsoft 365 / Outlook.com built on Microsoft Graph.
 
+Disclaimer: This app is built using Claude Code. Claude consists of roughly 90% of the codebase, while the human touch
+is responsible for 10%. I am a Python developer so I was able to audit the codebase and smoke test the entire way. 
+I didn't find a simple Microsoft 365 mail client for my Fedora 45 install so I dialed up 
+Claude to help me build one.
+
 ## What works
 
 - Sign-in with MSAL (public client, system browser + PKCE, no client secret). Tokens are kept in the
@@ -449,13 +454,3 @@ waddlemail/ui/iconset.py   loads and tints the bundled Lucide SVGs (icons/)
 - Search: `body_fts` is an FTS5 table keyed by the `bodies` rowid. `put_body` adds the text and
   a trigger removes it when a body is evicted, so the index never outgrows the cache. Bodies
   cached before the index existed are indexed once on upgrade.
-
-## Next steps
-
-1. Removing a contact's photo (Graph has no call for it); photos in lists and autocomplete.
-2. Calendar: other people's shared calendars, room booking; reminders dismissed on another
-   device aren't noticed here until they'd fire (Graph's reminderView could tell).
-3. Search across all folders; optional background download of
-   bodies so local search covers everything offline.
-4. Tasks: checklist steps, and a To-Do Bar / daily task list beside the calendar.
-5. Publisher verification of the app registration before sharing with other organizations.
