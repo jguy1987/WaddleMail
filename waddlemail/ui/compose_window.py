@@ -154,6 +154,11 @@ class ComposeWindow(QMainWindow):
         self._title()
         (self.to if not self.to.text().strip() else
          (self.subject if not self.subject.text().strip() else self.editor.edit)).setFocus()
+        # Edits to the fields count as changes (the body tracks its own). Connected last:
+        # filling them in above isn't one.
+        self._fields_changed = False
+        for field in (self.subject, self.to, self.cc, self.bcc):
+            field.textChanged.connect(self._field_changed)
 
     # -- body ------------------------------------------------------------------------------
     def _fill_body(self, original_body, as_html: bool):
@@ -262,9 +267,16 @@ class ComposeWindow(QMainWindow):
                         to=self.to.addresses(), cc=self.cc.addresses(),
                         bcc=self.bcc.addresses(), inline=inline)
 
+    def _field_changed(self, *_):
+        self._fields_changed = True
+
     def is_dirty(self) -> bool:
-        return (self.editor.edit.document().isModified() or self._attachments_changed or
-                (self.kind == NEW and bool(self.to.text().strip() or self.subject.text().strip())))
+        """Whether closing would lose something: a change since it was last saved to Drafts
+        (or, for a message not saved yet, anything written in a new one)."""
+        return (self.editor.edit.document().isModified() or self._attachments_changed
+                or self._fields_changed
+                or (self.kind == NEW and self.draft_id is None
+                    and bool(self.to.text().strip() or self.subject.text().strip())))
 
     # -- send / close ------------------------------------------------------------------------
     def _send(self):
@@ -294,6 +306,7 @@ class ComposeWindow(QMainWindow):
         self.draft_id = draft_id
         self.editor.edit.document().setModified(False)
         self._attachments_changed = False
+        self._fields_changed = False
 
     # -- dropping files --------------------------------------------------------------------
     @staticmethod

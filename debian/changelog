@@ -1,3 +1,10 @@
+waddlemail (1.0.3) unstable; urgency=medium
+
+  * A draft opens for editing (double-click or Enter in Drafts); saving or sending updates it (#4).
+  * A draft changed or sent from another client no longer shows its old text (#5).
+
+ -- John Mish <jmish1987@gmail.com>  Thu, 19 Nov 2026 14:00:00 +0000
+
 waddlemail (1.0.2) unstable; urgency=medium
 
   * Forwarded messages keep their attachments (#1).

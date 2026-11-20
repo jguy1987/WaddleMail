@@ -43,6 +43,10 @@ class BodyService:
             body.content = self._pictures(message_id, body.content)
         return body
 
+    def with_pictures(self, message_id: str, content: str) -> str:
+        """`content` (an HTML body) with the pictures it links to put in as data: URIs."""
+        return self._pictures(message_id, content)
+
     def _pictures(self, message_id: str, content: str) -> str:
         wanted = cid_refs(content)
         if not wanted:

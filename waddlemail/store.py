@@ -582,12 +582,19 @@ class Store:
                                     (item["id"], folder_id))
                     rm += cur.rowcount
                 else:
+                    stored = c.execute(
+                        "SELECT f.well_known FROM messages m LEFT JOIN folders f"
+                        " ON f.id = m.folder_id WHERE m.id=?", (item["id"],)).fetchone()
                     if new is not None or changed is not None:
-                        known = c.execute("SELECT 1 FROM messages WHERE id=?",
-                                          (item["id"],)).fetchone() is not None
-                        target = changed if known else new
+                        target = changed if stored is not None else new
                         if target is not None:
                             target.append(item["id"])
+                    if stored is not None and stored["well_known"] == "drafts":
+                        # A draft is the one kind of message whose text changes: edited in
+                        # another client (Outlook on the web), then perhaps sent, which moves
+                        # it to Sent Items. The cached text (and its pictures, by trigger) is
+                        # from before; read it again when it is next opened.
+                        c.execute("DELETE FROM bodies WHERE message_id=?", (item["id"],))
                     c.execute(_UPSERT_MESSAGE, _row_from_item(item, folder_id))
                     up += 1
         return up, rm

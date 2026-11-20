@@ -813,6 +813,15 @@ class GraphClient:
                              params={"$filter": flt, "$select": "id", "$top": 1})
         return bool(data.get("value"))
 
+    def get_draft(self, message_id: str) -> dict:
+        """What is needed to go on writing a draft: subject, recipients (Bcc too: the list
+        doesn't keep it) and the body as it was written (html or text, not converted)."""
+        return self._request(
+            f"{self._root}/messages/{quote(message_id, safe='')}",
+            params={"$select": "subject,body,toRecipients,ccRecipients,bccRecipients,"
+                               "hasAttachments,isDraft"},
+            headers=_prefer())
+
     def get_message_body(self, message_id: str) -> tuple[str, str]:
         """Return (content_type, content); content_type is 'html' or 'text'."""
         data = self._request(
