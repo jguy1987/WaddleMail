@@ -1,5 +1,5 @@
 Name:           waddlemail
-Version:        1.0.2
+Version:        1.0.3
 Release:        1%{?dist}
 Summary:        Linux mail client for Microsoft 365
 
@@ -44,6 +44,10 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/waddlemail.desktop
 %{_datadir}/icons/hicolor/*/apps/waddlemail*
 
 %changelog
+* Thu Nov 19 2026 John Mish <jmish1987@gmail.com> - 1.0.3-1
+- A draft opens for editing (double-click or Enter in Drafts); saving or sending updates it (#4)
+- A draft changed or sent from another client no longer shows its old text (#5)
+
 * Tue Nov 17 2026 John Mish <jmish1987@gmail.com> - 1.0.2-1
 - Forwarded messages keep their attachments (#1)
 - Meeting invitations can be accepted, tentatively accepted or declined from the message (#2)

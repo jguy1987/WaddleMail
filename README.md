@@ -141,7 +141,11 @@ Claude to help me build one.
     later saves or the send only upload or remove the differences.
   - Send (Ctrl+Enter). New mail without attachments is sent directly; replies and forwards go through Exchange's
     reply/forward draft, so they stay in the conversation and a forward keeps the original's
-    attachments. Save draft (Ctrl+S) keeps it in Drafts; closing an unsent message asks.
+    attachments. Save draft (Ctrl+S) keeps it in Drafts; closing an unsent message asks (only when
+    something would be lost). Double-click (or Enter on) a message in Drafts to go on writing
+    it: it is read from the server, so changes made in another client show, and Save draft or
+    Send updates that same draft. A draft's text is never kept from before a change: one edited
+    or sent from Outlook on the web shows as it is now.
   - **Outbox**: when the server can't be reached (offline, timing out, busy), the message
     waits in the Outbox, with copies of its files, and the window closes. The account's
     Outbox folder counts and lists it (the reader shows it as it will go out); it goes out

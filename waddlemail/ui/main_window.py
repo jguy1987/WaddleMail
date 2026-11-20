@@ -25,7 +25,7 @@ from .. import __version__, desktop, graph
 from ..attachments import Attachment, file_name, reconcile, reconcile_inline, unique_path
 from ..calendars import event_row as calendar_event_row
 from ..calendars import event_span
-from ..contacts import personal_row, removal_payload, suggestions
+from ..contacts import format_address, personal_row, removal_payload, suggestions
 from ..graph import NO_SUBFOLDERS
 from ..invites import Invite, parse_invite
 from ..inline import cid_refs, resolve_cids
@@ -889,13 +889,16 @@ class MainWindow(QMainWindow):
 
     def open_message(self, mid: str):
         """Open one message in its own window (double-click / Enter) and mark it read. One
-        waiting in the Outbox opens to edit."""
+        waiting in the Outbox, or in your Drafts, opens to edit."""
         if self.outbox_id(mid) is not None:
             self.edit_outbox_item(self.outbox_id(mid))
             return
         row = self.store.message_row(mid)
         box = self.mailboxes.for_folder(self._current_folder) if self._current_folder else None
         if row is None or box is None:
+            return
+        if not box.shared and self._is_draft(row):
+            self.edit_draft(mid)
             return
         # (no parent yet: a main-window parent would make Del delete it from the main window)
         delete = QAction(iconset.load("trash-2"), "Delete")
@@ -2230,6 +2233,59 @@ class MainWindow(QMainWindow):
             if row is not None:
                 self.msg_list.model_.update_rows([row])
 
+    def _is_draft(self, row) -> bool:
+        folder = self.store.folder_row(row["folder_id"])
+        return bool(folder and folder["well_known"] == "drafts")
+
+    def edit_draft(self, mid: str):
+        """Open a message from Drafts to go on writing it. Save draft and Send then update
+        that same draft on the server (no second copy). It is read from the server, not the
+        cache: it may have been changed elsewhere."""
+        for w in self._windows:  # already open for editing: bring it forward
+            if isinstance(w, ComposeWindow) and w.draft_id == mid:
+                w.raise_()
+                w.activateWindow()
+                return
+        row = self.store.message_row(mid)
+        box = self.mailboxes.for_folder(row["folder_id"]) if row else None
+        if box is None:
+            return
+
+        def people(items):
+            return [format_address((r.get("emailAddress") or {}).get("name") or "",
+                                   (r.get("emailAddress") or {}).get("address") or "")
+                    for r in items or [] if (r.get("emailAddress") or {}).get("address")]
+
+        def job():
+            data = box.graph.get_draft(mid)
+            body = data.get("body") or {}
+            html = (body.get("contentType") or "html").lower() == "html"
+            content = body.get("content") or ""
+            pictures = html and bool(cid_refs(content))
+            if html:  # its pictures, as the editor holds them
+                content = box.bodies.with_pictures(mid, content)
+            attachments = []
+            if data.get("hasAttachments"):
+                attachments = [Attachment.from_server(a) for a in
+                               box.graph.attachments(box.graph.message_path(mid))
+                               if not a.get("isInline")]
+            return data, html, content, pictures, attachments
+
+        def done(result):
+            data, html, content, pictures, attachments = result
+            win = self._compose(account_id=box.account_id)
+            win.mailbox_id, win.draft_id = box.id, mid
+            win.originals_known = True  # (what the server has is what the list shows)
+            win.had_pictures = pictures
+            win.load(data.get("subject") or "", people(data.get("toRecipients")),
+                     people(data.get("ccRecipients")), people(data.get("bccRecipients")),
+                     html, content, attachments)
+            win.mark_saved(mid)  # as it is on the server: closing it unchanged asks nothing
+
+        self._run(job, done, activity="Opening draft…",
+                  on_failed=lambda msg: QMessageBox.warning(
+                      self, "Draft", f"The draft couldn't be opened.\n\n{msg}"))
+
     def save_draft(self, win: ComposeWindow):
         box = self._sending_box(win)
         if box is None:
@@ -2241,6 +2297,7 @@ class MainWindow(QMainWindow):
             self._saved(win, p)
             win.mark_saved(draft_id)
             self.statusBar().showMessage("Saved to Drafts", 3000)
+            QTimer.singleShot(2000, lambda: self.sync_current(full=False))  # the list's copy
             if closing:
                 win.close()
 
